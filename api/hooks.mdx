@@ -116,3 +116,90 @@ With `?template=true`, the payload is enriched with `templates`, `groupings` (li
 - Hooks fire **after** a command is committed; failures in the hook do not roll back the transaction. They are retried on a separate schedule by the `HookProcessor`.
 - `GET /v1/hooks/{id}?template=true` returns both the saved hook and the empty template merged together — useful for rendering an edit form pre-populated with the current values.
 - Updating a hook with only `isActive: false` is the supported way to "pause" a webhook without losing its configuration.
+
+## Curl reference
+
+List hooks:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  https://example.org/fineract-provider/api/v1/hooks
+```
+
+Create a hook:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Content-Type: application/json" \
+  -X POST https://example.org/fineract-provider/api/v1/hooks \
+  -d '{
+    "name": "Web",
+    "displayName": "Loan disbursed → ops bus",
+    "isActive": true,
+    "events": [{ "actionName": "DISBURSE", "entityName": "LOAN" }],
+    "config": {
+      "Content Type": "json",
+      "Payload URL": "https://ops.example.org/fineract/webhook/disbursement"
+    }
+  }'
+```
+
+Pause a hook in place (preserves config and events):
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Content-Type: application/json" \
+  -X PUT https://example.org/fineract-provider/api/v1/hooks/5 \
+  -d '{ "isActive": false }'
+```
+
+## Processor implementations
+
+`HookProcessorProvider` resolves which `HookProcessor` bean to invoke for each saved hook by template name. The Apache Fineract codebase ships these processors under `org.apache.fineract.infrastructure.hooks.processor`:
+
+| Template | Processor bean | Notes |
+| --- | --- | --- |
+| `Web` | `webHookProcessor` (`WebHookProcessor`) | Generic POST through a Retrofit-built `WebHookService`. |
+| `SMS Bridge` | `messageGatewayHookProcessor` (`MessageGatewayHookProcessor`) | Forwards to a Mifos-CN message gateway. |
+| `Twilio` | `twilioHookProcessor` (`TwilioHookProcessor`) | Drives the Twilio REST API. |
+| `Elastic Search` | `elasticSearchHookProcessor` (`ElasticSearchHookProcessor`) | Indexes the payload into an ES cluster. |
+
+Each processor implements the `HookProcessor` SPI — third parties can register additional `@Component` beans of that interface to add channels.
+
+## Event delivery semantics
+
+- Hooks fire **after** the originating command commits. The processor runs in a separate worker and a failed delivery does **not** roll back the business transaction.
+- The payload posted to a `Web` hook is the JSON of the matched `CommandWrapper` plus the response body produced by the command handler. `actionName` and `entityName` are echoed in HTTP headers (`X-Fineract-Event`, `X-Fineract-Entity`).
+- Retries are the responsibility of each processor; the default `WebHookProcessor` does **not** retry on HTTP 5xx — operators that need at-least-once delivery should front the hook URL with their own retry queue or sidecar.
+- `displayName` is metadata only; the engine routes purely on the saved `(actionName, entityName)` events.
+
+## Validation rules
+
+| Error | When |
+| --- | --- |
+| `400 BAD_REQUEST` (`error.msg.hook.name.cannot.be.blank`) | `name` missing in the create body. |
+| `400 BAD_REQUEST` (`error.msg.hook.events.cannot.be.empty`) | `events` array missing or empty. |
+| `400 BAD_REQUEST` (`error.msg.hook.config.cannot.be.empty`) | `config` missing required fields for the chosen template. |
+| `403 FORBIDDEN` | Caller lacks `READ_HOOK` / `CREATE_HOOK` / `UPDATE_HOOK` / `DELETE_HOOK`. |
+| `404 NOT_FOUND` (`HookNotFoundException`) | `hookId` does not exist. |
+
+## Permissions matrix
+
+| Action | Permission code | Notes |
+| --- | --- | --- |
+| List & retrieve | `READ_HOOK` | Required even for `GET /template`. |
+| Create | `CREATE_HOOK` (+ `CREATE_HOOK_CHECKER` under maker-checker) | Command `CREATE_HOOK`. |
+| Update | `UPDATE_HOOK` (+ `_CHECKER`) | Command `UPDATE_HOOK`. |
+| Delete | `DELETE_HOOK` (+ `_CHECKER`) | Command `DELETE_HOOK`. |
+
+See [Permissions](/api/permissions) for how to wire these codes into a role, and [Maker–Checker](/api/maker-checkers) for the `_CHECKER` variants.
+
+## Operational tips
+
+- Keep the receiver idempotent: the same `(commandId, hookId)` pair may be retried by an upstream queue and the engine does not deduplicate.
+- Use distinct hooks per environment by setting `displayName` to include the target (`prod-ops-bus`, `staging-ops-bus`) — that field surfaces in the run logs and makes troubleshooting easier.
+- The `Web` template uses the URL exactly as configured; HTTPS endpoints must present a certificate the JVM trusts. To add a private CA, set `javax.net.ssl.trustStore` on the Fineract JVM.
+- For high-volume events (`REPAYMENT`, `CREATE_TRANSACTION`), prefer routing the hook to a thin sidecar that fan-outs to downstream consumers — the hook engine should not be the back-pressure point.

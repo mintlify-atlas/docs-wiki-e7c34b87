@@ -104,3 +104,100 @@ Only fields present in the body are written; omitted keys keep their previous va
 - The platform validates credentials lazily — the first failed send writes a `failed` row in the email outbox with the SMTP error. There is no "test connection" endpoint; use `POST /v1/email` with a small message to verify.
 - A single SMTP profile is shared across the tenant. Multi-profile / per-campaign SMTP is not supported through this resource.
 - The Java class name in some legacy docs is `SmtpConfigurationApiResource` — that class was renamed to `EmailConfigurationApiResource` and the URL path moved from `/smtpConfiguration` to `/v1/email/configuration`.
+
+## Curl reference
+
+Read the configured keys:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  https://example.org/fineract-provider/api/v1/email/configuration
+```
+
+Update credentials (the body is a flat map of `name`-keyed updates):
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Content-Type: application/json" \
+  -X PUT https://example.org/fineract-provider/api/v1/email/configuration \
+  -d '{
+    "host": "smtp.example.org",
+    "port": "587",
+    "username": "fineract@example.org",
+    "password": "s3cret",
+    "useTLS": "true",
+    "fromName": "Apache Fineract",
+    "fromEmail": "fineract@example.org"
+  }'
+```
+
+## Persistence layer
+
+Configuration values are stored as rows in `m_external_service_properties` keyed by `external_service_id` for the `EMAIL_SMTP` row of `m_external_service`. Each row is a `(name, value)` pair — there is no schema enforced beyond the per-key validators wired into `EmailConfigurationCommandFromApiJsonDeserializer`. Reads materialise the rows into a `Map<String, String>` via `EmailConfigurationReadPlatformService.retrieveAll`.
+
+## Validation
+
+| Error | Cause |
+| --- | --- |
+| `error.msg.email.configuration.host.cannot.be.blank` | Empty `host` value. |
+| `error.msg.email.configuration.port.invalid` | `port` not a positive integer. |
+| `error.msg.email.configuration.useTLS.must.be.boolean` | `useTLS` not parseable as `true` / `false`. |
+| `error.msg.email.configuration.fromEmail.invalid.format` | `fromEmail` fails the SMTP address check. |
+
+## Permissions matrix
+
+| Action | Permission |
+| --- | --- |
+| Read | `READ_EMAIL_CONFIGURATION` |
+| Update | `UPDATE_EMAIL_CONFIGURATION` (`+ _CHECKER`) |
+
+## Operational notes
+
+- Setting `useTLS=true` enables `STARTTLS` over the standard SMTP port; full TLS-from-the-handshake (port 465) requires an external proxy — the dispatcher only speaks STARTTLS.
+- `password` round-trips in plaintext on the wire — front the endpoint with HTTPS, and audit which roles hold `UPDATE_EMAIL_CONFIGURATION`.
+- Changes apply on the **next** dispatcher tick; in-flight sends keep the old credentials until they complete or fail.
+- There is no `GET /v1/email/configuration/{key}` form — `GET` returns the whole map.
+
+## Related resources
+
+- [Email](/api/email) — the outbox the dispatcher drains using these credentials.
+- [Email Campaigns](/api/email-campaigns) — produces the messages.
+- [External Services Configuration](/api/external-services-configuration) — generic surface for the same `m_external_service*` tables (SES, S3, etc.).
+- [Report Mailing Jobs](/api/report-mailing-job) — scheduled report delivery also uses this SMTP profile.
+
+## Verifying the configuration end-to-end
+
+Because there is no "test connection" handler, the standard verification sequence is:
+
+1. `PUT /v1/email/configuration` with the new credentials.
+2. `POST /v1/email` to queue a single message to a controllable inbox.
+3. Wait for the scheduler tick (or trigger an inline run via [Inline Jobs](/api/inline-jobs)).
+4. `GET /v1/email/messageByStatus?status=200` (sent) or `?status=400` (failed) to confirm delivery — failures land with the SMTP error in `errorMessage`.
+
+This pattern keeps credentials out of any "ping" endpoint, which is intentional: an explicit send is also an explicit audit trail for who triggered it (visible in [Audits](/api/audits)).
+
+## Notable keys
+
+The shipped key set (see `EmailConfigurationApiConstants`):
+
+| Key | Type | Notes |
+| --- | --- | --- |
+| `host` | string | SMTP hostname. |
+| `port` | int | SMTP port (commonly 25, 465, 587). |
+| `username` | string | SMTP login. |
+| `password` | string | SMTP password — stored at rest in `m_external_service_properties`. |
+| `useTLS` | boolean | STARTTLS upgrade on the SMTP socket. |
+| `fromName` | string | Default sender display name. |
+| `fromEmail` | string | Default sender address. |
+
+Unknown keys are silently ignored on `PUT` — the validator only enforces the known set.
+
+## Backup and migration
+
+When migrating a tenant between databases, copy the `m_external_service` row for `EMAIL_SMTP` and the matching `m_external_service_properties` rows. The platform does not export these values through any other endpoint, and a missing row leaves the email dispatcher silently broken (`getEmailCredentials()` returns `null`, the job skips its run, and no row in the outbox is updated).
+
+## Maker-checker behaviour
+
+Like other `_CHECKER`-aware resources, the `PUT` can be intercepted by a maker-checker rule on the `EMAIL_CONFIGURATION` entity. When enabled, the response is a `commandId` rather than `changes`, and the second pair of eyes must approve via the [Maker-Checker](/api/maker-checkers) queue before the SMTP credentials change.

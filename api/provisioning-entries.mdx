@@ -97,9 +97,72 @@ Content-Type: application/json
 
 When the batch posts entries, each `JournalEntry` is recorded with `transactionId = "P" + entryId`. The journal-entries API exposes the helper `GET /v1/journalentries/provisioning?entryId={id}` to enumerate those rows; see [/api/journal-entries](/api/journal-entries).
 
+## Batch lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Cron as Scheduler / Operator
+    participant Resource as ProvisioningEntriesApiResource
+    participant Write as ProvisioningEntriesWritePlatformService
+    participant Loan as LoanReadPlatformService
+    participant JE as JournalEntryWritePlatformService
+
+    Cron->>Resource: POST /v1/provisioningentries {date, createjournalentries:true}
+    Resource->>Write: createProvisioningEntries(JsonCommand)
+    Write->>Loan: aggregateOutstandingByProductByBucket(date)
+    Loan-->>Write: ProvisioningEntry + LoanProductProvisioningEntry rows
+    alt createjournalentries == true
+        Write->>JE: createProvisioningJournalEntries(entry)
+        JE-->>Write: transactionId="P{entryId}"
+    end
+    Write-->>Resource: CommandProcessingResult
+    Resource-->>Cron: 200 OK
+
+    Note over Cron,Resource: Later re-run after data fix
+    Cron->>Resource: POST /v1/provisioningentries/12?command=recreateprovisioningentry
+    Resource->>Write: reCreateProvisioningEntries(entryId)
+    Write->>JE: reverse prior P12 entries + post fresh
+```
+
+## Idempotency and re-runs
+
+- `recreateprovisioningentry` reverses the existing `P{entryId}` journal entries and posts new ones. The reversal keeps the historical row but flips `reversed=true`; consumers reading the GL must filter on `reversed=false` to avoid double-counting.
+- `createjournalentry` is rejected if `journalEntryCreated == true` — it can only run on a batch that was generated **without** the eager flag.
+
+## Common pitfalls
+
+- **Date must be on or after the most recent GL closure** for every affected office. Otherwise the journal-entry step raises `error.msg.journalEntry.cannot.be.created.on.or.before.previous.glClosure.date` and aborts the whole batch.
+- **No criterion** for an active loan product means that product is silently skipped — operators must check the `loanProductProvisioningEntries` length against the active-product count.
+- **`recreateprovisioningentry` is destructive** — there is no archive of the prior values besides the reversal of the journal entries themselves.
+
+## Sample curl — list batches
+
+```bash
+curl -k -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  "https://localhost:8443/fineract-provider/api/v1/provisioningentries?offset=0&limit=20"
+```
+
+## Drill-down: per-product rows
+
+`GET /v1/provisioningentries/entries?entryId=12&productId=1` returns a `Page<LoanProductProvisioningEntryData>` so reporting tools can break a batch down by product or category. Supported filters:
+
+- `entryId` (required for sensible results)
+- `officeId` — restrict to one branch
+- `productId` — restrict to one loan product
+- `categoryId` — restrict to one bucket
+- `offset`, `limit` — pagination
+
+The row shape includes `amountreserved`, `liabilityAccount`, `expenseAccount` and the resolved office/product/category names, suitable for direct rendering.
+
+## Scheduler integration
+
+The job `UPDATE_LOAN_PROVISIONING_PROFILES` calls the same write service as `POST /v1/provisioningentries` with `createjournalentries=true` and `date = BusinessDate.COB_DATE`. Manual API runs and scheduled runs share the same data model — you can always re-post manually after a missed scheduled run, then call `?command=recreateprovisioningentry` to refresh.
+
 ## Related subsystems
 
 - Subsystem overview: [/accounting/provisioning-entries](/accounting/provisioning-entries)
 - Provisioning criteria configuration: [/accounting/provisioning-criteria](/organisation/provisioning-criteria)
 - Journal entries written by the batch: [/api/journal-entries](/api/journal-entries)
 - Loan products: [/portfolio/loan-products](/loan/loan-product-api)
+- [/api/conventions](/api/conventions) — envelope, locale and error model.

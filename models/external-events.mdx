@@ -28,7 +28,7 @@ column), `0046_*` (schema column), `0051_*` (category column) and
 | ------------------------------ | ------------------------------------------------------------------- | ---------------------------------------------------- |
 | `m_external_event`             | `event.external.repository.domain.ExternalEvent`                    | `0043_add_external_event_table.xml`; later refined by `0045_*`, `0046_*`, `0051_*`, `0085_*` |
 | `m_external_event_configuration` | `event.external.repository.domain.ExternalEventConfiguration`     | `0043_add_external_event_table.xml`                  |
-| `m_external_event_view` (view) | `event.external.repository.domain.ExternalEventView`                | created in `0117_set_datetime_precision.xml` / runtime metadata |
+| `ExternalEventView` (Spring Data projection over `m_external_event`) | `event.external.repository.domain.ExternalEventView`                | projection interface — no separate table; consumed by `ExternalEventRepository.findByStatusOrderByBusinessDateAscIdAsc` |
 
 Subsystem cross-links:
 [`core/event-external`](/core/event-external),
@@ -129,14 +129,21 @@ payment events, etc. — see for example
 and
 `fineract-loan/.../parts/1004_add_external_event_configuration_for_down_payment_transaction_event.xml`.
 
-## `m_external_event_view` (database view)
+## `ExternalEventView` (Spring Data projection)
 
-A read-side view used by the producer query that joins `m_external_event` to
-`m_external_event_configuration` and filters by `enabled = true`. It is
-created together with the table in
-`0117_set_datetime_precision.xml` (re-creation step) and is not represented
-by its own JPA entity — the `ExternalEventView` Java class is mapped to it
-as an `@Entity` with `@Immutable`.
+`ExternalEventView` (in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/repository/domain/ExternalEventView.java`)
+is **not** a database view — it is a Spring Data
+[interface projection](https://docs.spring.io/spring-data/jpa/docs/current/reference/html/#projections.interfaces)
+declared as a Java `interface` over `ExternalEvent`. Spring Data JPA builds a
+proxy that exposes a stable read-only contract (`getId`, `getType`,
+`getCategory`, `getSchema`, `getData`, `getCreatedAt`, `getStatus`,
+`getSentAt`, `getIdempotencyKey`, `getBusinessDate`, `getAggregateRootId`)
+and lets the underlying entity evolve without affecting the producer code
+path. It is consumed by
+`ExternalEventRepository.findByStatusOrderByBusinessDateAscIdAsc`, which
+returns `List<ExternalEventView>` for the
+`SendAsynchronousEventsTasklet` polling loop.
 
 ## How events are recorded
 
@@ -158,24 +165,28 @@ producer, `ExternalBusinessEventService`, which:
 
 ## How events are shipped
 
-A background worker bean (`ExternalEventProducerBean`) polls the table
-periodically. The query pattern is:
+`SendAsynchronousEventsTasklet` (in
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/jobs/SendAsynchronousEventsTasklet.java`)
+runs on a Spring Batch schedule and polls `m_external_event` via the
+projection. The effective query pattern is:
 
 ```sql
-SELECT *
-FROM   m_external_event_view
+SELECT id, type, category, schema, data, created_at, status, sent_at,
+       idempotency_key, business_date, aggregate_root_id
+FROM   m_external_event
 WHERE  status = 'TO_BE_SENT'
-ORDER  BY id
-LIMIT  N
+ORDER  BY business_date ASC, id ASC
+LIMIT  ?  -- fineract.events.external.producer.read-batch-size
 ```
 
-`m_external_event_view` is a join of `m_external_event` with
-`m_external_event_configuration` filtered on `enabled = true`. Each batch
-of N rows is shipped to the configured broker (JMS or Kafka, controlled by
-the `fineract.events.external.producer.read-batch-size` and broker
-properties), then UPDATEd to `status = 'SENT'` in a second transaction.
-Failed ships leave the rows in `TO_BE_SENT` and the next polling cycle
-picks them up.
+The repository call is
+`findByStatusOrderByBusinessDateAscIdAsc(ExternalEventStatus.TO_BE_SENT,
+PageRequest.of(0, batchSize))` and returns
+`List<ExternalEventView>`. Each batch is shipped to the configured broker
+(JMS or Kafka, selected by `KafkaExternalEventProducer` /
+`JmsExternalEventProducer`), then UPDATEd in a second transaction to
+`status = 'SENT'` with `sent_at = now()`. Failed ships leave the rows in
+`TO_BE_SENT` and the next tasklet tick picks them up.
 
 The idempotency contract is on the consumer: every event row has a
 deterministic `idempotency_key` (UUID v4 produced when the event is

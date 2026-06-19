@@ -40,11 +40,13 @@ The paged list endpoints accept `offset`, `limit`, `orderBy` and `sortOrder`. `o
 
 ## Status codes
 
-| status | Meaning |
-| ------ | ------- |
-| 100 | Pending |
-| 200 | Sent |
-| 300 | Failed |
+| status | Meaning | Enum constant |
+| ------ | ------- | ------------- |
+| 100 | Pending | `EmailMessageStatusType.PENDING` |
+| 200 | Sent | `EmailMessageStatusType.SENT` |
+| 400 | Failed | `EmailMessageStatusType.FAILED` |
+
+Status values come from `org.apache.fineract.infrastructure.campaigns.email.domain.EmailMessageStatusType`. A status id outside `{100, 200, 400}` raises an `InvalidEmailStatusException`.
 
 ## Request body — create
 
@@ -95,4 +97,113 @@ Response:
 
 - The retrieveOne endpoint **does not** call `validateHasReadPermission`. Treat reads of `/v1/email/{id}` as authenticated-but-not-authorised, and front-end-enforce additional controls if needed.
 - Status transitions are owned by the scheduler — there is no API endpoint to mark a message "sent" manually. Use this resource for **inspection** and **cancellation**, not retries.
-- Messages persisted as `failed` retain their last error in the `errorMessage` field of `EmailData`; downstream tooling can poll `messageByStatus?status=300` to alert operators.
+- Messages persisted as `failed` retain their last error in the `errorMessage` field of `EmailData`; downstream tooling can poll `messageByStatus?status=400` to alert operators.
+
+## Curl reference
+
+List pending messages:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  "https://example.org/fineract-provider/api/v1/email/pendingEmail?limit=100&offset=0"
+```
+
+Queue a new ad-hoc email:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Content-Type: application/json" \
+  -X POST https://example.org/fineract-provider/api/v1/email \
+  -d '{
+    "groupId": null,
+    "clientId": 12,
+    "staffId": null,
+    "emailAddress": "client12@example.org",
+    "emailSubject": "Statement ready",
+    "message": "Your January statement is available in your portal."
+  }'
+```
+
+Fetch the failed window for a date range:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  "https://example.org/fineract-provider/api/v1/email/messageByStatus?status=400&fromDate=2024-01-01&toDate=2024-01-31&dateFormat=yyyy-MM-dd&locale=en"
+```
+
+Cancel a queued message:
+
+```bash
+curl -u mifos:password \
+  -H "Fineract-Platform-TenantId: default" \
+  -X DELETE https://example.org/fineract-provider/api/v1/email/4271
+```
+
+## EmailData response shape
+
+The DTO returned by the retrieval endpoints (`org.apache.fineract.infrastructure.campaigns.email.data.EmailData`) carries:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | long | Primary key of `m_email_messages_outbound`. |
+| `groupId` / `clientId` / `staffId` | long, nullable | Recipient resolution scope. |
+| `campaignId` / `campaignName` | long, string, nullable | Set when the row originated from an Email Campaign. |
+| `emailAddress` | string | Target SMTP address. |
+| `emailSubject` | string | Rendered subject. |
+| `message` | string | Rendered body. |
+| `statusType` | object | `{ id, code, value }` mapped from `EmailMessageStatusType`. |
+| `submittedOnDate` | array of int | `[yyyy, MM, dd]` per the platform date format. |
+| `errorMessage` | string, nullable | Populated on `FAILED`; truncated at the column length defined in the entity. |
+
+## Permissions matrix
+
+| Action | Permission | Source check |
+| --- | --- | --- |
+| List / search | `READ_Email` | `validateHasReadPermission(EmailApiConstants.RESOURCE_NAME)` in each handler. |
+| Retrieve one | none beyond authentication | The handler skips `validateHasReadPermission`. Front-end with care. |
+| Create | `CREATE_Email` (`+ _CHECKER`) | Command source `CREATE_EMAIL`. |
+| Update | `UPDATE_Email` (`+ _CHECKER`) | Command source `UPDATE_EMAIL`. |
+| Delete | `DELETE_Email` (`+ _CHECKER`) | Command source `DELETE_EMAIL`. |
+
+## Error responses
+
+| HTTP | Error code | Cause |
+| --- | --- | --- |
+| 400 | `error.msg.email.invalid.status` | `status` query parameter outside `{100, 200, 400}`. |
+| 400 | `error.msg.email.message.cannot.be.blank` | Missing `message` on create. |
+| 400 | `error.msg.email.address.invalid.format` | `emailAddress` fails the SMTP format check. |
+| 403 | Standard `validateHasReadPermission` failure | Caller lacks `READ_Email`. |
+| 404 | `error.msg.email.id.invalid` | `resourceId` does not exist. |
+
+## Operational notes
+
+- The dispatcher is a Quartz job (`Update email outbound with campaign message`) — pause it via [Scheduler Jobs](/api/scheduler-jobs) when running point-in-time migrations.
+- Messages do not carry HTML/text discrimination; the body field is plain text. For HTML email, use a campaign template that wraps the merge body.
+- The Mifos web UI surfaces this resource under **Communications → Email Outbox**; the SMTP profile it uses is the one configured via [Email Configuration](/api/email-configuration).
+
+## Related resources
+
+- [Email Campaigns](/api/email-campaigns) — bulk creator of messages that land in this outbox.
+- [Email Configuration](/api/email-configuration) — SMTP host, port, credentials and TLS flags.
+- [SMS](/api/sms) — the matching per-message outbox for the SMS channel.
+- [Notifications](/api/notifications) — in-app notification surface (no SMTP involvement).
+- [Hooks](/api/hooks) — event-driven webhook delivery; an alternative path for downstream notifications.
+- [Scheduler Jobs](/api/scheduler-jobs) — controls the cron that drains the outbox.
+
+## Data model footprint
+
+The outbox is persisted in `m_email_messages_outbound`. Key columns map 1:1 onto `EmailData`:
+
+| Column | DTO field | Notes |
+| --- | --- | --- |
+| `id` | `id` | Numeric PK. |
+| `group_id`, `client_id`, `staff_id` | matching `*Id` fields | Recipient resolution scope. |
+| `email_campaign_id` | `campaignId` | Backlink to the campaign that produced the row. |
+| `email_address` | `emailAddress` | Normalised recipient. |
+| `email_subject`, `message` | `emailSubject`, `message` | Already-rendered content. |
+| `status_enum` | `statusType.id` | Stored as int; see status code table. |
+| `error_message` | `errorMessage` | Trimmed; populated on `FAILED`. |
+| `submittedon_date` | `submittedOnDate` | Set on insert. |

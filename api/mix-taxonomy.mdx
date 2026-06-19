@@ -80,3 +80,121 @@ Use this output to build the configuration UI for [`/v1/mixmapping`](/api/mix-ta
 
 - The taxonomy is the MIX Market 2010 schema (`mx-cor` namespace). It is intentionally not editable through the API; updates require a database migration.
 - The `fineract-mix` Gradle module must be on the runtime classpath; absent that, the resource is not registered.
+
+## Resource shape
+
+The full resource is intentionally trivial — there is exactly one handler:
+
+```java
+@Path("/v1/mixtaxonomy")
+@Component
+@Tag(name = "Mix Taxonomy", description = "")
+@RequiredArgsConstructor
+public class MixTaxonomyApiResource {
+
+    private final MixTaxonomyReadService readTaxonomyService;
+
+    @GET
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public List<MixTaxonomyData> retrieveAll() {
+        return readTaxonomyService.retrieveAll();
+    }
+}
+```
+
+There is no PUT / POST / DELETE — the table backing `MixTaxonomyReadService` is seeded by Flyway/Liquibase migrations in `fineract-mix/src/main/resources/db/changelog`. Customising the taxonomy means adding rows in a migration, not via HTTP.
+
+## Why "no permission check"
+
+Reading the XBRL taxonomy reveals only public regulatory metadata — there is no tenant data on this endpoint. The handler therefore does not call `validateHasReadPermission` or `platformSecurityContext.authenticatedUser()`. Authentication is still required (the JAX-RS request filter enforces it), but no per-role check fires. If you need to limit access (for example to hide proprietary regulatory mappings), wrap the endpoint behind an external gateway.
+
+## Lifecycle of a taxonomy element
+
+```mermaid
+flowchart LR
+  Seed[Flyway migration<br/>inserts m_mix_taxonomy rows] --> Read[MixTaxonomyReadService.retrieveAll]
+  Read --> GET[/v1/mixtaxonomy]
+  GET --> UI[Mapping UI lists elements]
+  UI --> Map[Operator PUT /v1/mixmapping]
+  Map --> Render[GET /v1/mixreport renders fact]
+```
+
+The endpoint is the entry point of that flow: the operator first sees what is _possible_ before deciding what to _bind_.
+
+## Field semantics
+
+- **`id`** — stable surrogate key. Use it in `/v1/mixmapping` to identify the element being mapped.
+- **`namespace`** — the XBRL local name. The renderer pre-pends the `mix:` namespace alias declared on the root `<xbrl>` element when emitting facts.
+- **`dimension`** — if non-null, the element is a dimensional fact. The renderer emits an additional `<segment>` inside the `<context>` and tags the fact accordingly. Most elements in the shipped seed have `null` here.
+- **`type`** — drives how `MixReportXBRLBuilder` formats the value (number of `decimals`, integer coercion, plain text).
+- **`description`** — UI-only; not used by the renderer.
+
+## Sample integration
+
+A configuration UI typically fetches `/v1/mixtaxonomy` once at boot, then uses the result to render a two-column form (left: taxonomy element, right: GL account selector). On save the form posts a single `PUT /v1/mixmapping` containing the full updated mapping. Refreshing the page reissues the GET — the taxonomy itself is static across the session.
+
+## cURL recipe
+
+```bash
+curl -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     "https://localhost:8443/fineract-provider/api/v1/mixtaxonomy" | jq '.[] | {id, namespace, type}'
+```
+
+## Common pitfalls
+
+- **Confusing `id` with `namespace`** — the mapping endpoint expects the numeric `id`, not the XBRL tag name. Mapping by namespace will be silently ignored.
+- **Adding elements at runtime** — direct INSERTs into `m_mix_taxonomy` work but require an application restart for `retrieveAll` to see them if the read service caches its lookup. Prefer a migration.
+- **Different taxonomy versions** — Fineract's seed is the 2010 schema; consumers expecting a newer MIX or Cerise+SPI4 schema must migrate the table themselves or fork the module.
+
+## Cross-links
+
+- **[Mix Taxonomy Mapping](/api/mix-taxonomy-mapping)** — assign GL identifiers to these elements.
+- **[Mix Report](/api/mix-report)** — render an XBRL document using the mapping.
+- **[GL Accounts](/api/gl-accounts)** — the chart of accounts whose ids the mapping references.
+- **[Accounting overview](/accounting/overview)** — domain background for the balances aggregated by the XBRL builder.
+
+## Taxonomy seed inventory
+
+The shipped seed in `fineract-mix` defines a few dozen elements covering the standard MIX outreach, financial structure, and performance categories. Examples you can expect to find in a fresh database:
+
+| Category | Representative elements |
+| -------- | ----------------------- |
+| **Outreach** | `NumberOfActiveBorrowers`, `NumberOfActiveClients`, `NumberOfOffices`, `NumberOfPersonnel` |
+| **Balance sheet** | `Assets`, `Liabilities`, `Equity`, `Deposits`, `GrossLoanPortfolio` (alias `GLP`) |
+| **Performance** | `OperatingExpense`, `FinancialRevenueOnLoans`, `LoanLossProvisionExpense` |
+| **Portfolio quality** | `PortfolioAtRiskGT30Days`, `WriteOffs` |
+
+If your deployment requires elements outside this seed (for example country-specific Cerise+SPI indicators) you must add rows via migration and re-run the read service.
+
+## Why a `List`, not a `Page`
+
+The handler returns a raw `List<MixTaxonomyData>` rather than the platform's standard `Page<>` envelope used by other read endpoints (clients, loans, etc.). The taxonomy is bounded (low hundreds of rows at most) and the consuming UI almost always needs the full set to build its mapping editor, so pagination would be an overhead with no payoff. Clients should not expect `totalElements` / `pageItems` in the response — it is a top-level JSON array.
+
+## Response field reference
+
+The Java DTO `MixTaxonomyData` (see `fineract-mix/src/main/java/org/apache/fineract/mix/data/MixTaxonomyData.java`) carries the fields documented above. Field order in the JSON output follows the declaration order of the record, but consumers should treat it as an unordered object — Fineract does not contract on field ordering in any of its endpoints.
+
+## Operational tips
+
+- Cache the response aggressively on the client. The taxonomy is effectively immutable per release.
+- Do not import the namespace strings directly; resolve element identity by `id`. Future schema versions can rename `namespace` while keeping `id` stable.
+- When debugging the mapping screen, hit `GET /v1/mixtaxonomy` and `GET /v1/mixmapping` side-by-side; mismatched `id` values are the most common source of "fact missing from the XBRL output" tickets.
+
+## Schema cross-walks
+
+Several MIX taxonomy elements have well-known synonyms in adjacent reporting schemas:
+
+| MIX element | Cerise SPI4 alias | Common regulator label |
+| ----------- | ----------------- | ---------------------- |
+| `GrossLoanPortfolio` | `OUT-1` | "Gross outstanding portfolio" |
+| `NumberOfActiveBorrowers` | `OUT-2` | "Active borrowers" |
+| `PortfolioAtRiskGT30Days` | `FIN-7` | "PAR > 30" |
+| `WriteOffs` | `FIN-9` | "Write-offs" |
+
+The Fineract endpoint only returns the MIX-native namespace; any cross-walk has to live in your reporting middleware.
+
+## Versioning & evolution
+
+The endpoint has no version selector — the `m_mix_taxonomy` table holds exactly one taxonomy at a time, and the mapping resource therefore can only target that single version. To support multiple taxonomies side-by-side, both the table and `MixTaxonomyMappingApiResource.updateTaxonomyMapping` would need to gain a `taxonomyVersionId` selector; see the `TODO support multiple configuration file loading` comment in `MixTaxonomyMappingApiResource` for the existing design debt.
