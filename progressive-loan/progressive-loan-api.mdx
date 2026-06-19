@@ -1,0 +1,426 @@
+---
+title: "Progressive Loan REST API Surface Complete Reference"
+sidebarTitle: "Progressive API"
+description: "Every JAX-RS ApiResource shipped in fineract-progressive-loan: buy-down fees, capitalized income, internal model inspection — paths, methods, handlers."
+---
+
+The Apache Fineract progressive-loan module ships **three** JAX-RS `@Component` classes that expose HTTP endpoints. None of them re-implements the bulk of the loan API — `/v1/loans/{id}` create/disburse/repay traffic continues to be served by `fineract-loan`'s `LoansApiResource` and friends — they only add the progressive-specific surface for **buy-down fees**, **capitalized income**, and an **internal model-inspection** API gated by the `TEST` profile. This page is the complete catalog of paths, methods, response shapes and downstream handlers shipped from `fineract-progressive-loan/src/main/java/`.
+
+## Resource catalog
+
+| Resource class | Base path | Visibility | Purpose |
+| --- | --- | --- | --- |
+| `LoanBuyDownFeeApiResource` | `/v1/loans` | public | Buy-down fee amortization read endpoints |
+| `LoanCapitalizedIncomeApiResource` | `/v1/loans` | public | Capitalized income aggregate + per-transaction reads |
+| `InternalProgressiveLoanApiResource` | `/v1/internal/loan/progressive` | `@Profile(FineractProfiles.TEST)` only | CRUD on the serialized `ProgressiveLoanInterestScheduleModel` |
+
+The progressive write endpoints (`POST /v1/loans/{loanId}/transactions?command=…`) do **not** require new resources; they piggyback on `LoanTransactionsApiResource` in `fineract-loan`, which dispatches by `command` query-string to the appropriate `NewCommandSourceHandler`. See [Command overview](/command/overview) for the CQRS routing.
+
+```mermaid
+flowchart LR
+    Client[HTTP client]
+    Client -->|GET .../buydown-fees| BD[LoanBuyDownFeeApiResource]
+    Client -->|GET .../capitalized-incomes| CI[LoanCapitalizedIncomeApiResource]
+    Client -->|GET POST DELETE /v1/internal/loan/progressive/...| INT[InternalProgressiveLoanApiResource]
+    Client -->|POST /v1/loans/{id}/transactions?command=buyDownFee| LT[LoanTransactionsApiResource\nin fineract-loan]
+    Client -->|POST /v1/loans/{id}/transactions?command=capitalizedIncome| LT
+
+    BD --> BDRead[BuyDownFeeReadPlatformService\nLoanAmortizationAllocationService]
+    CI --> CIRead[CapitalizedIncomeBalanceReadService\nLoanAmortizationAllocationService]
+    LT -->|LOAN/BUYDOWNFEE| H1[AddBuyDownFeeCommandHandler]
+    LT -->|LOAN/BUYDOWNFEEADJUSTMENT| H2[BuyDownFeeAdjustmentCommandHandler]
+    LT -->|LOAN/CAPITALIZEDINCOME| H3[AddCapitalizedIncomeCommandHandler]
+    LT -->|LOAN/CAPITALIZEDINCOMEADJUSTMENT| H4[CapitalizedIncomeAdjustmentCommandHandler]
+    INT --> WRP[InterestScheduleModelRepositoryWrapper]
+```
+
+## `LoanBuyDownFeeApiResource`
+
+```java
+@Path("/v1/loans")
+@Component
+@Tag(name = "Loan Buy Down Fees", description = "Loan Buy Down Fees")
+@RequiredArgsConstructor
+public class LoanBuyDownFeeApiResource {
+
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = new HashSet<>(Arrays.asList(
+            "loanId", "loanExternalId", "baseLoanTransactionId", "baseLoanTransactionDate",
+            "baseLoanTransactionAmount", "unrecognizedAmount", "chargedOffAmount",
+            "adjustmentAmount", "amortizationMappings"));
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "LOAN";
+
+    private final PlatformSecurityContext context;
+    private final BuyDownFeeReadPlatformService buyDownFeeReadPlatformService;
+    private final LoanAmortizationAllocationService loanAmortizationAllocationService;
+    private final DefaultToApiJsonSerializer<LoanAmortizationAllocationData> toApiJsonSerializer;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final LoanReadPlatformService loanReadPlatformService;
+    // ...
+}
+```
+
+### Endpoint table
+
+| # | Method | Path | Handler | Returns |
+| - | --- | --- | --- | --- |
+| 1 | GET | `/v1/loans/{loanId}/buydown-fees` | `retrieveLoanBuyDownFeeAmortizationDetails` | `List<BuyDownFeeAmortizationDetails>` |
+| 2 | GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees` | `retrieveLoanBuyDownFeeAmortizationDetailsByExternalId` | `List<BuyDownFeeAmortizationDetails>` |
+| 3 | GET | `/v1/loans/{loanId}/buydown-fees/{loanTransactionId}` | `retrieveBuyDownFeesAllocationData` | `LoanAmortizationAllocationData` (JSON via `DefaultToApiJsonSerializer`) |
+| 4 | GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/{loanTransactionId}` | `getBuyDownFeesAllocationDataByLoanExternalId` | same |
+| 5 | GET | `/v1/loans/{loanId}/buydown-fees/external-id/{loanTransactionExternalId}` | `getBuyDownFeesAllocationDataByTransactionExternalId` | same |
+| 6 | GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/external-id/{loanTransactionExternalId}` | `getBuyDownFeesAllocationDataByExternalIds` | same |
+
+Endpoints 3–6 are six permutations of the same private helper:
+
+```java
+private String retrieveBuyDownFeesAllocationData(final Long loanId, final String loanExternalIdStr,
+        final Long loanTransactionId, final String loanTransactionExternalIdStr, final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+
+    final ExternalId loanExternalId            = ExternalIdFactory.produce(loanExternalIdStr);
+    final ExternalId loanTransactionExternalId = ExternalIdFactory.produce(loanTransactionExternalIdStr);
+
+    final Long resolvedLoanId = loanId == null
+            ? loanReadPlatformService.getResolvedLoanId(loanExternalId) : loanId;
+    final Long resolvedLoanTransactionId = loanReadPlatformService
+            .getResolvedLoanTransactionId(loanTransactionId, loanTransactionExternalId);
+
+    final LoanAmortizationAllocationData loanAmortizationAllocationData = loanAmortizationAllocationService
+            .retrieveLoanAmortizationAllocationsForBuyDownFeeTransaction(resolvedLoanTransactionId, resolvedLoanId);
+
+    final ApiRequestJsonSerializationSettings settings = apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, loanAmortizationAllocationData, RESPONSE_DATA_PARAMETERS);
+}
+```
+
+The serializer respects the `fields=` query parameter — clients can ask for `?fields=baseLoanTransaction,unrecognizedAmount` and get a projection.
+
+### Permissions
+
+Both list and detail endpoints require `READ_LOAN` (resolved from `RESOURCE_NAME_FOR_PERMISSIONS = "LOAN"`). The check runs against `PlatformSecurityContext.authenticatedUser().validateHasReadPermission(...)`. See [Security overview](/security/overview).
+
+### Sample requests
+
+```bash
+# List all buy-down fee balances for a loan
+curl -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     https://<host>/fineract-provider/api/v1/loans/123/buydown-fees
+```
+
+```bash
+# Drill into one transaction's daily allocation
+curl -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     "https://<host>/fineract-provider/api/v1/loans/123/buydown-fees/456?fields=baseLoanTransaction,amortizationMappings"
+```
+
+## `LoanCapitalizedIncomeApiResource`
+
+```java
+@Path("/v1/loans")
+@Component
+@Tag(name = "Loan Capitalized Income",
+     description = "Fetch the Loan capitalized income related informations")
+@RequiredArgsConstructor
+public class LoanCapitalizedIncomeApiResource {
+
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = new HashSet<>(Arrays.asList(
+            "loanId", "loanExternalId", "baseLoanTransactionId", "baseLoanTransactionDate",
+            "baseLoanTransactionAmount", "unrecognizedAmount", "chargedOffAmount",
+            "adjustmentAmount", "amortizationMappings"));
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "LOAN";
+
+    private final PlatformSecurityContext context;
+    private final CapitalizedIncomeBalanceReadService capitalizedIncomeBalanceReadService;
+    private final LoanAmortizationAllocationService loanAmortizationAllocationService;
+    private final DefaultToApiJsonSerializer<LoanAmortizationAllocationData> toApiJsonSerializer;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final LoanReadPlatformService loanReadPlatformService;
+    // ...
+}
+```
+
+### Endpoint table
+
+| # | Method | Path | Handler | Returns |
+| - | --- | --- | --- | --- |
+| 1 | GET | `/v1/loans/{loanId}/deferredincome` (deprecated) | `fetchLoanCapitalizedIncomeData` | `LoanCapitalizedIncomeData` |
+| 2 | GET | `/v1/loans/external-id/{loanExternalId}/deferredincome` (deprecated) | `fetchLoanCapitalizedIncomeDataByExternalId` | `LoanCapitalizedIncomeData` |
+| 3 | GET | `/v1/loans/{loanId}/capitalized-incomes` | `fetchCapitalizedIncomeDetails` | `List<CapitalizedIncomeDetails>` |
+| 4 | GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes` | `fetchCapitalizedIncomeDetailsByExternalId` | `List<CapitalizedIncomeDetails>` |
+| 5 | GET | `/v1/loans/{loanId}/capitalized-incomes/{loanTransactionId}` | `retrieveCapitalizedIncomeAllocationData` | `LoanAmortizationAllocationData` JSON |
+| 6 | GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/{loanTransactionId}` | `getCapitalizedIncomeAllocationDataByLoanExternalId` | same |
+| 7 | GET | `/v1/loans/{loanId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | `getCapitalizedIncomeAllocationDataByTransactionExternalId` | same |
+| 8 | GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | `getCapitalizedIncomeAllocationDataByExternalIds` | same |
+
+The two deprecated `deferredincome` endpoints are still wired in for back-compat:
+
+```java
+@Path("/{loanId}/deferredincome")
+@GET
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(deprecated = true, summary = "Fetch the Capitalized Income related informations")
+public LoanCapitalizedIncomeData fetchLoanCapitalizedIncomeData(
+        @PathParam("loanId") @Parameter(description = "loanId") final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return capitalizedIncomeBalanceReadService.fetchLoanCapitalizedIncomeData(loanId);
+}
+```
+
+The modern aggregate endpoint:
+
+```java
+@Path("/{loanId}/capitalized-incomes")
+@GET
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Fetch the Capitalized Income related informations")
+public List<CapitalizedIncomeDetails> fetchCapitalizedIncomeDetails(
+        @PathParam("loanId") @Parameter(description = "loanId") final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return capitalizedIncomeBalanceReadService.fetchLoanCapitalizedIncomeDetails(loanId);
+}
+```
+
+Detail endpoints route through the same `retrieveCapitalizedIncomeAllocationData(...)` private helper:
+
+```java
+private String retrieveCapitalizedIncomeAllocationData(final Long loanId, final String loanExternalIdStr,
+        final Long loanTransactionId, final String loanTransactionExternalIdStr, final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+
+    final ExternalId loanExternalId            = ExternalIdFactory.produce(loanExternalIdStr);
+    final ExternalId loanTransactionExternalId = ExternalIdFactory.produce(loanTransactionExternalIdStr);
+
+    final Long resolvedLoanId = loanId == null
+            ? loanReadPlatformService.getResolvedLoanId(loanExternalId) : loanId;
+    final Long resolvedLoanTransactionId = loanReadPlatformService
+            .getResolvedLoanTransactionId(loanTransactionId, loanTransactionExternalId);
+
+    final LoanAmortizationAllocationData loanAmortizationAllocationData = loanAmortizationAllocationService
+            .retrieveLoanAmortizationAllocationsForCapitalizedIncomeTransaction(resolvedLoanTransactionId, resolvedLoanId);
+
+    final ApiRequestJsonSerializationSettings settings = apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, loanAmortizationAllocationData, RESPONSE_DATA_PARAMETERS);
+}
+```
+
+## `InternalProgressiveLoanApiResource`
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Profile(FineractProfiles.TEST)
+@Component
+@Path("v1/internal/loan/progressive")
+@Tag(name = "Progressive Loan",
+     description = "internal loan testing API. This API should be disabled in production!!!")
+public class InternalProgressiveLoanApiResource implements InitializingBean {
+
+    private final LoanRepositoryWrapper loanRepository;
+    private final InterestScheduleModelRepositoryWrapper writePlatformService;
+    private final InterestScheduleModelRepositoryWrapper interestScheduleModelRepositoryWrapper;
+    private final LoanScheduleService loanScheduleService;
+
+    @Override
+    @SuppressFBWarnings("SLF4J_SIGN_ONLY_FORMAT")
+    public void afterPropertiesSet() throws Exception {
+        log.warn("------------------------------------------------------------");
+        log.warn("                                                            ");
+        log.warn("DO NOT USE THIS IN PRODUCTION!");
+        log.warn("Internal client services mode is enabled");
+        log.warn("DO NOT USE THIS IN PRODUCTION!");
+        log.warn("                                                            ");
+        log.warn("------------------------------------------------------------");
+    }
+    // ...
+}
+```
+
+The `@Profile(FineractProfiles.TEST)` annotation means the bean is only registered when Spring is started under the `TEST` profile — production builds never wire it. It is used by the integration test suite to assert the persisted `ProgressiveLoanInterestScheduleModel` matches expectations.
+
+### Endpoint table
+
+| # | Method | Path | Handler | Returns |
+| - | --- | --- | --- | --- |
+| 1 | GET | `/v1/internal/loan/progressive/{loanId}/model` | `fetchModel` | `ProgressiveLoanInterestScheduleModel` JSON |
+| 2 | POST | `/v1/internal/loan/progressive/{loanId}/model` | `updateModel` | `ProgressiveLoanInterestScheduleModel` JSON |
+| 3 | DELETE | `/v1/internal/loan/progressive/{loanId}/model` | `deleteModel` | `Long` (rows removed) |
+
+### `GET /v1/internal/loan/progressive/{loanId}/model`
+
+```java
+@GET
+@Produces({ MediaType.APPLICATION_JSON })
+@Path("{loanId}/model")
+@Operation(summary = "Fetch ProgressiveLoanInterestScheduleModel",
+           description = "DO NOT USE THIS IN PRODUCTION!")
+public ProgressiveLoanInterestScheduleModel fetchModel(
+        @PathParam("loanId") @Parameter(description = "loanId") long loanId) {
+    Loan loan = loanRepository.findOneWithNotFoundDetection(loanId);
+    if (!loan.isProgressiveSchedule()) {
+        throw new IllegalArgumentException("The loan is not progressive.");
+    }
+    ILoanConfigurationDetails loanConfigurationDetails = LoanConfigurationDetailsMapper.map(loan);
+    return writePlatformService.readProgressiveLoanInterestScheduleModel(
+            loanId, loanConfigurationDetails,
+            loan.getLoanProductRelatedDetail().getInstallmentAmountInMultiplesOf())
+            .orElse(null);
+}
+```
+
+Reads the serialized model row, deserialises it via `ProgressiveLoanInterestScheduleModelParserService`, and returns it.
+
+### `POST /v1/internal/loan/progressive/{loanId}/model`
+
+```java
+@POST
+@Path("{loanId}/model")
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Update and Save ProgressiveLoanInterestScheduleModel",
+           description = "DO NOT USE THIS IN PRODUCTION!")
+@Transactional
+public ProgressiveLoanInterestScheduleModel updateModel(
+        @PathParam("loanId") @Parameter(description = "loanId") long loanId) {
+    Loan loan = loanRepository.findOneWithNotFoundDetection(loanId);
+    if (!loan.isProgressiveSchedule()) {
+        throw new IllegalArgumentException("The loan is not progressive.");
+    }
+    ProgressiveLoanInterestScheduleModel model = reprocessTransactionsAndGetModel(loan);
+    return writePlatformService.writeInterestScheduleModel(loan, model);
+}
+
+private ProgressiveLoanInterestScheduleModel reprocessTransactionsAndGetModel(final Loan loan) {
+    loanScheduleService.regenerateScheduleWithReprocessingTransactions(loan);
+    return interestScheduleModelRepositoryWrapper
+            .extractModel(interestScheduleModelRepositoryWrapper.findOneByLoan(loan)).get();
+}
+```
+
+Equivalent to "drop the saved model, regenerate from current loan state, write the result". This is what integration tests invoke to force a clean recalc after manipulating fixture data.
+
+### `DELETE /v1/internal/loan/progressive/{loanId}/model`
+
+```java
+@DELETE
+@Path("{loanId}/model")
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Delete ProgressiveLoanInterestScheduleModel By Loan ID",
+           description = "DO NOT USE THIS IN PRODUCTION!")
+@Transactional
+public Long deleteModel(@PathParam("loanId") @Parameter(description = "loanId") long loanId) {
+    return writePlatformService.removeByLoanId(loanId);
+}
+```
+
+Removes the row from `m_loan_progressive_model`. The next read or repayment will reconstruct it from scratch.
+
+## Write commands routed via `LoanTransactionsApiResource`
+
+The progressive-loan module does not expose its write endpoints directly; it relies on the loan-transactions API in `fineract-loan`. The relevant `command` values and their handlers (all in `fineract-progressive-loan/.../handler/`):
+
+| `command=` | Handler class | `@CommandType` | Service method |
+| --- | --- | --- | --- |
+| `buyDownFee` | `AddBuyDownFeeCommandHandler` | `LOAN/BUYDOWNFEE` | `BuyDownFeePlatformService.makeLoanBuyDownFee` |
+| `buyDownFeeAdjustment` | `BuyDownFeeAdjustmentCommandHandler` | `LOAN/BUYDOWNFEEADJUSTMENT` | `BuyDownFeePlatformService.buyDownFeeAdjustment` |
+| `capitalizedIncome` | `AddCapitalizedIncomeCommandHandler` | `LOAN/CAPITALIZEDINCOME` | `CapitalizedIncomePlatformService.addCapitalizedIncome` |
+| `capitalizedIncomeAdjustment` | `CapitalizedIncomeAdjustmentCommandHandler` | `LOAN/CAPITALIZEDINCOMEADJUSTMENT` | `CapitalizedIncomePlatformService.capitalizedIncomeAdjustment` |
+
+All four are `@Service` beans wired into the CQRS dispatch by `@CommandType(entity=…, action=…)`.
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "BUYDOWNFEE")
+public class AddBuyDownFeeCommandHandler implements NewCommandSourceHandler { ... }
+
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "CAPITALIZEDINCOME")
+public class AddCapitalizedIncomeCommandHandler implements NewCommandSourceHandler { ... }
+```
+
+The full POST URLs:
+
+| URL | Maker-checker | Resulting transaction type |
+| --- | --- | --- |
+| `POST /v1/loans/{loanId}/transactions?command=buyDownFee` | Optional | `BUY_DOWN_FEE` |
+| `POST /v1/loans/{loanId}/transactions/{txnId}?command=buyDownFeeAdjustment` | Optional | `BUY_DOWN_FEE_ADJUSTMENT` |
+| `POST /v1/loans/{loanId}/transactions?command=capitalizedIncome` | Optional | `CAPITALIZED_INCOME` |
+| `POST /v1/loans/{loanId}/transactions/{txnId}?command=capitalizedIncomeAdjustment` | Optional | `CAPITALIZED_INCOME_ADJUSTMENT` |
+
+## Payment-allocation endpoints — where do they live?
+
+Payment-allocation rules (the `paymentAllocation` array consumed by `AdvancedPaymentScheduleTransactionProcessor`) are **product-level** and **loan-level** configuration; they are not a standalone REST resource in the progressive module. They are written by:
+
+* `POST/PUT /v1/loanproducts/{id}` — bulk product config, accepts a `paymentAllocation` array. The array is parsed into `LoanProductPaymentAllocationRule` rows (in `fineract-loan`).
+* `POST/PUT /v1/loans/{id}` — loan-level override, parsed into `LoanPaymentAllocationRule` rows.
+
+Reads come back inline in the loan and loan-product GET responses. See [Loan overview](/loan/overview) for the loan-product API surface, and [Progressive transaction processors](/progressive-loan/progressive-transaction-processors) for the runtime semantics of the array.
+
+## Response shapes referenced above
+
+```java
+// data/BuyDownFeeAmortizationDetails.java
+public record BuyDownFeeAmortizationDetails(
+        Long id, Long loanId, Long transactionId,
+        LocalDate buyDownFeeDate, BigDecimal buyDownFeeAmount,
+        BigDecimal amortizedAmount, BigDecimal notYetAmortizedAmount,
+        BigDecimal adjustedAmount, BigDecimal chargedOffAmount) { }
+
+// data/CapitalizedIncomeDetails.java
+public class CapitalizedIncomeDetails {
+    private BigDecimal amount;
+    private BigDecimal amortizedAmount;
+    private BigDecimal unrecognizedAmount;
+    private BigDecimal amountAdjustment;
+    private BigDecimal chargedOffAmount;
+}
+
+// data/LoanCapitalizedIncomeData.java -- deprecated aggregate DTO
+```
+
+`LoanAmortizationAllocationData` is the per-transaction breakdown returned by detail endpoints; it lives in `fineract-loan` (because it is reused by both buy-down fee and capitalized income flows). The `RESPONSE_DATA_PARAMETERS` constant on each resource declares which top-level fields are serializable when clients pass `?fields=` — anything outside the set is dropped.
+
+## Security
+
+All endpoints require an authenticated user. The progressive module reuses Fineract's standard permissions:
+
+| Endpoint group | Required permission |
+| --- | --- |
+| `GET /v1/loans/{loanId}/buydown-fees/...` | `READ_LOAN` |
+| `GET /v1/loans/{loanId}/capitalized-incomes/...` | `READ_LOAN` |
+| `POST /v1/loans/{loanId}/transactions?command=buyDownFee` | `BUYDOWNFEE_LOAN` |
+| `POST .../buyDownFeeAdjustment` | `BUYDOWNFEEADJUSTMENT_LOAN` |
+| `POST .../capitalizedIncome` | `CAPITALIZEDINCOME_LOAN` |
+| `POST .../capitalizedIncomeAdjustment` | `CAPITALIZEDINCOMEADJUSTMENT_LOAN` |
+| `* /v1/internal/loan/progressive/...` | TEST profile must be active |
+
+Permissions are seeded via Liquibase changesets under `fineract-progressive-loan/src/main/resources/db/changelog/tenant/module/progressiveloan/`.
+
+## Errors
+
+| HTTP | Body code | When |
+| --- | --- | --- |
+| 400 | `validation.msg.loan.transaction.buydownfee.transactionAmount.must.be.positive` | invalid amount |
+| 400 | `error.msg.loan.not.progressive` | endpoint called on a non-progressive loan |
+| 403 | `error.msg.platform.user.not.authorized` | permission denied |
+| 404 | `error.msg.loan.id.invalid` | loan id not found |
+| 404 | `error.msg.loan.transaction.id.invalid` | transaction id not found |
+| 409 | `error.msg.platform.duplicate.command` | idempotency violation |
+
+Validation messages come from `ProgressiveLoanTransactionValidatorImpl`; routing errors from the loan-assembler stack in `fineract-loan`.
+
+## OpenAPI generation
+
+Each resource class is annotated with `@Tag`, `@Operation`, `@Parameter` and `@ApiResponse` from swagger-jakarta — Fineract publishes a generated OpenAPI definition that includes all of the above. The tags appear as `Loan Buy Down Fees`, `Loan Capitalized Income`, and `Progressive Loan` (internal) in the Swagger UI.
+
+## Cross references
+
+* The command-handler / CQRS pipeline that backs the POST endpoints — [Command overview](/command/overview).
+* The internal model the GET endpoints return — [Model and recalculation](/progressive-loan/model-and-recalculation).
+* The transaction processor that produces the rows behind the read endpoints — [Progressive transaction processors](/progressive-loan/progressive-transaction-processors).
+* The feature pages: [Buy-down fee](/progressive-loan/buy-down-fee), [Capitalized income](/progressive-loan/capitalized-income).
+* The classic loan APIs that handle non-progressive endpoints — [Loan overview](/loan/overview).

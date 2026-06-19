@@ -1,0 +1,270 @@
+---
+title: "Util Helpers — LoopGuard, Stream, Response Utilities"
+sidebarTitle: "Util Helpers"
+description: "Reference for the four utility classes in fineract-core util: LoopContext, LoopGuard, StreamResponseUtil, and StreamUtil."
+---
+
+The `util/` package in `fineract-core` is the smallest one in the codebase — four files. It exists to give domain code a few hand-rolled helpers that don't fit any of the larger feature packages: a typed loop-safety guard that throws if a recurrence engine forgets to terminate, a streaming JAX-RS response builder used by document-download endpoints, and two utility collectors for working with `Stream<Map<…>>`. This page is the reference for all four.
+
+<Note>
+Don't add anything to this package without strong justification. Most cross-cutting helpers belong to `infrastructure/core/...` (under its proper concern: `service`, `serialization`, `data`). `util/` is reserved for genuinely orthogonal small tools.
+</Note>
+
+## File summary
+
+| File                              | Purpose                                                                |
+| --------------------------------- | ---------------------------------------------------------------------- |
+| `util/LoopContext.java`           | Marker interface for the loop's mutable context                       |
+| `util/LoopGuard.java`             | Bounded `do-while` and `while` loops with an iteration ceiling        |
+| `util/StreamResponseUtil.java`    | JAX-RS `Response`/`AsyncResponse` builders for streaming downloads     |
+| `util/StreamUtil.java`            | `Stream` collectors — `foldLeft`, `mergeMapsOfLists`                  |
+
+## `LoopContext`
+
+```java
+// util/LoopContext.java
+public interface LoopContext {}
+```
+
+A pure marker. Implementations of `LoopContext` are mutable carriers passed into a `LoopGuard` loop body. The marker exists so `LoopGuard`'s generic signature can be parameterised — it prevents accidentally passing an immutable value (which would make any loop pointless because the condition predicate would always see the same input).
+
+A typical concrete context:
+
+```java
+public class RescheduleContext implements LoopContext {
+    LocalDate current;
+    int        installmentsAllocated;
+    boolean    done;
+}
+```
+
+## `LoopGuard`
+
+```java
+public final class LoopGuard {
+
+    private LoopGuard() {}
+
+    public interface LoopBody<T extends LoopContext> {
+        void execute(T context);
+    }
+
+    public static <T extends LoopContext> void runSafeDoWhileLoop(
+            int maxIterations, T context, Predicate<T> condition, LoopBody<T> body) {
+        int count = 0;
+        do {
+            if (++count > maxIterations) {
+                throw new IllegalStateException(
+                    "Loop exceeded " + maxIterations + " iterations. Possible infinite loop.");
+            }
+            body.execute(context);
+        } while (condition.test(context));
+    }
+
+    public static <T extends LoopContext> void runSafeWhileLoop(
+            int maxIterations, T context, Predicate<T> condition, LoopBody<T> body) {
+        int count = 0;
+        while (condition.test(context)) {
+            if (++count > maxIterations) {
+                throw new IllegalStateException(
+                    "Loop exceeded " + maxIterations + " iterations. Possible infinite loop.");
+            }
+            body.execute(context);
+        }
+    }
+}
+```
+
+Two helpers — a `do-while` flavor (executes the body at least once before checking the condition) and a `while` flavor (checks first). Both throw `IllegalStateException` if the body runs more than `maxIterations` times.
+
+### Why bother?
+
+Date-arithmetic-heavy code in Fineract — loan repayment schedule generation, recurring-deposit projections, holiday-aware reschedule walks — sometimes ends up in a loop where the termination condition depends on the body advancing a date. Bugs in that advancement (e.g. forgetting to skip a holiday correctly) used to manifest as a JVM hang at production load. The guard makes those bugs fail-fast and visible.
+
+### Example
+
+```java
+RescheduleContext ctx = new RescheduleContext();
+ctx.current = startDate;
+ctx.done = false;
+
+LoopGuard.runSafeDoWhileLoop(
+    500,                                          // max iterations
+    ctx,                                          // context
+    c -> !c.done,                                 // continue condition
+    c -> {                                        // body
+        c.current = workingDays.nextWorkingDay(c.current);
+        c.installmentsAllocated++;
+        if (c.installmentsAllocated >= totalInstallments) {
+            c.done = true;
+        }
+    }
+);
+```
+
+A `500`-iteration ceiling is generous for loan schedules (typical max term: 360 months). If the inner advancement misbehaves and `c.current` never crosses the end date, the guard kicks in at iteration 501.
+
+<Warning>
+Pick `maxIterations` carefully — too low and a legitimate run dies; too high and the bug it was meant to catch can still hang for minutes. Use a value that's "the worst legitimate case × 2".
+</Warning>
+
+## `StreamResponseUtil`
+
+```java
+@Slf4j
+public final class StreamResponseUtil {
+
+    public static String DISPOSITION_TYPE_ATTACHMENT = "attachment";
+    public static String DISPOSITION_TYPE_INLINE     = "inline";
+
+    private static final ExecutorService executor = Executors.newCachedThreadPool();
+
+    private StreamResponseUtil() {}
+
+    public static Response ok(StreamResponseData content) { /* ... */ }
+
+    public static Future<?> ok(AsyncResponse asyncResponse, StreamResponseData content) { /* ... */ }
+
+    @Builder @Data @NoArgsConstructor @AllArgsConstructor
+    public static final class StreamResponseData {
+        private InputStream stream;
+        private String type;        // MIME content type
+        private String fileName;    // download filename
+        private String dispositionType; // "attachment" or "inline"
+        private Long size;
+    }
+}
+```
+
+Two ways to use it.
+
+### Synchronous `ok(StreamResponseData)`
+
+Returns a JAX-RS `Response` with a `StreamingOutput` that copies the input stream to the response writer via `IOUtils.copy`. Used by document download endpoints:
+
+```java
+@GET @Path("/{documentId}/attachment")
+public Response downloadFile(@PathParam("documentId") Long documentId) {
+    Document doc = repo.requireById(documentId);
+    InputStream content = storage.read(doc.getLocation());
+    return StreamResponseUtil.ok(StreamResponseData.builder()
+            .stream(content)
+            .type(doc.getType())                      // e.g. "application/pdf"
+            .fileName(doc.getFileName())              // for the browser's Save dialog
+            .dispositionType(DISPOSITION_TYPE_ATTACHMENT)
+            .size(doc.getSize())
+            .build());
+}
+```
+
+The builder distinguishes two cases:
+
+- **No `dispositionType`** → response is `Response.ok(stream, type)` — the browser inlines or displays based on its MIME handler.
+- **`dispositionType` set** → an explicit `Content-Disposition: <type>; filename="<filename>"` header is added.
+
+### Async `ok(AsyncResponse, StreamResponseData)`
+
+Submits the work to an internal `Executors.newCachedThreadPool()` and returns the `Future`:
+
+```java
+@GET @Path("/large-report")
+public void exportReport(@Suspended AsyncResponse asyncResponse) {
+    InputStream bytes = reportGenerator.streaming(); // long-running
+    StreamResponseUtil.ok(asyncResponse, StreamResponseData.builder()
+            .stream(bytes)
+            .type("text/csv")
+            .fileName("report-2024-08.csv")
+            .dispositionType(DISPOSITION_TYPE_ATTACHMENT)
+            .build());
+}
+```
+
+The Servlet container doesn't tie up the HTTP thread waiting for the generator; the cached thread pool calls `asyncResponse.resume(...)` when ready.
+
+<Warning>
+`StreamResponseUtil` does **not** close the `InputStream` after the response is written. Always wrap the stream so it self-closes (e.g. with `BoundedInputStream` + try-with-resources around the caller) or use a `StreamingOutput` decorator that closes on `write` completion. Otherwise you can leak file handles or S3 connections under load.
+</Warning>
+
+## `StreamUtil`
+
+Two collectors that fill gaps in the standard `Collectors` toolkit.
+
+### `foldLeft`
+
+```java
+public static <A, B> Collector<A, ?, B> foldLeft(
+        B init, BiFunction<? super B, ? super A, ? extends B> f) {
+    return Collectors.collectingAndThen(
+            Collectors.reducing(Function.<B>identity(),
+                                a -> b -> f.apply(b, a),
+                                Function::andThen),
+            endo -> endo.apply(init));
+}
+```
+
+A left fold for `Stream`. Useful when you want the **previous accumulator** to be the first argument of the combiner (which `Collectors.reducing` doesn't do directly):
+
+```java
+Stream<LoanRepayment> repayments = ...;
+BigDecimal totalPaid = repayments.collect(
+    StreamUtil.foldLeft(BigDecimal.ZERO, (acc, r) -> acc.add(r.amount())));
+```
+
+The trick is to build a stream of `B → B` functions (one per element) and `andThen`-combine them into a single `Function<B, B>`, then apply it to the initial value. Works for both sequential and parallel streams.
+
+### `mergeMapsOfLists`
+
+```java
+public static <K, V> Collector<Map<K, List<V>>, ?, Map<K, List<V>>> mergeMapsOfLists() {
+    return Collectors.collectingAndThen(
+        Collectors.flatMapping(
+            (Map<K, List<V>> m) -> m.entrySet().stream(),
+            Collectors.toMap(
+                Map.Entry::getKey,
+                Map.Entry::getValue,
+                (list1, list2) -> {
+                    List<V> merged = new ArrayList<>(list1);
+                    merged.addAll(list2);
+                    return merged;
+                })),
+        HashMap::new);  // ensures the result is mutable
+}
+```
+
+Combines a stream of `Map<K, List<V>>` into a single map: duplicate keys have their lists concatenated. Common use case is gathering per-partition results into one keyed structure:
+
+```java
+Map<Long, List<LoanInstallment>> byLoanId = partitions.stream()
+        .map(partition -> partition.groupInstallments())   // returns Map<loanId, List<...>>
+        .collect(StreamUtil.mergeMapsOfLists());
+```
+
+The `collectingAndThen(... , HashMap::new)` wrap ensures the returned `Map` is mutable so callers can do further `put`s without `UnsupportedOperationException`.
+
+## When to use what
+
+| You want to...                                                | Use                                          |
+| ------------------------------------------------------------- | -------------------------------------------- |
+| Run a date-walking loop with an iteration ceiling             | `LoopGuard.runSafeDoWhileLoop`              |
+| Run a fixed-condition loop with a ceiling                     | `LoopGuard.runSafeWhileLoop`                |
+| Stream a file or document back to the client                  | `StreamResponseUtil.ok(StreamResponseData)` |
+| Stream a long-running report without blocking the HTTP thread | `StreamResponseUtil.ok(asyncResponse, ...)` |
+| Sum/aggregate a stream where order matters                    | `StreamUtil.foldLeft`                       |
+| Combine per-shard `Map<K, List<V>>` into one                  | `StreamUtil.mergeMapsOfLists`               |
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Document Storage" icon="paperclip" href="/documents/overview">
+    Primary user of `StreamResponseUtil` — the downstream path of every document download.
+  </Card>
+  <Card title="Loan Overview" icon="hand-holding-dollar" href="/loan/overview">
+    Repayment schedule generation — the canonical use case for `LoopGuard`.
+  </Card>
+  <Card title="Spring Batch Infra" icon="diagram-project" href="/core/spring-batch-infra">
+    Per-partition results combined with `StreamUtil.mergeMapsOfLists` in some COB steps.
+  </Card>
+  <Card title="Jobs Overview" icon="clock" href="/jobs/overview">
+    Background jobs that stream report bodies asynchronously.
+  </Card>
+</CardGroup>

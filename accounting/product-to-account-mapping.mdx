@@ -1,0 +1,508 @@
+---
+title: "Product-to-Account Mapping: Slot Binding per Product"
+sidebarTitle: "Product Mapping"
+description: "How Apache Fineract binds loan, savings, and share product accounting slots to concrete GL accounts via the acc_product_mapping table and the mapping helpers."
+---
+
+Every Apache Fineract product (loan product, savings product, share product) participates in accounting through a set of *slots* — abstract roles like "loan portfolio", "interest on loans", "fund source". The `ProductToGLAccountMapping` table binds each (product, slot) pair to a concrete `GLAccount` row. This page documents the entity, the slot enums per product type, the helper services that read and persist mappings, and the payment-type / charge / classification overrides.
+
+## Entity — `org.apache.fineract.accounting.producttoaccountmapping.domain.ProductToGLAccountMapping`
+
+```java
+@Getter
+@Setter
+@NoArgsConstructor
+@Accessors(chain = true)
+@Entity
+@Table(name = "acc_product_mapping", uniqueConstraints = {
+        @UniqueConstraint(columnNames = { "product_id", "product_type", "financial_account_type", "payment_type" },
+                          name = "financial_action") })
+public class ProductToGLAccountMapping extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = true)
+    @JoinColumn(name = "gl_account_id")
+    private GLAccount glAccount;
+
+    @Column(name = "product_id", nullable = true)
+    private Long productId;
+
+    @ManyToOne
+    @JoinColumn(name = "payment_type", nullable = true)
+    private PaymentType paymentType;
+
+    @ManyToOne
+    @JoinColumn(name = "charge_id", nullable = true)
+    private Charge charge;
+
+    @Column(name = "product_type", nullable = true)
+    private int productType;
+
+    @Column(name = "financial_account_type", nullable = true)
+    private int financialAccountType;
+
+    @ManyToOne
+    @JoinColumn(name = "charge_off_reason_id", nullable = true)
+    private CodeValue chargeOffReason;
+
+    @ManyToOne
+    @JoinColumn(name = "write_off_reason_id", nullable = true)
+    private CodeValue writeOffReason;
+
+    @ManyToOne
+    @JoinColumn(name = "capitalized_income_classification_id", nullable = true)
+    private CodeValue capitalizedIncomeClassification;
+
+    @ManyToOne
+    @JoinColumn(name = "buydown_fee_classification_id", nullable = true)
+    private CodeValue buydownFeeClassification;
+
+    public static ProductToGLAccountMapping createNew(final GLAccount glAccount, final Long productId,
+            final int productType, final int financialAccountType,
+            final CodeValue chargeOffReason, final CodeValue capitalizedIncomeClassification,
+            final CodeValue buydownFeeClassification) {
+        return new ProductToGLAccountMapping().setGlAccount(glAccount).setProductId(productId)
+                .setProductType(productType).setFinancialAccountType(financialAccountType)
+                .setChargeOffReason(chargeOffReason)
+                .setCapitalizedIncomeClassification(capitalizedIncomeClassification)
+                .setBuydownFeeClassification(buydownFeeClassification);
+    }
+}
+```
+
+### Column reference
+
+| Column | Java | Purpose |
+| --- | --- | --- |
+| `gl_account_id` | `glAccount` | FK to the bound GL account. |
+| `product_id` | `productId` | The owning product (loan / savings / share id). |
+| `product_type` | `productType` | `PortfolioProductType.LOAN(1) / SAVINGS(2) / CLIENT(3) / SHARES(4) / PROVISIONING(5)`. |
+| `financial_account_type` | `financialAccountType` | The slot id — value from `CashAccountsForLoan`, `AccrualAccountsForLoan`, `CashAccountsForSavings`, `AccrualAccountsForSavings`, `CashAccountsForShares`. |
+| `payment_type` | `paymentType` | Optional. When set, this mapping is a *payment-type override* — used for `FUND_SOURCE` only. |
+| `charge_id` | `charge` | Optional. When set, this mapping is a *charge-to-income override* — used for `INCOME_FROM_FEES` / `INCOME_FROM_PENALTIES`. |
+| `charge_off_reason_id` | `chargeOffReason` | Optional. CodeValue conditioning a charge-off expense mapping. |
+| `write_off_reason_id` | `writeOffReason` | Optional. CodeValue conditioning a write-off expense mapping. |
+| `capitalized_income_classification_id` | `capitalizedIncomeClassification` | Optional. CodeValue conditioning an income-from-capitalization mapping. |
+| `buydown_fee_classification_id` | `buydownFeeClassification` | Optional. CodeValue conditioning a buy-down income mapping. |
+
+The DB unique constraint `financial_action` on `(product_id, product_type, financial_account_type, payment_type)` prevents duplicate "core" slot mappings while still allowing many rows per slot if they differ by payment type.
+
+## Slot enums per product type
+
+### Loan product — cash
+
+```java
+public enum CashAccountsForLoan {
+
+    FUND_SOURCE(1),
+    LOAN_PORTFOLIO(2),
+    INTEREST_ON_LOANS(3),
+    INCOME_FROM_FEES(4),
+    INCOME_FROM_PENALTIES(5),
+    LOSSES_WRITTEN_OFF(6),
+    TRANSFERS_SUSPENSE(10),
+    OVERPAYMENT(11),
+    INCOME_FROM_RECOVERY(12),
+    GOODWILL_CREDIT(13),
+    INCOME_FROM_CHARGE_OFF_INTEREST(14),
+    INCOME_FROM_CHARGE_OFF_FEES(15),
+    CHARGE_OFF_EXPENSE(16),
+    CHARGE_OFF_FRAUD_EXPENSE(17),
+    INCOME_FROM_CHARGE_OFF_PENALTY(18),
+    INCOME_FROM_GOODWILL_CREDIT_INTEREST(19),
+    INCOME_FROM_GOODWILL_CREDIT_FEES(20),
+    INCOME_FROM_GOODWILL_CREDIT_PENALTY(21),
+    CLASSIFICATION_INCOME(22);
+}
+```
+
+| Slot | Account type | Typical use |
+| --- | --- | --- |
+| `FUND_SOURCE` | Asset | The cash / bank account the loan draws from. |
+| `LOAN_PORTFOLIO` | Asset | Outstanding loan principal. |
+| `INTEREST_ON_LOANS` | Income | Interest revenue. |
+| `INCOME_FROM_FEES` | Income | Fee revenue. |
+| `INCOME_FROM_PENALTIES` | Income | Penalty revenue. |
+| `LOSSES_WRITTEN_OFF` | Expense | Write-off expense. |
+| `TRANSFERS_SUSPENSE` | Asset/Liability | Used in inter-fund and investor flows. |
+| `OVERPAYMENT` | Liability | Money received in excess of obligations. |
+| `INCOME_FROM_RECOVERY` | Income | Recovery of previously written-off principal. |
+| `GOODWILL_CREDIT` | Expense | Credits granted as goodwill. |
+| `INCOME_FROM_CHARGE_OFF_*` | Income | Recognised against subsequent collections on a charged-off loan. |
+| `CHARGE_OFF_EXPENSE` / `CHARGE_OFF_FRAUD_EXPENSE` | Expense | Charge-off booked when a loan is recognised as uncollectible. |
+| `INCOME_FROM_GOODWILL_CREDIT_*` | Income | Reversal income when goodwill credit is unwound. |
+| `CLASSIFICATION_INCOME` | Income | Reclassification income (advanced mapping). |
+
+### Loan product — accrual
+
+`AccrualAccountsForLoan` adds three receivable slots and four advanced slots on top of the cash slots:
+
+```java
+public enum AccrualAccountsForLoan {
+    FUND_SOURCE(1), LOAN_PORTFOLIO(2), INTEREST_ON_LOANS(3),
+    INCOME_FROM_FEES(4), INCOME_FROM_PENALTIES(5), LOSSES_WRITTEN_OFF(6),
+    INTEREST_RECEIVABLE(7),                     // ← accrual only
+    FEES_RECEIVABLE(8),                         // ← accrual only
+    PENALTIES_RECEIVABLE(9),                    // ← accrual only
+    TRANSFERS_SUSPENSE(10), OVERPAYMENT(11), INCOME_FROM_RECOVERY(12),
+    GOODWILL_CREDIT(13),
+    INCOME_FROM_CHARGE_OFF_INTEREST(14), INCOME_FROM_CHARGE_OFF_FEES(15),
+    CHARGE_OFF_EXPENSE(16), CHARGE_OFF_FRAUD_EXPENSE(17),
+    INCOME_FROM_CHARGE_OFF_PENALTY(18),
+    INCOME_FROM_GOODWILL_CREDIT_INTEREST(19), INCOME_FROM_GOODWILL_CREDIT_FEES(20),
+    INCOME_FROM_GOODWILL_CREDIT_PENALTY(21),
+    INCOME_FROM_CAPITALIZATION(22),             // ← accrual only
+    DEFERRED_INCOME_LIABILITY(23),              // ← accrual only
+    BUY_DOWN_EXPENSE(24),                       // ← accrual only
+    INCOME_FROM_BUY_DOWN(25);                   // ← accrual only
+}
+```
+
+### Savings product — cash
+
+```java
+public enum CashAccountsForSavings {
+
+    SAVINGS_REFERENCE(1),
+    SAVINGS_CONTROL(2),
+    INTEREST_ON_SAVINGS(3),
+    INCOME_FROM_FEES(4),
+    INCOME_FROM_PENALTIES(5),
+    TRANSFERS_SUSPENSE(10),
+    OVERDRAFT_PORTFOLIO_CONTROL(11),
+    INCOME_FROM_INTEREST(12),
+    LOSSES_WRITTEN_OFF(13),
+    ESCHEAT_LIABILITY(14);
+}
+```
+
+### Savings product — accrual
+
+`AccrualAccountsForSavings` adds four payable/receivable slots:
+
+```java
+public enum AccrualAccountsForSavings {
+    ... (cash slots) ...
+    FEES_RECEIVABLE(15),
+    PENALTIES_RECEIVABLE(16),
+    INTEREST_PAYABLE(17),
+    INTEREST_RECEIVABLE(18);
+}
+```
+
+### Share product — cash only
+
+```java
+public enum CashAccountsForShares {
+    SHARES_REFERENCE(1),
+    SHARES_SUSPENSE(2),
+    INCOME_FROM_FEES(3),
+    SHARES_EQUITY(4);
+}
+```
+
+### JSON parameter names
+
+The slot enums above are *integer* ids stored in the database. The JSON parameter names used in product create/update requests are in `LoanProductAccountingParams`, `SavingProductAccountingParams`, and `SharesProductAccountingParams`. Example for loan:
+
+```java
+public enum LoanProductAccountingParams {
+
+    FUND_SOURCE("fundSourceAccountId"),
+    LOAN_PORTFOLIO("loanPortfolioAccountId"),
+    INTEREST_ON_LOANS("interestOnLoanAccountId"),
+    INCOME_FROM_FEES("incomeFromFeeAccountId"),
+    INCOME_FROM_PENALTIES("incomeFromPenaltyAccountId"),
+    LOSSES_WRITTEN_OFF("writeOffAccountId"),
+    GOODWILL_CREDIT("goodwillCreditAccountId"),
+    OVERPAYMENT("overpaymentLiabilityAccountId"),
+    INTEREST_RECEIVABLE("receivableInterestAccountId"),
+    FEES_RECEIVABLE("receivableFeeAccountId"),
+    PENALTIES_RECEIVABLE("receivablePenaltyAccountId"),
+    TRANSFERS_SUSPENSE("transfersInSuspenseAccountId"),
+    PAYMENT_CHANNEL_FUND_SOURCE_MAPPING("paymentChannelToFundSourceMappings"),
+    PAYMENT_TYPE("paymentTypeId"),
+    FEE_INCOME_ACCOUNT_MAPPING("feeToIncomeAccountMappings"),
+    PENALTY_INCOME_ACCOUNT_MAPPING("penaltyToIncomeAccountMappings"),
+    CHARGE_ID("chargeId"),
+    INCOME_ACCOUNT_ID("incomeAccountId"),
+    INCOME_FROM_RECOVERY("incomeFromRecoveryAccountId"),
+    INCOME_FROM_CHARGE_OFF_INTEREST("incomeFromChargeOffInterestAccountId"),
+    INCOME_FROM_CHARGE_OFF_FEES("incomeFromChargeOffFeesAccountId"),
+    CHARGE_OFF_EXPENSE("chargeOffExpenseAccountId"),
+    CHARGE_OFF_FRAUD_EXPENSE("chargeOffFraudExpenseAccountId"),
+    INCOME_FROM_CHARGE_OFF_PENALTY("incomeFromChargeOffPenaltyAccountId"),
+    INCOME_FROM_GOODWILL_CREDIT_INTEREST("incomeFromGoodwillCreditInterestAccountId"),
+    INCOME_FROM_GOODWILL_CREDIT_FEES("incomeFromGoodwillCreditFeesAccountId"),
+    INCOME_FROM_GOODWILL_CREDIT_PENALTY("incomeFromGoodwillCreditPenaltyAccountId"),
+    CHARGE_OFF_REASON_TO_EXPENSE_ACCOUNT_MAPPINGS("chargeOffReasonToExpenseAccountMappings"),
+    WRITE_OFF_REASON_TO_EXPENSE_ACCOUNT_MAPPINGS("writeOffReasonsToExpenseMappings"),
+    EXPENSE_GL_ACCOUNT_ID("expenseAccountId"),
+    CHARGE_OFF_REASON_CODE_VALUE_ID("chargeOffReasonCodeValueId"),
+    WRITE_OFF_REASON_CODE_VALUE_ID("writeOffReasonCodeValueId"),
+    DEFERRED_INCOME_LIABILITY("deferredIncomeLiabilityAccountId"),
+    INCOME_FROM_CAPITALIZATION("incomeFromCapitalizationAccountId"),
+    BUY_DOWN_EXPENSE("buyDownExpenseAccountId"),
+    INCOME_FROM_BUY_DOWN("incomeFromBuyDownAccountId"),
+    CAPITALIZED_INCOME_CLASSIFICATION_TO_INCOME_ACCOUNT_MAPPINGS("capitalizedIncomeClassificationToIncomeAccountMappings"),
+    BUYDOWN_FEE_CLASSIFICATION_TO_INCOME_ACCOUNT_MAPPINGS("buydownfeeClassificationToIncomeAccountMappings"),
+    CLASSIFICATION_CODE_VALUE_ID("classificationCodeValueId");
+}
+```
+
+Similarly `LoanProductAccountingDataParams` ("dataParams") is the *response* shape returned by the read service: same enum members, but values like `fundSourceAccount` (without `Id`) point at the embedded `GLAccountData` object.
+
+## Repository
+
+```java
+public interface ProductToGLAccountMappingRepository
+        extends JpaRepository<ProductToGLAccountMapping, Long>,
+                JpaSpecificationExecutor<ProductToGLAccountMapping> {
+
+    Optional<ProductToGLAccountMapping> findCoreProductToFinAccountMapping(Long productId, int productType, int financialAccountType);
+
+    List<ProductToGLAccountMapping> findAllByProductIdAndProductType(Long productId, int productType);
+
+    Optional<ProductToGLAccountMapping> findByProductIdAndProductTypeAndPaymentType(
+            Long productId, int productType, Long paymentTypeId);
+
+    Optional<ProductToGLAccountMapping> findByProductIdAndProductTypeAndChargeId(
+            Long productId, int productType, Long chargeId);
+}
+```
+
+The naming convention is critical:
+
+- **Core mapping**: `payment_type IS NULL AND charge_id IS NULL` — looked up by `findCoreProductToFinAccountMapping`. There is exactly one core row per `(product, slot)`.
+- **Payment-type override**: `payment_type IS NOT NULL` — looked up by `findByProductIdAndProductTypeAndPaymentType` (only legal for `FUND_SOURCE`).
+- **Charge-to-income override**: `charge_id IS NOT NULL` — looked up by `findByProductIdAndProductTypeAndChargeId` (legal for `INCOME_FROM_FEES` / `INCOME_FROM_PENALTIES`).
+
+The accounting helper falls back from override to core when no override is present.
+
+## `ProductToGLAccountMappingHelper`
+
+The helper centralises the *save / merge / validate* logic shared by loan, savings, and shares write services. The key methods:
+
+```java
+public void saveProductToAccountMapping(final JsonElement element, final String paramName, final Long productId,
+        final int placeHolderTypeId, final GLAccountType expectedAccountType, final PortfolioProductType portfolioProductType) {
+    final Long accountId = this.fromApiJsonHelper.extractLongNamed(paramName, element);
+    if (accountId != null) {
+        final GLAccount glAccount = getAccountByIdAndType(paramName, expectedAccountType, accountId);
+        final ProductToGLAccountMapping accountMapping = new ProductToGLAccountMapping()
+                .setGlAccount(glAccount).setProductId(productId)
+                .setProductType(portfolioProductType.getValue()).setFinancialAccountType(placeHolderTypeId);
+        this.accountMappingRepository.saveAndFlush(accountMapping);
+    }
+}
+
+public void mergeProductToAccountMappingChanges(final JsonElement element, final String paramName, final Long productId,
+        final int accountTypeId, final String accountTypeName, final Map<String, Object> changes,
+        final GLAccountType expectedAccountType, final PortfolioProductType portfolioProductType) { ... }
+```
+
+Notable behaviour in `mergeProductToAccountMappingChanges`:
+
+```java
+final ProductToGLAccountMapping accountMapping = this.accountMappingRepository
+        .findCoreProductToFinAccountMapping(productId, portfolioProductType.getValue(), accountTypeId);
+if (accountMapping == null) {
+    ArrayList<String> optionalProductToGLAccountMappingEntries = new ArrayList<>();
+    optionalProductToGLAccountMappingEntries.add(LoanProductAccountingParams.GOODWILL_CREDIT.getValue());
+    optionalProductToGLAccountMappingEntries.add(LoanProductAccountingParams.INCOME_FROM_CHARGE_OFF_INTEREST.getValue());
+    optionalProductToGLAccountMappingEntries.add(LoanProductAccountingParams.INCOME_FROM_CHARGE_OFF_FEES.getValue());
+    optionalProductToGLAccountMappingEntries.add(LoanProductAccountingParams.CHARGE_OFF_EXPENSE.getValue());
+    optionalProductToGLAccountMappingEntries.add(LoanProductAccountingParams.CHARGE_OFF_FRAUD_EXPENSE.getValue());
+    ...
+    if (optionalProductToGLAccountMappingEntries.contains(paramName)) {
+        saveProductToAccountMapping(...);
+    } else {
+        throw new ProductToGLAccountMappingNotFoundException(portfolioProductType, productId, accountTypeName);
+    }
+} else {
+    if (accountMapping.getGlAccount() != null
+            && !Objects.equals(accountMapping.getGlAccount().getId(), accountId)) {
+        final GLAccount glAccount = getAccountByIdAndType(...);
+        changes.put(paramName, accountId);
+        accountMapping.setGlAccount(glAccount);
+        this.accountMappingRepository.saveAndFlush(accountMapping);
+    }
+}
+```
+
+The "optional entries" list represents slots that were added in later releases — the helper auto-inserts them on update so that an older product can be upgraded by simply supplying the new slot. For all other slots, a missing mapping during update raises `ProductToGLAccountMappingNotFoundException`.
+
+`getAccountByIdAndType(...)` ensures the chosen GL account has the expected `type` — e.g. assigning a Liability account to `LOAN_PORTFOLIO` (which expects Asset) fails fast with `ProductToGLAccountMappingInvalidException`.
+
+### Sister helpers
+
+- `SavingsProductToGLAccountMappingHelper` — savings-specific variants of the same methods.
+- `ShareProductToGLAccountMappingHelper` — shares-specific variants.
+
+Each extends or composes the base helper to apply slot-set differences.
+
+## Write service interface
+
+```java
+public interface ProductToGLAccountMappingWritePlatformService {
+
+    void createLoanProductToGLAccountMapping(Long loanProductId, JsonCommand command);
+
+    void createSavingProductToGLAccountMapping(Long savingProductId, JsonCommand command, DepositAccountType accountType);
+
+    Map<String, Object> updateLoanProductToGLAccountMapping(Long loanProductId, JsonCommand command,
+            boolean accountingRuleChanged, AccountingRuleType accountingRuleTypeId,
+            boolean enableIncomeCapitalization, boolean enableBuyDownFee, boolean merchantBuyDownFee);
+
+    Map<String, Object> updateSavingsProductToGLAccountMapping(Long savingsProductId, JsonCommand command,
+            boolean accountingRuleChanged, int accountingRuleTypeId, DepositAccountType accountType);
+
+    void createShareProductToGLAccountMapping(Long shareProductId, JsonCommand command);
+
+    Map<String, Object> updateShareProductToGLAccountMapping(Long shareProductId, JsonCommand command,
+            boolean accountingRuleChanged, int accountingRuleTypeId);
+}
+```
+
+The implementation `ProductToGLAccountMappingWritePlatformServiceImpl` lives in `fineract-provider` under the slightly different package name `productaccountmapping`. The loan flow dispatches by accounting rule type:
+
+```java
+switch (accountingRuleTypeId) {
+    case AccountingRuleType.NONE              -> { /* delete all mappings */ }
+    case AccountingRuleType.CASH_BASED        -> saveAllCashLoanSlots(...);
+    case AccountingRuleType.ACCRUAL_UPFRONT,
+         AccountingRuleType.ACCRUAL_PERIODIC  -> saveAllAccrualLoanSlots(...);
+}
+```
+
+It also walks the optional payment-channel-fund-source array and the fee-to-income / penalty-to-income arrays:
+
+```json
+{
+  "paymentChannelToFundSourceMappings": [
+    { "paymentTypeId": 1, "fundSourceAccountId": 14 },
+    { "paymentTypeId": 2, "fundSourceAccountId": 15 }
+  ],
+  "feeToIncomeAccountMappings": [
+    { "chargeId": 3, "incomeAccountId": 41 }
+  ]
+}
+```
+
+Each item produces a separate row in `acc_product_mapping` with `payment_type` or `charge_id` set respectively.
+
+## Read service
+
+`ProductToGLAccountMappingReadPlatformServiceImpl` exposes:
+
+- `fetchAccountingMappingsForLoanProduct(Long productId)` → `Map<String, Object>` keyed by `LoanProductAccountingDataParams` names, where each value is a `GLAccountData` (or list of `ChargeToGLAccountMapper` / `PaymentTypeToGLAccountMapper`).
+- `fetchAccountingMappingsForSavingsProduct(...)` → analogous.
+- `fetchAccountingMappingsForShareProduct(...)` → analogous.
+
+These maps are merged into the product's `LoanProductData` / `SavingsProductData` / `ShareProductData` so the product details endpoint surfaces the bound GL accounts in one payload.
+
+## Resolution at posting time
+
+`AccountingProcessorHelper.getLinkedGLAccountForLoanProduct(loanProductId, accountTypeId, paymentTypeId)`:
+
+```java
+public GLAccount getLinkedGLAccountForLoanProduct(final Long loanProductId,
+        final Integer accountTypeId, final Long paymentTypeId) {
+    ProductToGLAccountMapping accountMapping = null;
+    if (paymentTypeId != null && CashAccountsForLoan.FUND_SOURCE.getValue() == accountTypeId) {
+        accountMapping = this.accountMappingRepository
+                .findByProductIdAndProductTypeAndPaymentType(loanProductId,
+                        PortfolioProductType.LOAN.getValue(), paymentTypeId).orElse(null);
+    }
+    if (accountMapping == null) {
+        accountMapping = this.accountMappingRepository
+                .findCoreProductToFinAccountMapping(loanProductId,
+                        PortfolioProductType.LOAN.getValue(), accountTypeId)
+                .orElseThrow(() -> new ProductToGLAccountMappingNotFoundException(...));
+    }
+    return accountMapping.getGlAccount();
+}
+```
+
+Resolution order:
+
+1. **Payment-type override** (only when `accountTypeId == FUND_SOURCE`).
+2. **Core mapping** (no payment type, no charge).
+
+The same pattern is used for `getLinkedGLAccountForLoanCharges(loanProductId, accountTypeId, chargeId)`: charge override first, core mapping second.
+
+## Tables at a glance
+
+### Loan product mapping slots
+
+| Slot enum (cash) | Slot enum (accrual) | JSON param | Expected GL type |
+| --- | --- | --- | --- |
+| FUND_SOURCE (1) | FUND_SOURCE (1) | `fundSourceAccountId` | Asset / Liability |
+| LOAN_PORTFOLIO (2) | LOAN_PORTFOLIO (2) | `loanPortfolioAccountId` | Asset |
+| INTEREST_ON_LOANS (3) | INTEREST_ON_LOANS (3) | `interestOnLoanAccountId` | Income |
+| INCOME_FROM_FEES (4) | INCOME_FROM_FEES (4) | `incomeFromFeeAccountId` | Income |
+| INCOME_FROM_PENALTIES (5) | INCOME_FROM_PENALTIES (5) | `incomeFromPenaltyAccountId` | Income |
+| LOSSES_WRITTEN_OFF (6) | LOSSES_WRITTEN_OFF (6) | `writeOffAccountId` | Expense |
+| – | INTEREST_RECEIVABLE (7) | `receivableInterestAccountId` | Asset |
+| – | FEES_RECEIVABLE (8) | `receivableFeeAccountId` | Asset |
+| – | PENALTIES_RECEIVABLE (9) | `receivablePenaltyAccountId` | Asset |
+| TRANSFERS_SUSPENSE (10) | TRANSFERS_SUSPENSE (10) | `transfersInSuspenseAccountId` | Asset / Liability |
+| OVERPAYMENT (11) | OVERPAYMENT (11) | `overpaymentLiabilityAccountId` | Liability |
+| INCOME_FROM_RECOVERY (12) | INCOME_FROM_RECOVERY (12) | `incomeFromRecoveryAccountId` | Income |
+| GOODWILL_CREDIT (13) | GOODWILL_CREDIT (13) | `goodwillCreditAccountId` | Expense |
+| INCOME_FROM_CHARGE_OFF_INTEREST (14) | (same) | `incomeFromChargeOffInterestAccountId` | Income |
+| INCOME_FROM_CHARGE_OFF_FEES (15) | (same) | `incomeFromChargeOffFeesAccountId` | Income |
+| CHARGE_OFF_EXPENSE (16) | (same) | `chargeOffExpenseAccountId` | Expense |
+| CHARGE_OFF_FRAUD_EXPENSE (17) | (same) | `chargeOffFraudExpenseAccountId` | Expense |
+| INCOME_FROM_CHARGE_OFF_PENALTY (18) | (same) | `incomeFromChargeOffPenaltyAccountId` | Income |
+| – | INCOME_FROM_CAPITALIZATION (22) | `incomeFromCapitalizationAccountId` | Income |
+| – | DEFERRED_INCOME_LIABILITY (23) | `deferredIncomeLiabilityAccountId` | Liability |
+| – | BUY_DOWN_EXPENSE (24) | `buyDownExpenseAccountId` | Expense |
+| – | INCOME_FROM_BUY_DOWN (25) | `incomeFromBuyDownAccountId` | Income |
+
+### Savings product slots
+
+| Slot enum (cash) | Slot enum (accrual) | JSON param | Expected GL type |
+| --- | --- | --- | --- |
+| SAVINGS_REFERENCE (1) | (same) | `savingsReferenceAccountId` | Asset |
+| SAVINGS_CONTROL (2)   | (same) | `savingsControlAccountId` | Liability |
+| INTEREST_ON_SAVINGS (3) | (same) | `interestOnSavingsAccountId` | Expense |
+| INCOME_FROM_FEES (4) | (same) | `incomeFromFeeAccountId` | Income |
+| INCOME_FROM_PENALTIES (5) | (same) | `incomeFromPenaltyAccountId` | Income |
+| TRANSFERS_SUSPENSE (10) | (same) | `transfersInSuspenseAccountId` | Asset/Liability |
+| OVERDRAFT_PORTFOLIO_CONTROL (11) | (same) | `overdraftPortfolioControlId` | Asset |
+| INCOME_FROM_INTEREST (12) | (same) | `incomeFromInterestId` | Income |
+| LOSSES_WRITTEN_OFF (13) | (same) | `writeOffAccountId` | Expense |
+| ESCHEAT_LIABILITY (14) | (same) | `escheatLiabilityId` | Liability |
+| – | FEES_RECEIVABLE (15) | `feesReceivableAccountId` | Asset |
+| – | PENALTIES_RECEIVABLE (16) | `penaltiesReceivableAccountId` | Asset |
+| – | INTEREST_PAYABLE (17) | `interestPayableAccountId` | Liability |
+| – | INTEREST_RECEIVABLE (18) | `interestReceivableAccountId` | Asset |
+
+### Share product slots
+
+| Slot enum | JSON param | Expected GL type |
+| --- | --- | --- |
+| SHARES_REFERENCE (1) | `shareReferenceId` | Asset |
+| SHARES_SUSPENSE (2) | `shareSuspenseId` | Liability |
+| INCOME_FROM_FEES (3) | `incomeFromFeeAccountId` | Income |
+| SHARES_EQUITY (4) | `shareEquityId` | Equity |
+
+## Cross references
+
+<CardGroup cols={2}>
+  <Card title="GL accounts" icon="book" href="/accounting/gl-accounts">
+    The bound entity.
+  </Card>
+  <Card title="Accounting processors" icon="gears" href="/accounting/accounting-processors">
+    Where slot lookups happen at posting time.
+  </Card>
+  <Card title="Financial activity accounts" icon="building-columns" href="/accounting/financial-activity-accounts">
+    Sister table for organisation-level (not product-level) bindings.
+  </Card>
+  <Card title="Loan overview" icon="hand-holding-dollar" href="/loan/overview">
+    `LoanProduct` carries the JSON parameters processed here.
+  </Card>
+  <Card title="Savings overview" icon="piggy-bank" href="/savings/overview">
+    Same for `SavingsProduct`.
+  </Card>
+</CardGroup>

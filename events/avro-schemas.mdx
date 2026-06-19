@@ -1,0 +1,375 @@
+---
+title: "Avro Schemas — fineract-avro-schemas Module Reference"
+sidebarTitle: "Avro Schemas"
+description: "Every .avsc shipped in fineract-avro-schemas, the Gradle build that generates Java classes, the bigdecimal template, and schema-evolution rules."
+---
+
+The Avro schemas that serialise every external event in Apache Fineract live in a dedicated Gradle module — `fineract-avro-schemas`. At build time, the module preprocesses `.avsc` files (substituting a shared `bigdecimal` logical type), then runs the `com.github.davidmc24.gradle.plugin.avro` plugin to generate Java classes that implement `ByteBufferSerializable`. Both the runtime (the `BusinessEventSerializer` implementations in `fineract-provider`) and downstream consumers (Java SDK packaging) link against those generated classes. This page is the catalogue: the envelope schemas, the per-domain payload schemas, the bigdecimal template, and the Gradle wiring that ties it all together.
+
+<Note>
+There is no schema registry in Fineract — every consumer must have the same `org.apache.fineract.avro.*` class on its classpath, resolved via `MessageV1.dataschema` (the fully-qualified Java class name). Schema evolution is therefore by Java-class compatibility, not by schema-registry compatibility checks.
+</Note>
+
+## Module layout
+
+```
+fineract-avro-schemas/
+├── build.gradle               ← preprocess + GenerateAvroJavaTask
+├── dependencies.gradle
+└── src/
+    └── main/
+        ├── avro/              ← .avsc source files (organised by family/v1/)
+        │   ├── MessageV1.avsc
+        │   ├── BulkMessageItemV1.avsc
+        │   ├── BulkMessagePayloadV1.avsc
+        │   ├── client/v1/…
+        │   ├── document/v1/…
+        │   ├── fixeddeposit/v1/…
+        │   ├── generic/v1/…
+        │   ├── gl/v1/…
+        │   ├── group/v1/…
+        │   ├── loan/v1/…
+        │   ├── office/v1/…
+        │   ├── payment/v1/…
+        │   ├── portfolio/v1/…
+        │   ├── recurringdeposit/v1/…
+        │   ├── savings/v1/…
+        │   └── share/v1/…
+        └── resources/
+            ├── avro-templates/
+            │   └── bigdecimal.avsc      ← shared logical-type template
+            └── avro-generator-templates/
+                ├── enum.vm
+                ├── fixed.vm
+                ├── protocol.vm
+                └── record.vm             ← custom Velocity template that adds `implements ByteBufferSerializable`
+```
+
+## Gradle build
+
+`fineract-avro-schemas/build.gradle` runs three tasks in sequence:
+
+```groovy
+apply plugin: 'com.github.davidmc24.gradle.plugin.avro-base'
+
+tasks.register('preprocessAvroSchemas', PreprocessAvroSchemasTask) {
+    inputDir = file("$projectDir/src/main/avro")
+    bigDecimalTemplate = file("$projectDir/src/main/resources/avro-templates/bigdecimal.avsc")
+    outputDir = file("$buildDir/generated/avro/src/main/avro")
+}
+
+task buildJavaSdk(type: GenerateAvroJavaTask) {
+    source("$buildDir/generated/avro/src/main/avro")
+    outputDir = file("$buildDir/generated/java/src/main/java")
+    templateDirectory = "$projectDir/src/main/resources/avro-generator-templates/"
+}
+```
+
+| Task                    | Effect                                                                                                            |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `preprocessAvroSchemas` | Reads every `.avsc`, replaces the literal `"bigdecimal"` token with the contents of `avro-templates/bigdecimal.avsc`, writes to `$buildDir/generated/avro/src/main/avro`. |
+| `buildJavaSdk`          | Calls `GenerateAvroJavaTask` against the preprocessed schemas using the custom record template so each generated class implements `ByteBufferSerializable`. Output goes to `$buildDir/generated/java/src/main/java`. |
+| `compileJava`           | `dependsOn buildJavaSdk`; compiles the generated Java alongside the few hand-written ones (the `ByteBufferSerializable` marker, the `generator` package). |
+
+Java compatibility is pinned at 1.8 (`sourceCompatibility = VERSION_1_8`) so the generated SDK can be consumed by older downstream services.
+
+## The bigdecimal logical type
+
+```json
+// fineract-avro-schemas/src/main/resources/avro-templates/bigdecimal.avsc
+{
+    "logicalType": "decimal",
+    "precision": 27,
+    "scale": 8,
+    "type": "bytes"
+}
+```
+
+Schemas that need a `java.math.BigDecimal` write `"bigdecimal"` as the field type; the preprocessor expands it inline. The chosen `(27, 8)` covers all of Fineract's monetary fields and percentage rates without precision loss. The decimal logical type is encoded on the wire as variable-length `bytes`, so unions like `[ "null", "bigdecimal" ]` are valid and common.
+
+## Envelope schemas
+
+These three are loaded by every consumer; the inner payloads vary per event.
+
+### `MessageV1.avsc`
+
+The outer wire envelope. All external events use this:
+
+```json
+{
+    "name": "MessageV1",
+    "namespace": "org.apache.fineract.avro",
+    "type": "record",
+    "fields": [
+        { "name": "id",             "type": "long",   "doc": "ID of the message to be sent" },
+        { "name": "source",         "type": "string", "doc": "Unique identifier of the source service" },
+        { "name": "type",           "type": "string", "doc": "Event type. Example: LoanApprovedBusinessEvent" },
+        { "name": "category",       "type": "string", "doc": "Category. Example: LOAN" },
+        { "name": "createdAt",      "type": "string", "doc": "UTC time, ISO_LOCAL_DATE_TIME" },
+        { "name": "businessDate",   "type": "string", "doc": "Business date, ISO_LOCAL_DATE" },
+        { "name": "tenantId",       "type": "string", "doc": "Tenant the event was sent from" },
+        { "name": "idempotencyKey", "type": "string", "doc": "Consumer dedup key" },
+        { "name": "dataschema",     "type": "string", "doc": "FQCN of the inner Avro schema" },
+        { "name": "data",           "type": "bytes",  "doc": "Inner payload bytes" }
+    ]
+}
+```
+
+### `BulkMessagePayloadV1.avsc`
+
+The body shape that wraps multiple inner events when the recording window produces a `BulkBusinessEvent`:
+
+```json
+{
+    "name": "BulkMessagePayloadV1",
+    "namespace": "org.apache.fineract.avro",
+    "type": "record",
+    "fields": [{
+        "name": "datas",
+        "doc": "The individual messages within this bulk message",
+        "type": { "type": "array", "items": "org.apache.fineract.avro.BulkMessageItemV1" }
+    }]
+}
+```
+
+### `BulkMessageItemV1.avsc`
+
+One element inside the bulk:
+
+```json
+{
+    "name": "BulkMessageItemV1",
+    "namespace": "org.apache.fineract.avro",
+    "type": "record",
+    "fields": [
+        { "name": "id",         "type": "long",   "doc": "ID of the bulk-internal message" },
+        { "name": "type",       "type": "string", "doc": "Event type" },
+        { "name": "category",   "type": "string", "doc": "Event category" },
+        { "name": "dataschema", "type": "string", "doc": "FQCN of the inner Avro schema for this item" },
+        { "name": "data",       "type": "bytes",  "doc": "Inner Avro payload bytes for this item" }
+    ]
+}
+```
+
+## Per-domain schema catalogue
+
+83 files in total. Each is generated into a Java class under `org.apache.fineract.avro.<namespace>`.
+
+### Generic (`generic/v1/`)
+
+| `.avsc`                                | Avro class                          | Used by                                                          |
+| -------------------------------------- | ----------------------------------- | ---------------------------------------------------------------- |
+| `CalendarDataV1.avsc`                  | `CalendarDataV1`                    | Calendar / holiday fields embedded in loan and group payloads    |
+| `CodeValueDataV1.avsc`                 | `CodeValueDataV1`                   | Generic `code_value` reference (`m_code_value`)                  |
+| `CommandProcessingResultV1.avsc`       | `CommandProcessingResultV1`         | Command pipeline outcomes carried in some events                 |
+| `CurrencyDataV1.avsc`                  | `CurrencyDataV1`                    | Currency triple used by every monetary record                    |
+| `EnumOptionDataV1.avsc`                | `EnumOptionDataV1`                  | Generic enum representation with `id`, `code`, `value`           |
+| `StringEnumOptionDataV1.avsc`          | `StringEnumOptionDataV1`            | String-keyed enum representation                                 |
+
+### Client (`client/v1/`)
+
+| `.avsc`                                | Avro class                          | Event                                                             |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `ClientDataV1.avsc`                    | `ClientDataV1`                      | `Client*BusinessEvent` family                                     |
+| `ClientCollateralManagementV1.avsc`    | `ClientCollateralManagementV1`      | Collateral nested inside `ClientDataV1`                           |
+| `ClientTimelineDataV1.avsc`            | `ClientTimelineDataV1`              | Application timeline inside `ClientDataV1`                        |
+
+### Document (`document/v1/`)
+
+| `.avsc`                                | Avro class                          | Event                                                             |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `DocumentDataV1.avsc`                  | `DocumentDataV1`                    | `DocumentCreatedBusinessEvent`, `DocumentDeletedBusinessEvent`    |
+
+### Office (`office/v1/`)
+
+| `.avsc`                                | Avro class                          | Used by                                                           |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `OfficeDataV1.avsc`                    | `OfficeDataV1`                      | Office references embedded in client/loan/group payloads          |
+
+### Group (`group/v1/`)
+
+| `.avsc`                                | Avro class                          | Event                                                             |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `GroupGeneralDataV1.avsc`              | `GroupGeneralDataV1`                | `GroupsCreateBusinessEvent`, `CentersCreateBusinessEvent`         |
+| `GroupRoleDataV1.avsc`                 | `GroupRoleDataV1`                   | Group-role nested member inside `GroupGeneralDataV1`              |
+
+### Payment / charges (`payment/v1/`, `portfolio/v1/`)
+
+| `.avsc`                                | Avro class                          | Used by                                                           |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `PaymentDetailDataV1.avsc`             | `PaymentDetailDataV1`               | Embedded in transaction payloads                                  |
+| `PaymentTypeDataV1.avsc`               | `PaymentTypeDataV1`                 | Embedded in payment-detail records                                |
+| `ChargeDataV1.avsc`                    | `ChargeDataV1`                      | Embedded in `LoanChargeDataV1`, `SavingsAccountChargeDataV1`      |
+| `PortfolioAccountDataV1.avsc`          | `PortfolioAccountDataV1`            | Linked-account references                                         |
+| `RateDataV1.avsc`                      | `RateDataV1`                        | Loan rate references                                              |
+
+### GL (`gl/v1/`)
+
+| `.avsc`                                | Avro class                          | Used by                                                           |
+| -------------------------------------- | ----------------------------------- | ----------------------------------------------------------------- |
+| `GLAccountDataV1.avsc`                 | `GLAccountDataV1`                   | Journal-entry events emitted by `fineract-accounting`             |
+
+### Loan (`loan/v1/`) — the biggest family
+
+| `.avsc`                                            | Avro class                                  | Used by                                                                  |
+| -------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------------ |
+| `LoanAccountDataV1.avsc`                           | `LoanAccountDataV1`                         | All `LoanBusinessEvent` (status, balance, snapshot, charge-off, …)        |
+| `LoanAccountSummaryDataV1.avsc`                    | `LoanAccountSummaryDataV1`                  | Nested in `LoanAccountDataV1.summary`                                    |
+| `LoanAccountStayedLockedDataV1.avsc`               | `LoanAccountStayedLockedDataV1`             | Per-loan element of stayed-locked notifications                          |
+| `LoanAccountsStayedLockedDataV1.avsc`              | `LoanAccountsStayedLockedDataV1`            | `LoanAccountsStayedLockedBusinessEventSerializer` payload                |
+| `LoanAccountDelinquencyRangeDataV1.avsc`           | `LoanAccountDelinquencyRangeDataV1`         | `LoanDelinquencyRangeChangeBusinessEvent`                                |
+| `LoanAmountDataV1.avsc`                            | `LoanAmountDataV1`                          | Nested monetary fields                                                   |
+| `LoanApplicationTimelineDataV1.avsc`               | `LoanApplicationTimelineDataV1`             | Nested timeline                                                          |
+| `LoanChargeDataV1.avsc`                            | `LoanChargeDataV1`                          | `LoanAdd/Update/WaiveChargeBusinessEvent`                                |
+| `LoanChargeDataRangeViewV1.avsc`                   | `LoanChargeDataRangeViewV1`                 | Used inside `LoanRepaymentPastDueDataMapper`                             |
+| `LoanChargeDeletedV1.avsc`                         | `LoanChargeDeletedV1`                       | `LoanDeleteChargeBusinessEvent`                                          |
+| `LoanChargePaidByDataV1.avsc`                      | `LoanChargePaidByDataV1`                    | Nested in transaction payloads                                           |
+| `LoanInstallmentChargeDataV1.avsc`                 | `LoanInstallmentChargeDataV1`               | Charge per installment                                                   |
+| `LoanInstallmentDelinquencyBucketDataV1.avsc`      | `LoanInstallmentDelinquencyBucketDataV1`    | Installment-level delinquency, injected via `LoanInstallmentLevelDelinquencyEventProducer` |
+| `LoanInterestRecalculationDataV1.avsc`             | `LoanInterestRecalculationDataV1`           | `LoanInterestRecalculationBusinessEvent`                                 |
+| `LoanOwnershipTransferDataV1.avsc`                 | `LoanOwnershipTransferDataV1`               | `LoanOwnershipTransferBusinessEvent` (see [Investor Events](/investor/investor-events)) |
+| `LoanProductBorrowerCycleVariationDataV1.avsc`     | `LoanProductBorrowerCycleVariationDataV1`   | Nested in product                                                        |
+| `LoanProductDataV1.avsc`                           | `LoanProductDataV1`                         | `LoanProductCreateBusinessEvent`                                         |
+| `LoanProductGuaranteeDataV1.avsc`                  | `LoanProductGuaranteeDataV1`                | Nested in product                                                        |
+| `LoanProductInterestRecalculationDataV1.avsc`      | `LoanProductInterestRecalculationDataV1`    | Nested in product                                                        |
+| `LoanRepaymentDueDataV1.avsc`                      | `LoanRepaymentDueDataV1`                    | `LoanRepaymentDueBusinessEvent`                                          |
+| `LoanScheduleDataV1.avsc`                          | `LoanScheduleDataV1`                        | Nested repayment schedule in `LoanAccountDataV1`                         |
+| `LoanSchedulePeriodDataV1.avsc`                    | `LoanSchedulePeriodDataV1`                  | Nested schedule period                                                   |
+| `LoanStatusEnumDataV1.avsc`                        | `LoanStatusEnumDataV1`                      | Status enum                                                              |
+| `LoanSummaryDataV1.avsc`                           | `LoanSummaryDataV1`                         | Account summary                                                          |
+| `LoanTermVariationsDataV1.avsc`                    | `LoanTermVariationsDataV1`                  | Active term variations                                                   |
+| `LoanTransactionAdjustmentDataV1.avsc`             | `LoanTransactionAdjustmentDataV1`           | `LoanAdjustTransactionBusinessEvent`                                     |
+| `LoanTransactionDataV1.avsc`                       | `LoanTransactionDataV1`                     | `LoanTransactionBusinessEvent` family                                    |
+| `LoanTransactionEnumDataV1.avsc`                   | `LoanTransactionEnumDataV1`                 | Transaction-type enum                                                    |
+| `LoanTransactionFlagsDataV1.avsc`                  | `LoanTransactionFlagsDataV1`                | Flags nested inside transactions                                         |
+| `LoanTransactionRelationDataV1.avsc`               | `LoanTransactionRelationDataV1`             | Relations between transactions                                           |
+| `OriginatorDetailsV1.avsc`                         | `OriginatorDetailsV1`                       | Originator data injected by enrichers                                    |
+| `RepaymentDueDataV1.avsc`                          | `RepaymentDueDataV1`                        | Inside `LoanRepaymentDueDataV1`                                          |
+| `RepaymentPastDueDataV1.avsc`                      | `RepaymentPastDueDataV1`                    | `LoanRepaymentPastDueDataMapper`                                         |
+| `UnpaidChargeDataV1.avsc`                          | `UnpaidChargeDataV1`                        | `UnpaidChargeDataMapper`                                                 |
+| `CollectionDataV1.avsc`                            | `CollectionDataV1`                          | Nested collection data inside loan                                       |
+| `DelinquencyBucketDataV1.avsc`                     | `DelinquencyBucketDataV1`                   | Nested delinquency bucket                                                |
+| `DelinquencyPausePeriodV1.avsc`                    | `DelinquencyPausePeriodV1`                  | Delinquency pause periods                                                |
+| `DelinquencyRangeDataV1.avsc`                      | `DelinquencyRangeDataV1`                    | Delinquency range                                                        |
+| `DisbursementDataV1.avsc`                          | `DisbursementDataV1`                        | Multi-tranche disbursement entries                                       |
+
+### Savings (`savings/v1/`)
+
+| `.avsc`                                          | Avro class                                  | Used by                                              |
+| ------------------------------------------------ | ------------------------------------------- | ---------------------------------------------------- |
+| `SavingsAccountDataV1.avsc`                      | `SavingsAccountDataV1`                      | `SavingsAccountBusinessEvent` family                 |
+| `SavingsAccountApplicationTimelineDataV1.avsc`   | `SavingsAccountApplicationTimelineDataV1`   | Nested timeline                                      |
+| `SavingsAccountChargeDataV1.avsc`                | `SavingsAccountChargeDataV1`                | Account charges                                      |
+| `SavingsAccountChargesPaidByDataV1.avsc`         | `SavingsAccountChargesPaidByDataV1`         | Nested charge-paid                                   |
+| `SavingsAccountStatusEnumDataV1.avsc`            | `SavingsAccountStatusEnumDataV1`            | Status enum                                          |
+| `SavingsAccountSubStatusEnumDataV1.avsc`         | `SavingsAccountSubStatusEnumDataV1`         | Sub-status enum                                      |
+| `SavingsAccountSummaryDataV1.avsc`               | `SavingsAccountSummaryDataV1`               | Account summary                                      |
+| `SavingsAccountTransactionDataV1.avsc`           | `SavingsAccountTransactionDataV1`           | `SavingsAccountTransactionBusinessEvent`             |
+| `SavingsAccountTransactionEnumDataV1.avsc`       | `SavingsAccountTransactionEnumDataV1`       | Transaction-type enum                                |
+| `SavingsAccountStayedLockedDataV1.avsc`          | `SavingsAccountStayedLockedDataV1`          | Per-account element of stayed-locked                 |
+| `SavingsAccountsStayedLockedDataV1.avsc`         | `SavingsAccountsStayedLockedDataV1`         | `SavingsAccountsStayedLockedBusinessEventSerializer` |
+| `AccountTransferDataV1.avsc`                     | `AccountTransferDataV1`                     | Inter-account transfer details                       |
+
+### Recurring deposit (`recurringdeposit/v1/`)
+
+| `.avsc`                                          | Avro class                                  | Used by                                            |
+| ------------------------------------------------ | ------------------------------------------- | -------------------------------------------------- |
+| `RecurringDepositAccountDataV1.avsc`             | `RecurringDepositAccountDataV1`             | `RecurringDepositAccountBusinessEvent` family      |
+
+### Fixed deposit (`fixeddeposit/v1/`)
+
+| `.avsc`                                          | Avro class                                  | Used by                                            |
+| ------------------------------------------------ | ------------------------------------------- | -------------------------------------------------- |
+| `FixedDepositAccountDataV1.avsc`                 | `FixedDepositAccountDataV1`                 | `FixedDepositAccountBusinessEvent` family          |
+
+### Share (`share/v1/`)
+
+| `.avsc`                                          | Avro class                                  | Used by                                            |
+| ------------------------------------------------ | ------------------------------------------- | -------------------------------------------------- |
+| `ShareAccountDataV1.avsc`                        | `ShareAccountDataV1`                        | `ShareAccountBusinessEvent` family                 |
+| `ShareAccountApplicationTimelineDataV1.avsc`     | `ShareAccountApplicationTimelineDataV1`     | Nested timeline                                    |
+| `ShareAccountStatusEnumDataV1.avsc`              | `ShareAccountStatusEnumDataV1`              | Status enum                                        |
+| `ShareAccountSummaryDataV1.avsc`                 | `ShareAccountSummaryDataV1`                 | Account summary                                    |
+| `ShareAccountTransactionDataV1.avsc`             | `ShareAccountTransactionDataV1`             | Share transactions                                 |
+| `ShareProductDataV1.avsc`                        | `ShareProductDataV1`                        | `ShareProductDividentsCreateBusinessEvent`         |
+| `ShareProductMarketPriceDataV1.avsc`             | `ShareProductMarketPriceDataV1`             | Nested market price                                |
+
+## A schema example
+
+```json
+// fineract-avro-schemas/src/main/avro/loan/v1/LoanAccountDataV1.avsc  (head)
+{
+    "name": "LoanAccountDataV1",
+    "namespace": "org.apache.fineract.avro.loan.v1",
+    "type": "record",
+    "fields": [
+        { "default": null, "name": "id",              "type": [ "null", "long"   ] },
+        { "default": null, "name": "accountNo",       "type": [ "null", "string" ] },
+        { "default": null, "name": "externalId",      "type": [ "null", "string" ] },
+        { "default": null, "name": "externalOwnerId", "type": [ "null", "string" ] },
+        { "default": null, "name": "settlementDate",  "type": [ "null", "string" ] },
+        …
+    ]
+}
+```
+
+Most fields are unions of `[null, T]` with a default of `null` — the convention that lets schema evolution add new fields without breaking older consumers.
+
+## Schema evolution rules in practice
+
+Because there is no schema registry, the rules are simpler but stricter:
+
+| Change                                          | Safe?      | Why                                                                                                |
+| ----------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
+| Add a new field with `default = null` (union)   | ✅         | Older Java consumers ignore the unknown field; new consumers see `null` when reading old payloads  |
+| Remove an existing field                        | ⚠️         | Older Java consumers reading the new payload still work; newer code must drop the field reference |
+| Rename a field                                  | ❌         | Field name is the map key; renaming is an additive + removal — coordinate across consumers         |
+| Change a type without union expansion           | ❌         | Avro requires explicit union expansion to evolve                                                   |
+| Add a new variant inside a `union`              | ⚠️         | Older readers fail on the new branch — coordinate                                                  |
+| Increment to V2                                 | ✅ (preferred) | New `LoanAccountDataV2.avsc` next to V1; serializer's `getSupportedSchema()` returns the new class for new event types; old consumers keep parsing `MessageV1.dataschema = "LoanAccountDataV1"` |
+
+The convention in Fineract is **major version per schema file** (`…V1.avsc`, `…V2.avsc` would coexist) and a clear `dataschema` advertisement on every wire message.
+
+## How a consumer decodes a message
+
+```java
+// Pseudocode for any Java consumer that links against fineract-avro-schemas
+byte[] envelopeBytes = jmsBytesMessage.getBody(byte[].class);    // or KafkaRecord.value()
+MessageV1 envelope = MessageV1.fromByteBuffer(ByteBuffer.wrap(envelopeBytes));
+String schemaFqcn = envelope.getDataschema();
+Class<?> payloadCls = Class.forName(schemaFqcn);    // e.g. LoanAccountDataV1
+Object payload = payloadCls.getMethod("fromByteBuffer", ByteBuffer.class)
+                            .invoke(null, envelope.getData());
+// Now process payload based on envelope.getType()
+```
+
+The test-mode `InternalExternalEventService.convertToReadableFormat` does exactly this, including the `BulkBusinessEvent` branch that walks `BulkMessageItemV1.dataschema`.
+
+## Consumer-side packaging
+
+`fineract-avro-schemas` produces a `sourcesJar` so consumers can import the generated SDK without rebuilding from scratch. The TODO in `build.gradle` notes the intent to publish to Maven Central; in the meantime, consumers either depend on the locally-published jar or vendor the generated classes.
+
+## Useful build commands
+
+```bash
+# Generate Java classes once
+./gradlew :fineract-avro-schemas:buildJavaSdk
+
+# Preprocess only (resolve bigdecimal placeholder)
+./gradlew :fineract-avro-schemas:preprocessAvroSchemas
+
+# Discover every .avsc
+find fineract-avro-schemas/src/main/avro -name '*.avsc' | sort
+```
+
+## Related reading
+
+- [Events Overview](/events/overview)
+- [Serialization & Mappers](/events/event-serialization-mappers)
+- [External Event Domain](/events/external-event-domain)
+- [Event Idempotency](/events/event-idempotency)
+- [Event Producer (JMS)](/events/event-producer-jms)
+- [Event Producer (Kafka)](/events/event-producer-kafka)
+- [Investor Events](/investor/investor-events)
+- [Clients Avro Schemas](/clients/avro-schemas)
+- [External Event Flow](/flows/external-event-flow)

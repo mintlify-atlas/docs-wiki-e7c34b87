@@ -1,0 +1,546 @@
+---
+title: "Spring Boot Configuration Classes and Autoconfiguration"
+sidebarTitle: "Spring Configuration"
+description: "Every @Configuration under infrastructure.core.config, the autoconfigurations Fineract excludes and replaces, and the conditions that gate each bean."
+---
+
+`fineract-provider` ships its `@Configuration` classes under
+`org.apache.fineract.infrastructure.core.config` and a handful of
+neighbouring packages. Together they replace **six** Spring Boot
+autoconfigurations, define the bean graph that wires Jersey, EclipseLink,
+HikariCP, Spring Security, Spring Batch, Micrometer, and the in‑process
+task executors, and validate the runtime mode at startup.
+
+This page catalogues every class, its conditions, the `@Bean` methods it
+declares, and the property keys it consumes. See
+[`/runtime/server-application`](/runtime/server-application) for how
+`ServerApplication` activates these classes, and
+[`/overview/runtime-modes`](/overview/runtime-modes) for the broader
+read/write/COB mode story.
+
+## At‑a‑glance table
+
+All paths are relative to the repository root.
+
+| Class | File | One‑line role |
+| --- | --- | --- |
+| `HikariCpConfig` | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/HikariCpConfig.java` | Master HikariCP `DataSource` for the **tenants** registry DB. |
+| `CompatibilityConfig` | `infrastructure/core/config/CompatibilityConfig.java` | Deprecated legacy shim that builds Hikari from `fineract_tenants_*` env vars. |
+| `JdbcConfig` | `infrastructure/core/config/JdbcConfig.java` | `JdbcTemplate` and `NamedParameterJdbcTemplate` over `RoutingDataSource`. |
+| `JPAConfig` | `infrastructure/core/config/jpa/JPAConfig.java` | EclipseLink `JpaBaseConfiguration` subclass; persistence unit `jpa-pu`, JPA repositories, auditing. |
+| `EntityManagerFactoryCustomizer` (SPI) | `infrastructure/core/config/jpa/EntityManagerFactoryCustomizer.java` | Hook interface for downstream modules to extend EM packages / vendor props / `PersistenceUnitPostProcessor`s. |
+| `CacheConfig` | `infrastructure/core/config/cache/CacheConfig.java` | EhCache `JCacheCacheManager`, `TransactionBoundCacheManager`, `@Cacheable` discovery. |
+| `SecurityConfig` | `infrastructure/core/config/SecurityConfig.java` | `SecurityFilterChain` for `/api/**` (HTTP Basic, CORS, filter chain). |
+| `SecurityValidationConfig` | `infrastructure/core/config/SecurityValidationConfig.java` | Startup check that exactly one auth mode is enabled. |
+| `SpringConfig` | `infrastructure/core/config/SpringConfig.java` | `fineractEventExecutor`, async `ApplicationEventMulticaster`, `InheritableThreadLocal` SecurityContextHolder. |
+| `TaskExecutorConfig` | `infrastructure/core/config/TaskExecutorConfig.java` | `fineractDefaultThreadPoolTaskExecutor` + prototype‑scoped configurable executor. |
+| `MetricsConfig` | `infrastructure/core/config/MetricsConfig.java` | Micrometer `TimedAspect` bean + `@EnableAspectJAutoProxy`. |
+| `OkHttp3Config` | `infrastructure/core/config/OkHttp3Config.java` | Single shared `OkHttpClient` with configurable timeouts and optional insecure TLS. |
+| `ContentS3Config` | `infrastructure/core/config/ContentS3Config.java` | AWS S3 client beans for the document repository. |
+| `FineractStartupValidationConfig` | `infrastructure/core/config/FineractStartupValidationConfig.java` | Aborts the context if any validation condition trips. |
+| `TaskExecutorConstant` | `infrastructure/core/config/TaskExecutorConstant.java` | Bean‑name constants used as `@Async("...")` and `@Qualifier`. |
+| `JerseyConfig` | `infrastructure/core/jersey/JerseyConfig.java` | `extends ResourceConfig`; `@ApplicationPath("/api")` and `@Path`/`@Provider` auto‑discovery. |
+| `SpringAsyncConfig` | `infrastructure/configuration/async/SpringAsyncConfig.java` | `@EnableAsync` + COB catch‑up executor beans. |
+| `ScheduledJobRunnerConfig` | `infrastructure/jobs/ScheduledJobRunnerConfig.java` | `@EnableBatchProcessing`, registers `ExtendedJpaTransactionManager`. |
+
+## Autoconfiguration exclusions
+
+`FineractWebApplicationConfiguration` excludes the following so Fineract
+can supply its own beans without conflict:
+
+```java FineractWebApplicationConfiguration.java
+@EnableAutoConfiguration(exclude = {
+        DataSourceAutoConfiguration.class,
+        HibernateJpaAutoConfiguration.class,
+        DataSourceTransactionManagerAutoConfiguration.class,
+        GsonAutoConfiguration.class,
+        JdbcTemplateAutoConfiguration.class,
+        LiquibaseAutoConfiguration.class })
+```
+
+| Excluded autoconfiguration | Replaced by | Reason |
+| --- | --- | --- |
+| `DataSourceAutoConfiguration` | `HikariCpConfig` + `RoutingDataSource` | Spring's default would bind one global pool; Fineract needs a master tenants pool **plus** dynamic per‑tenant pools. |
+| `HibernateJpaAutoConfiguration` | `JPAConfig` w/ `EclipseLinkJpaVendorAdapter` | Fineract uses EclipseLink with static weaving, not Hibernate. |
+| `DataSourceTransactionManagerAutoConfiguration` | `ExtendedJpaTransactionManager` (registered in `ScheduledJobRunnerConfig`) | A `DataSourceTransactionManager` cannot honour JPA flush‑mode semantics and lifecycle callbacks; see [`/runtime/transaction-management`](/runtime/transaction-management). |
+| `GsonAutoConfiguration` | `GoogleGsonSerializerHelper` & per‑adapter `JsonSerializer`s | Boot's autoconfig would register Gson as a Spring HTTP message converter; Fineract registers Gson manually inside the JAX‑RS pipeline. |
+| `JdbcTemplateAutoConfiguration` | `JdbcConfig#jdbcTemplate(RoutingDataSource)` | The template must wrap the **routing** datasource, not the master Hikari pool directly. |
+| `LiquibaseAutoConfiguration` | `TenantDatabaseUpgradeService` | Boot would run a single global change log; Fineract runs one per tenant DB. |
+
+Everything else from `spring-boot-autoconfigure` is still in force: Web MVC,
+Validation, Actuator + Micrometer, Jackson, Spring Batch (with
+`spring.batch.job.enabled=false`), Spring Security, Spring Integration,
+Spring Cache, etc.
+
+## Bean‑override
+
+```properties application.properties (line 462)
+spring.main.allow-bean-definition-overriding=true
+```
+
+This is intentional because `RoutingDataSource` is declared
+`@Service(value = "dataSource") @Primary` and Spring would otherwise warn
+about the alias clashing with the Hikari master pool exposed as
+`hikariTenantDataSource`.
+
+## Per‑class detail
+
+### `HikariCpConfig`
+
+```java HikariCpConfig.java
+@Configuration
+@ConditionalOnExpression("#{ systemEnvironment['fineract_tenants_driver'] == null }")
+public class HikariCpConfig {
+
+    @Bean(initMethod = "getConnection", destroyMethod = "close")
+    @ConfigurationProperties(prefix = "spring.datasource.hikari")
+    public HikariDataSource hikariTenantDataSource() {
+        return new HikariDataSource();
+    }
+}
+```
+
+| Aspect | Detail |
+| --- | --- |
+| Bean name | `hikariTenantDataSource` |
+| Property prefix | `spring.datasource.hikari.*` (declared in `application.properties` lines 404‑428) |
+| Activation | Only when the legacy env var `fineract_tenants_driver` is **not** set; otherwise `CompatibilityConfig` wins. |
+| `initMethod = "getConnection"` | Forces eager pool initialisation by acquiring a connection at startup so misconfiguration fails fast. |
+| `destroyMethod = "close"` | Closes the pool on container shutdown (paired with `server.shutdown=graceful`). |
+
+The keys bound under `spring.datasource.hikari.*` include:
+
+| Key | Default | Env var |
+| --- | --- | --- |
+| `driverClassName` | `org.mariadb.jdbc.Driver` | `FINERACT_HIKARI_DRIVER_SOURCE_CLASS_NAME` |
+| `jdbcUrl` | `jdbc:mariadb://localhost:3306/fineract_tenants` | `FINERACT_HIKARI_JDBC_URL` |
+| `username` | `root` | `FINERACT_HIKARI_USERNAME` |
+| `minimumIdle` | `3` | `FINERACT_HIKARI_MINIMUM_IDLE` |
+| `maximumPoolSize` | `10` | `FINERACT_HIKARI_MAXIMUM_POOL_SIZE` |
+| `connectionTestquery` | `SELECT 1` | `FINERACT_HIKARI_TEST_QUERY` |
+| `autoCommit` | `true` | `FINERACT_HIKARI_AUTO_COMMIT` |
+| `transactionIsolation` | `TRANSACTION_REPEATABLE_READ` | `FINERACT_HIKARI_TRANSACTION_ISOLATION` |
+
+Every other `dataSourceProperties['…']` entry maps to MySQL/MariaDB JDBC
+optimisations (`cachePrepStmts`, `useServerPrepStmts`, etc.).
+
+### `CompatibilityConfig`
+
+```java CompatibilityConfig.java
+@Configuration
+@ConditionalOnExpression("#{ systemEnvironment['fineract_tenants_driver'] != null }")
+@Deprecated
+public class CompatibilityConfig {
+    ...
+    @Bean
+    public HikariConfig hikariConfig() {
+        HikariConfig hc = new HikariConfig();
+        hc.setDriverClassName(environment.getProperty("fineract_tenants_driver"));
+        hc.setJdbcUrl(environment.getProperty("fineract_tenants_url"));
+        hc.setUsername(environment.getProperty("fineract_tenants_uid"));
+        hc.setPassword(environment.getProperty("fineract_tenants_pwd"));
+        hc.setMinimumIdle(3);
+        hc.setMaximumPoolSize(10);
+        ...
+    }
+}
+```
+
+`@PostConstruct init()` prints a giant WARN block to the log explaining
+which environment variables to migrate to (`FINERACT_HIKARI_*`).
+`HikariConfig#dataSourceProperties` is hard‑coded with the same set as
+`HikariCpConfig` would have via property binding.
+
+### `JdbcConfig`
+
+```java JdbcConfig.java
+@Configuration
+public class JdbcConfig {
+    @Bean public JdbcTemplate jdbcTemplate(RoutingDataSource dataSource) {
+        return new JdbcTemplate(dataSource);
+    }
+    @Bean public NamedParameterJdbcTemplate namedParameterJdbcTemplate(RoutingDataSource dataSource) {
+        return new NamedParameterJdbcTemplate(dataSource);
+    }
+}
+```
+
+Both templates wrap `RoutingDataSource` — they always go through tenant
+routing, never directly to the master pool. See
+[`/runtime/datasource-and-connection-pooling`](/runtime/datasource-and-connection-pooling).
+
+### `JPAConfig`
+
+`JPAConfig extends JpaBaseConfiguration` so it can override
+`createJpaVendorAdapter()` (to return `EclipseLinkJpaVendorAdapter`),
+`getVendorProperties(DataSource)` (to inject EclipseLink‑specific
+properties), and `entityManagerFactory(...)` (to set the persistence unit
+name to `jpa-pu` and use static weaving). It also registers
+`AuditorAware<Long>` for `@CreatedBy` / `@LastModifiedBy` and a default
+`TransactionTemplate`.
+
+```java JPAConfig.java
+@Override
+protected Map<String, Object> getVendorProperties(DataSource dataSource) {
+    Map<String, Object> vendorProperties = new HashMap<>();
+    vendorProperties.put(PersistenceUnitProperties.WEAVING, "static");
+    vendorProperties.put(PersistenceUnitProperties.PERSISTENCE_CONTEXT_CLOSE_ON_COMMIT, "true");
+    vendorProperties.put(PersistenceUnitProperties.CACHE_SHARED_DEFAULT, "false");
+    emFactoryCustomizers.forEach(c -> vendorProperties.putAll(c.additionalVendorProperties()));
+    return vendorProperties;
+}
+```
+
+The persistence unit post‑processor is
+`DatabaseSelectingPersistenceUnitPostProcessor`, which adds
+`PersistenceUnitProperties.TARGET_DATABASE` based on the driver class
+detected by `DatabaseTypeResolver` (MariaDB / MySQL / PostgreSQL).
+
+`@EnableJpaRepositories(basePackages = {"org.apache.fineract.**.domain", "org.apache.fineract.**.repository"})`
+scans for Spring Data repository interfaces across every module.
+`@EnableJpaAuditing` activates Spring's auditing hook (timestamps and
+auditor IDs on `AbstractAuditableCustom`).
+
+### `CacheConfig`
+
+`CacheConfig` builds a `JCacheCacheManager` backed by EhCache 3, scans the
+classpath for `@Cacheable` annotations and method/class-level
+`@CacheConfig` via Reflections, and wraps the whole thing in a
+`TransactionBoundCacheManager` so cache puts are only visible after the
+enclosing transaction commits. The default template is sized via
+`fineract.cache.default-template.maximum-entries` and
+`fineract.cache.default-template.ttl`.
+
+### `SecurityConfig`
+
+```java SecurityConfig.java (excerpt)
+@Configuration
+@ConditionalOnProperty("fineract.security.basicauth.enabled")
+@EnableMethodSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.securityMatcher(API_MATCHER.matcher("/api/**"))
+            .authorizeHttpRequests(auth -> { ... long list of permission rules ... })
+            .httpBasic(hb -> hb.authenticationEntryPoint(basicAuthenticationEntryPoint()))
+            .csrf(AbstractHttpConfigurer::disable)
+            .sessionManagement(smc -> smc.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .addFilterBefore(tenantAwareBasicAuthenticationFilter(), SecurityContextHolderFilter.class)
+            .addFilterAfter(requestResponseFilter(), ExceptionTranslationFilter.class)
+            .addFilterAfter(correlationHeaderFilter(), RequestResponseFilter.class)
+            .addFilterAfter(fineractInstanceModeApiFilter(), CorrelationHeaderFilter.class);
+        ...
+    }
+}
+```
+
+`SecurityConfig` is the **single source of truth** for who can call which
+URI. The filter chain order it builds — `TenantAwareBasicAuthenticationFilter`
+→ `RequestResponseFilter` → `CorrelationHeaderFilter` →
+`FineractInstanceModeApiFilter` → optional `LoanCOBApiFilter` /
+`IdempotencyStoreFilter` / `ProgressiveLoanModelCheckerFilter` / 2FA — is
+covered in [`/security/overview`](/security/overview).
+
+### `SpringConfig`
+
+Three responsibilities:
+
+```java SpringConfig.java
+@Bean(name = "fineractEventExecutor")
+public ThreadPoolTaskExecutor fineractEventExecutor(...) {
+    int cpus = Runtime.getRuntime().availableProcessors();
+    int smartCore = cpus * 2;
+    int smartMax = cpus * 5;
+    int coreSize = configuredCore > 0 ? configuredCore : smartCore;
+    int rawMaxSize = configuredMax > 0 ? configuredMax : smartMax;
+    int queueCapacity = configuredQueueCapacity >= 0 ? configuredQueueCapacity : DEFAULT_QUEUE_CAPACITY;
+    ...
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(60);
+    return executor;
+}
+
+@Bean
+public MethodInvokingFactoryBean overrideSecurityContextHolderStrategy() {
+    MethodInvokingFactoryBean factoryBean = new MethodInvokingFactoryBean();
+    factoryBean.setTargetClass(SecurityContextHolder.class);
+    factoryBean.setTargetMethod("setStrategyName");
+    factoryBean.setArguments(SecurityContextHolder.MODE_INHERITABLETHREADLOCAL);
+    return factoryBean;
+}
+
+@Bean
+@DependsOn("overrideSecurityContextHolderStrategy")
+public SimpleApplicationEventMulticaster applicationEventMulticaster(
+        @Qualifier("fineractEventExecutor") ThreadPoolTaskExecutor taskExecutor) {
+    SimpleApplicationEventMulticaster multicaster = new SimpleApplicationEventMulticaster();
+    multicaster.setTaskExecutor(new DelegatingSecurityContextAsyncTaskExecutor(taskExecutor));
+    return multicaster;
+}
+```
+
+| Bean | Notes |
+| --- | --- |
+| `fineractEventExecutor` | Per‑CPU smart sizing (`cpus * 2` core, `cpus * 5` max) overridable by `spring.task.execution.pool.*`. `CallerRunsPolicy` backpressure. Drain on shutdown for 60s. |
+| `overrideSecurityContextHolderStrategy` | Switches Spring Security to `InheritableThreadLocal` so child threads in `fineractEventExecutor` inherit the principal. |
+| `applicationEventMulticaster` | Async multicaster wrapping the event executor in a `DelegatingSecurityContextAsyncTaskExecutor` (transports `SecurityContext` to event threads). |
+
+### `TaskExecutorConfig`
+
+```java TaskExecutorConfig.java
+@Configuration
+public class TaskExecutorConfig {
+
+    @Autowired
+    private FineractProperties fineractProperties;
+
+    @Bean(TaskExecutorConstant.DEFAULT_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor fineractDefaultThreadPoolTaskExecutor() { ... }
+
+    @Bean(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+    @Scope(scopeName = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+    public ThreadPoolTaskExecutor fineractConfigurableThreadPoolTaskExecutor() { ... }
+}
+```
+
+| Bean | Scope | Size source |
+| --- | --- | --- |
+| `fineractDefaultThreadPoolTaskExecutor` | singleton | `fineract.task-executor.default-task-executor-core-pool-size` (`10`) / `…-max-pool-size` (`100`) |
+| `fineractConfigurableThreadPoolTaskExecutor` | **prototype** | same defaults; each injection point gets its own pool |
+
+Fully covered in [`/runtime/task-executors`](/runtime/task-executors).
+
+### `MetricsConfig`
+
+```java MetricsConfig.java
+@Configuration
+@EnableAspectJAutoProxy
+public class MetricsConfig {
+    @Bean
+    public TimedAspect timedAspect(MeterRegistry registry) {
+        return new TimedAspect(registry);
+    }
+}
+```
+
+Pulls Micrometer's `@Timed` aspect into the context so any
+`@Timed("name")` annotation produces a timer in the `MeterRegistry`. The
+registry itself is provided by Spring Boot Actuator's
+`MetricsAutoConfiguration` (with Prometheus, OTLP, or CloudWatch exporters
+gated by `management.*.export.enabled` keys — see
+[`/runtime/metrics-and-actuator`](/runtime/metrics-and-actuator)).
+
+### `OkHttp3Config`
+
+```java OkHttp3Config.java
+@Bean
+public OkHttpClient okHttpClient() throws Exception {
+    var okBuilder = new OkHttpClient.Builder()
+            .connectTimeout(Duration.ofSeconds(fineractProperties.getClientConnectTimeout()))
+            .readTimeout(Duration.ofSeconds(fineractProperties.getClientReadTimeout()))
+            .writeTimeout(Duration.ofSeconds(fineractProperties.getClientWriteTimeout()));
+
+    if (Boolean.TRUE.equals(fineractProperties.getInsecureHttpClient())) {
+        ... install an insecure X509TrustManager and HostnameVerifier ...
+    }
+    return okBuilder.build();
+}
+```
+
+| Property | Default | Purpose |
+| --- | --- | --- |
+| `fineract.client-connect-timeout` | `30` (seconds) | OkHttp `connectTimeout`. |
+| `fineract.client-read-timeout` | `30` | OkHttp `readTimeout`. |
+| `fineract.client-write-timeout` | `30` | OkHttp `writeTimeout`. |
+| `fineract.insecure-http-client` | `true` (dev default) | Disables TLS validation — **must** be `false` in production. |
+
+This single `OkHttpClient` is shared by webhook delivery, S3‑compatible
+content stores, and outbound interop calls.
+
+### `FineractStartupValidationConfig`
+
+```java FineractStartupValidationConfig.java
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+@Conditional(FineractValidationCondition.class)
+public class FineractStartupValidationConfig implements InitializingBean {
+
+    private final ApplicationContext applicationContext;
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        terminateApplication();
+    }
+
+    private void terminateApplication() {
+        log.error("The application startup fails on validations. Please check the log above for the details");
+        ((ConfigurableApplicationContext) applicationContext).close();
+    }
+}
+```
+
+If `FineractValidationCondition` matches, Spring instantiates this
+component **first** (because of `HIGHEST_PRECEDENCE`) and its
+`afterPropertiesSet()` immediately closes the context — the JVM exits with
+a non‑zero status and the actual validation failure (logged by one of the
+nested conditions below) becomes the boot's final word.
+
+```java FineractValidationCondition.java
+public class FineractValidationCondition extends AnyNestedCondition {
+
+    public FineractValidationCondition() {
+        super(ConfigurationPhase.PARSE_CONFIGURATION);
+    }
+
+    @Conditional(FineractModeValidationCondition.class)
+    static class FineractModeValidation {}
+
+    @Conditional(FineractPartitionJobConfigValidationCondition.class)
+    static class FineractPartitionedJobValidation {}
+
+    @Conditional(FineractRemoteJobMessageHandlerCondition.class)
+    static class FineractRemoteJobMessageHandlerValidation {}
+
+    @Conditional(FineractExternalEventConfigCondition.class)
+    static class FineractExternalEventConfigValidation {}
+}
+```
+
+It is an `AnyNestedCondition` — **any** of the four nested validation
+conditions matching is enough to abort startup:
+
+| Nested condition | Failure scenario |
+| --- | --- |
+| `FineractModeValidationCondition` | `fineract.mode.read-enabled=false` AND `fineract.mode.write-enabled=false`, i.e. the node would be unable to serve any traffic. |
+| `FineractPartitionJobConfigValidationCondition` | A `fineract.partitioned-job.partitioned-job-properties[i].*` entry is missing required keys. |
+| `FineractRemoteJobMessageHandlerCondition` | Both `fineract.remote-job-message-handler.jms.enabled` and `fineract.remote-job-message-handler.kafka.enabled` are true, or both are false in a node running in batch‑manager mode without `spring-events`. |
+| `FineractExternalEventConfigCondition` | `fineract.events.external.enabled=true` but no producer (JMS, Kafka, Spring events) is enabled. |
+
+The configurations the validation guards (read/write mode, partitioned
+jobs, external events) are all driven by `FineractProperties` (under
+`fineract-core`). The phase is `PARSE_CONFIGURATION` so the gate fires
+before any other `@Bean` evaluates.
+
+### `JerseyConfig`
+
+```java JerseyConfig.java
+@Configuration(proxyBeanMethods = false)
+@ApplicationPath("/api")
+public class JerseyConfig extends ResourceConfig {
+
+    JerseyConfig() {
+        register(org.glassfish.jersey.media.multipart.MultiPartFeature.class);
+        register(new AbstractBinder() {
+            @Override
+            protected void configure() {
+                bind(PageableParamProvider.class).to(ValueParamProvider.class).in(Singleton.class);
+            }
+        });
+        register(org.glassfish.jersey.server.validation.ValidationFeature.class);
+        property(ServerProperties.WADL_FEATURE_DISABLE, true);
+    }
+
+    @PostConstruct
+    public void setup() {
+        appCtx.getBeansWithAnnotation(Path.class).values().forEach(this::register);
+        appCtx.getBeansWithAnnotation(Provider.class).values().forEach(this::register);
+    }
+}
+```
+
+This is the JAX‑RS entry point. Fully covered in
+[`/runtime/jersey-jaxrs`](/runtime/jersey-jaxrs).
+
+### `SpringAsyncConfig`
+
+```java SpringAsyncConfig.java
+@Configuration
+@EnableAsync
+public class SpringAsyncConfig implements AsyncConfigurer {
+
+    @Bean(name = TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor loanCOBCatchUpThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor t = new ThreadPoolTaskExecutor();
+        t.setMaxPoolSize(1);
+        return t;
+    }
+
+    @Bean(name = TaskExecutorConstant.WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor t = new ThreadPoolTaskExecutor();
+        t.setMaxPoolSize(1);
+        return t;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return new CustomAsyncExceptionHandler();
+    }
+}
+```
+
+`@EnableAsync` activates the AOP proxy needed for `@Async`‑annotated
+methods. Both catch‑up executors are single‑threaded by design (COB jobs
+are serial per tenant).
+
+### `ScheduledJobRunnerConfig`
+
+```java ScheduledJobRunnerConfig.java (excerpt)
+@Configuration(proxyBeanMethods = false)
+@EnableBatchProcessing
+public class ScheduledJobRunnerConfig {
+
+    @Bean
+    public PlatformTransactionManager transactionManager(
+            ObjectProvider<TransactionManagerCustomizers> transactionManagerCustomizers,
+            List<TransactionLifecycleCallback> callbacks) {
+        ExtendedJpaTransactionManager transactionManager = new ExtendedJpaTransactionManager();
+        transactionManager.setLifecycleCallbacks(callbacks);
+        transactionManager.setValidateExistingTransaction(true);
+        transactionManagerCustomizers.ifAvailable(customizers -> customizers.customize(transactionManager));
+        return transactionManager;
+    }
+    ...
+}
+```
+
+This is where the `PlatformTransactionManager` actually comes from — see
+[`/runtime/transaction-management`](/runtime/transaction-management) for
+the `ExtendedJpaTransactionManager` behaviour.
+
+## Property files consumed
+
+The active property source is
+`fineract-provider/src/main/resources/application.properties` (725 lines).
+Spring Boot also recognises `application-<profile>.properties` for profiles
+like `liquibase-only` (none ship by default), and CLI overrides via
+`--key=value`.
+
+| Prefix | Bound to | Used by |
+| --- | --- | --- |
+| `fineract.*` | `FineractProperties` (`fineract-core`) | every feature flag, tenant‑config override, timeout, executor sizing |
+| `spring.datasource.hikari.*` | `HikariCpConfig#hikariTenantDataSource()` | master tenants pool |
+| `spring.jpa.*` | `JpaProperties` (autoconfig) | OSIV disabled, vendor name |
+| `spring.liquibase.*` | `LiquibaseProperties` + `TenantDatabaseUpgradeService` | tenants DB migrations and per‑tenant parameters |
+| `spring.task.execution.pool.*` | `SpringConfig#fineractEventExecutor` | event multicaster executor sizing |
+| `spring.batch.*` | Spring Batch autoconfig | `spring.batch.job.enabled=false` to suppress autostart |
+| `spring.servlet.multipart.*` | Servlet autoconfig | file upload sizes (`5MB` / `10MB`) |
+| `server.*` | `ServerProperties` | Tomcat tuning, TLS, shutdown |
+| `management.*` | Actuator | endpoints exposure, Prometheus, OTLP, CloudWatch |
+| `logging.*` | Logback via `logback-spring.xml` | pattern, level (`FINERACT_LOGGING_LEVEL`) |
+| `springdoc.*` | springdoc‑openapi | `/api-docs`, Swagger UI |
+
+## Cross‑references
+
+- [`/runtime/server-application`](/runtime/server-application) — how these `@Configuration` classes get loaded.
+- [`/runtime/jersey-jaxrs`](/runtime/jersey-jaxrs) — `JerseyConfig` deep dive.
+- [`/runtime/datasource-and-connection-pooling`](/runtime/datasource-and-connection-pooling) — `HikariCpConfig` + `RoutingDataSource`.
+- [`/runtime/transaction-management`](/runtime/transaction-management) — `ScheduledJobRunnerConfig` + `ExtendedJpaTransactionManager`.
+- [`/runtime/metrics-and-actuator`](/runtime/metrics-and-actuator) — `MetricsConfig` and Actuator endpoints.
+- [`/runtime/task-executors`](/runtime/task-executors) — `TaskExecutorConfig`, `SpringAsyncConfig`, `SpringConfig#fineractEventExecutor`.
+- [`/runtime/logging-and-correlation`](/runtime/logging-and-correlation) — `logback-spring.xml` and the correlation filter.
+- [`/security/overview`](/security/overview) — `SecurityConfig` filter chain.
+- [`/tenancy/overview`](/tenancy/overview), [`/database/overview`](/database/overview) — Liquibase and tenant routing.
+- [`/core/overview`](/core/overview) — where `FineractProperties` and the configuration support beans live.

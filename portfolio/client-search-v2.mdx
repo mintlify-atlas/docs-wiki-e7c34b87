@@ -1,0 +1,317 @@
+---
+title: "Client Search v2: PagedRequest Text Search Endpoint"
+sidebarTitle: "Client Search v2"
+description: "Reference for the Fineract v2 client search API, ClientSearchV2ApiResource, the Criteria-based repository and the PagedRequest contract."
+---
+
+# Client Search v2
+
+The v2 client search is a smaller, faster replacement for the legacy
+`/v1/search` endpoint when the target is clients. It lives under
+`/v2/clients/search`, uses a typed Spring Data `Page` response, and is
+backed by a hand-rolled JPA Criteria query that supports searching by
+account number, display name, external id, mobile number and any of the
+client's KYC document keys.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ClientSearchV2Api` (interface) | `fineract-provider` | `org.apache.fineract.portfolio.client.api.v2.search` |
+| `ClientSearchV2ApiDelegate` | `fineract-provider` | `org.apache.fineract.portfolio.client.api.v2.search` |
+| `ClientSearchV2ApiResource` (JAX-RS adapter) | `fineract-provider` | `org.apache.fineract.portfolio.client.api.v2.search` |
+| `ClientSearchService` | `fineract-provider` | `org.apache.fineract.portfolio.client.service.search` |
+| `ClientTextSearch`, `ClientSearchData` | `fineract-provider` | `org.apache.fineract.portfolio.client.service.search.domain` |
+| `ClientSearchDataMapper` | `fineract-provider` | `org.apache.fineract.portfolio.client.service.search.mapper` |
+| `SearchedClient`, `SearchingClientRepository(Impl)` | `fineract-core` | `org.apache.fineract.portfolio.client.domain.search` |
+| `PagedRequest` | `fineract-core` | `org.apache.fineract.infrastructure.core.service` |
+
+See [Clients](/portfolio/clients) for the underlying entity and
+[/api/client-and-onboarding-apis](/api/client-and-onboarding-apis) for
+the published API contract. The legacy global `/v1/search` lives in
+`org.apache.fineract.portfolio.search.api.SearchApiResource` and is
+unchanged.
+
+## REST surface
+
+```java
+@Path("/v2/clients")
+@Component
+@Tag(name = "ClientSearchV2")
+@RequiredArgsConstructor
+public class ClientSearchV2ApiResource implements ClientSearchV2Api {
+
+    private final ClientSearchV2ApiDelegate delegate;
+
+    @Override
+    @POST
+    @Path("search")
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    @Operation(summary = "Search Clients by text", operationId = "searchClientsByText")
+    public Page<ClientSearchData> searchByText(@Parameter PagedRequest<ClientTextSearch> request) {
+        return delegate.searchByText(request);
+    }
+}
+```
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `POST` | `/v2/clients/search` | Text search across clients within the caller's office hierarchy | `READ_CLIENT` (via `ClientSearchService.validateTextSearchRequest`) |
+
+There is no `GET` variant — the body carries both filter and pagination,
+which would not fit a URL. There is also no `command=` switch.
+
+## Request: PagedRequest&lt;ClientTextSearch&gt;
+
+`PagedRequest<T>` is the generic Fineract paged-request envelope:
+
+```json
+{
+  "request": { "text": "Tan" },
+  "page":     0,
+  "size":     25,
+  "sorts": [
+    { "property": "displayName", "direction": "ASC" }
+  ]
+}
+```
+
+The inner `ClientTextSearch` is intentionally tiny:
+
+```java
+@Data
+public class ClientTextSearch {
+    private String text;
+}
+```
+
+- `request` — the filter object. `request.text` is what gets matched.
+- `page` — zero-based page index.
+- `size` — page size; the platform default cap is 200 (enforced by
+  `PagedRequest.toPageable()`).
+- `sorts` — an array of `{ property, direction }` pairs. `property`
+  values are JPA paths on the `Client` entity (e.g. `displayName`,
+  `accountNumber`, `id`, `activationDate`). Defaults to `id DESC` when
+  absent.
+
+If `request` is omitted entirely the search treats the text as empty
+string, i.e. it returns all clients within the hierarchy.
+
+## Response: Page&lt;ClientSearchData&gt;
+
+```java
+@Data
+public class ClientSearchData {
+    private Long id;
+    private String displayName;
+    private ExternalId externalId;
+    private String accountNumber;
+    private Long officeId;
+    private String officeName;
+    private String mobileNo;
+    private EnumOptionData status;
+    private LocalDate activationDate;
+    private OffsetDateTime createdDate;
+}
+```
+
+`Page` is Spring Data's standard shape: `content`, `totalElements`,
+`totalPages`, `number`, `size`, `sort`, etc.
+
+```json
+{
+  "content": [
+    {
+      "id": 109,
+      "displayName": "Petra Tan",
+      "externalId": { "value": "EXT-0001", "empty": false },
+      "accountNumber": "000000109",
+      "officeId": 1,
+      "officeName": "Head Office",
+      "mobileNo": "+65-90001234",
+      "status": { "id": 300, "code": "clientStatusType.active", "value": "ACTIVE" },
+      "activationDate": [2025, 1, 27],
+      "createdDate": "2025-01-15T08:30:42Z"
+    }
+  ],
+  "totalElements": 1,
+  "totalPages": 1,
+  "number": 0,
+  "size": 25
+}
+```
+
+## Filter syntax
+
+`request.text` is a single substring; the implementation expands it with
+SQL `LIKE '%text%'` against multiple columns at once. There is no
+operator language (no `field:value` syntax, no Boolean operators) — keep
+the filter intentionally narrow.
+
+Columns matched, from `SearchingClientRepositoryImpl#searchByText`:
+
+| Column | Source |
+| --- | --- |
+| `accountNumber` | `m_client.account_no` |
+| `displayName` | `m_client.display_name` |
+| `externalId` | `m_client.external_id` |
+| `mobileNo` | `m_client.mobile_no` |
+| `documentKey` | `m_client_identifier.document_key` (via `LEFT JOIN`) |
+
+A single text such as `AB1234567` will therefore match a passport number
+on `ClientIdentifier`, a mobile number, an external id and a display
+name — in one query.
+
+## Implementation
+
+`ClientSearchV2ApiDelegate` is a thin pass-through to
+`ClientSearchService`:
+
+```java
+@Component
+@Transactional(readOnly = true)
+@RequiredArgsConstructor
+public class ClientSearchService {
+
+    private final PlatformSecurityContext context;
+    private final ClientRepository clientRepository;
+    private final ClientSearchDataMapper clientSearchDataMapper;
+
+    public Page<ClientSearchData> searchByText(PagedRequest<ClientTextSearch> searchRequest) {
+        validateTextSearchRequest(searchRequest);
+        return executeTextSearch(searchRequest);
+    }
+
+    private Page<ClientSearchData> executeTextSearch(PagedRequest<ClientTextSearch> searchRequest) {
+        final String hierarchy = context.authenticatedUser().getOffice().getHierarchy();
+
+        Optional<ClientTextSearch> request = searchRequest.getRequest();
+        String requestSearchText = request.map(ClientTextSearch::getText).orElse(null);
+        String searchText = Objects.toString(requestSearchText, "");
+
+        Pageable pageable = searchRequest.toPageable();
+
+        return clientRepository.searchByText(searchText, pageable, hierarchy)
+                               .map(clientSearchDataMapper::map);
+    }
+}
+```
+
+Three things to note:
+
+1. The hierarchy of the **authenticated user's** office is appended to a
+   `LIKE` filter so users only see clients under their office tree.
+2. A null or absent `request.text` becomes `""`, which matches every
+   row in the hierarchy.
+3. The mapping is done by MapStruct (`ClientSearchDataMapper`) — the
+   query returns a `SearchedClient` (lightweight projection), then the
+   mapper attaches the `EnumOptionData` for the status.
+
+### Criteria query
+
+```java
+@Override
+public Page<SearchedClient> searchByText(String searchText, Pageable pageable, String officeHierarchy) {
+    String hierarchyLikeValue = officeHierarchy + "%";
+
+    CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+    CriteriaQuery<SearchedClient> query = cb.createQuery(SearchedClient.class);
+
+    Root<Client> root = query.from(Client.class);
+    Path<Office> office = root.get("office");
+
+    Specification<Client> spec = (r, q, builder) -> {
+        q.distinct(true);
+        Path<Office> o = r.get("office");
+        Join<Client, ClientIdentifier> identity = r.join("identifiers", JoinType.LEFT);
+
+        List<Predicate> predicates = new ArrayList<>();
+        predicates.add(cb.like(o.get("hierarchy"), hierarchyLikeValue));
+
+        String searchLikeValue = "%" + searchText + "%";
+        predicates.add(cb.or(
+            cb.like(r.get("accountNumber"), searchLikeValue),
+            cb.like(r.get("displayName"),   searchLikeValue),
+            cb.like(r.get("externalId"),    searchLikeValue),
+            cb.like(r.get("mobileNo"),      searchLikeValue),
+            cb.like(identity.get("documentKey"), searchLikeValue)));
+
+        return cb.and(predicates.toArray(new Predicate[0]));
+    };
+    ...
+    query.select(cb.construct(SearchedClient.class,
+        root.get("id"), root.get("displayName"), root.get("externalId"),
+        root.get("accountNumber"), office.get("id"), office.get("name"),
+        root.get("mobileNo"), root.get("status"), root.get("activationDate"),
+        root.get("createdDate")));
+    ...
+}
+```
+
+The implementation comment notes that with Spring Data JPA 3+ this could
+collapse into a `Specification` + `findBy(Specification, Pageable)`
+call — for now the Criteria implementation is preserved.
+
+## SearchedClient projection
+
+```java
+@Getter
+@RequiredArgsConstructor
+public class SearchedClient {
+    private final Long id;
+    private final String displayName;
+    private final ExternalId externalId;
+    private final String accountNumber;
+    private final Long officeId;
+    private final String officeName;
+    private final String mobileNo;
+    private final Integer status;
+    private final LocalDate activationDate;
+    private final OffsetDateTime createdDate;
+}
+```
+
+`status` is the raw integer (e.g. `300` for `ACTIVE`); the mapper enriches
+it into an `EnumOptionData` via `ClientStatus.fromInt`.
+
+## Differences vs v1 search
+
+| Aspect | v1 (`/v1/search`) | v2 (`/v2/clients/search`) |
+| --- | --- | --- |
+| Scope | Global (clients, loans, savings, groups, …) | Clients only |
+| Verb | `GET ?query=&resource=` | `POST` JSON body |
+| Pagination | Manual `offset/limit` | Spring `Page` |
+| Sorting | Single string `orderBy=` | Multi-sort `sorts[]` |
+| Return shape | Free-form `JSON` array | Typed `Page<ClientSearchData>` |
+| Office filter | Yes | Yes (forced) |
+| KYC document lookup | Yes (joined) | Yes (joined) |
+
+## Performance notes
+
+- Add SQL indexes on `m_client.display_name`, `m_client.mobile_no` and
+  `m_client_identifier.document_key` if you expect high search volumes;
+  the trailing `%` wildcard prevents index seeks on the leading wildcard
+  side but a B-tree on these columns still narrows the scan.
+- `Page.getTotalElements()` runs a `COUNT(*)` over the same predicates
+  — beware on huge instances. If you don't need the total, use
+  `Page.hasNext()` and `Page.getContent().size() == request.getSize()`
+  as a cheap "more available" probe.
+- Empty `request.text` collapses to "list-all", scoped by hierarchy —
+  expected to be safe but verify on a hot office tree.
+
+## Common pitfalls
+
+- The path uses `text`, not `query` or `searchText`.
+- An empty payload `{}` is treated as text `""` (all rows) — not as a
+  no-op.
+- The status field in the response is the **integer** `id` plus `code` /
+  `value` strings — the integer values are the stable `ClientStatus`
+  codes (100, 300, 600, …) documented under [Clients](/portfolio/clients).
+
+## Cross-references
+
+- [Clients](/portfolio/clients) — entity and statuses
+- [Client Identifiers](/portfolio/client-identifiers) — `documentKey`
+  column matched here
+- [Portfolio shared domain](/core/portfolio-shared-domain) —
+  `ExternalId`, `EnumOptionData`, `PagedRequest`
+- [Portfolio APIs index](/api/portfolio-apis)

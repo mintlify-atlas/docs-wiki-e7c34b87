@@ -1,0 +1,478 @@
+---
+title: "RoutingDataSource and Per-Tenant DataSource Resolution"
+sidebarTitle: "DataSource Routing"
+description: "How Fineract resolves a tenant identifier into a Hikari pool: RoutingDataSource, RoutingDataSourceServiceFactory, DataSourcePerTenantServiceFactory, JdbcTenantDetailsService."
+---
+
+Apache Fineract runs every request against the **tenant's** database, not a
+shared one. The chain that turns a `Fineract-Platform-TenantId` header into
+the right Hikari pool lives entirely in
+`org.apache.fineract.infrastructure.core.service.database` and
+`infrastructure.core.service.tenant`. This page walks through every link in
+that chain.
+
+## High‑level flow
+
+```mermaid
+flowchart LR
+    Req[HTTP request<br/>Fineract-Platform-TenantId: default]
+    Filter[TenantAwareBasicAuthFilter]
+    Details[JdbcTenantDetailsService<br/>@Cacheable tenantsById]
+    Tenants[(fineract_tenants DB<br/>tenants + tenant_server_connections)]
+    TLC[ThreadLocalContextUtil<br/>tenantContext]
+    RDS["RoutingDataSource<br/>(@Primary @Service dataSource)"]
+    SFactory[RoutingDataSourceServiceFactory]
+    Service[TomcatJdbcDataSourcePerTenantService]
+    PFactory[DataSourcePerTenantServiceFactory]
+    HikariMap[("TENANT_TO_DATA_SOURCE_MAP<br/>(ConcurrentHashMap)")]
+    Pool["Hikari pool<br/>(tenant DB)"]
+
+    Req --> Filter --> Details --> Tenants
+    Details --> TLC
+    TLC -.read.-> Service
+    RDS --> SFactory --> Service
+    Service -- compute if absent --> PFactory --> Pool
+    Service --> HikariMap
+    HikariMap --> Pool
+    RDS -- getConnection --> Pool
+```
+
+The cached path is **filter → ThreadLocal → RoutingDataSource → ConcurrentHashMap → existing
+pool**. The cold path is everything in the diagram.
+
+## `RoutingDataSource`
+
+The platform's primary `DataSource` bean. It extends Spring JDBC's
+`AbstractDataSource` (not `AbstractRoutingDataSource`, because the routing
+key is resolved through a factory, not a static map):
+
+```java
+@Service(value = "dataSource")
+@Primary
+public class RoutingDataSource extends AbstractDataSource {
+
+    @Autowired
+    private RoutingDataSourceServiceFactory dataSourceServiceFactory;
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        return determineTargetDataSource().getConnection();
+    }
+
+    public DataSource determineTargetDataSource() {
+        return this.dataSourceServiceFactory.determineDataSourceService().retrieveDataSource();
+    }
+
+    @Override
+    public Connection getConnection(final String username, final String password) throws SQLException {
+        return determineTargetDataSource().getConnection(username, password);
+    }
+}
+```
+
+Because it is `@Primary` with the bean name `"dataSource"`, every
+`@Autowired DataSource`, every `JdbcTemplate` built with `new
+JdbcTemplate(dataSource)`, and the `entityManagerFactory` itself all flow
+through this class. There is no separate "tenant‑aware" DataSource bean — the
+default is already tenant‑aware.
+
+## `RoutingDataSourceServiceFactory`
+
+The factory decides which `RoutingDataSourceService` bean to use. There are
+two:
+
+- `"tomcatJdbcDataSourcePerTenantService"` — the default tenant pool
+  service. Returns a Hikari pool keyed by `connectionId` from
+  `FineractPlatformTenantConnection`.
+- `"dataSourceForTenants"` — the **master** `fineract_tenants` database
+  itself, used when the calling code wants to read tenant metadata. Selected
+  when `ThreadLocalContextUtil.getDataSourceContext()` equals
+  `ThreadLocalContextUtil.CONTEXT_TENANTS` (the string `"tenants"`).
+
+```java
+@Component
+public class RoutingDataSourceServiceFactory {
+
+    @Autowired
+    private ApplicationContext applicationContext;
+
+    public RoutingDataSourceService determineDataSourceService() {
+        String serviceName = "tomcatJdbcDataSourcePerTenantService";
+        if (ThreadLocalContextUtil.CONTEXT_TENANTS.equalsIgnoreCase(
+                ThreadLocalContextUtil.getDataSourceContext())) {
+            serviceName = "dataSourceForTenants";
+        }
+        return this.applicationContext.getBean(serviceName, RoutingDataSourceService.class);
+    }
+}
+```
+
+Code that needs to operate against the tenant‑catalog DB temporarily flips
+the slot:
+
+```java
+ThreadLocalContextUtil.setDataSourceContext(ThreadLocalContextUtil.CONTEXT_TENANTS);
+try {
+    // queries against tenants / tenant_server_connections
+} finally {
+    ThreadLocalContextUtil.clearDataSourceContext();
+}
+```
+
+## `RoutingDataSourceService`
+
+A two‑method strategy interface:
+
+```java
+public interface RoutingDataSourceService {
+    DataSource retrieveDataSource();
+}
+```
+
+### `TomcatJdbcDataSourcePerTenantService`
+
+The default implementation. It is a `@Service` and an
+`ApplicationListener<ContextRefreshedEvent>`. It keeps a static
+`ConcurrentHashMap<Long, DataSource>` keyed by `connectionId`:
+
+```java
+@Service
+public class TomcatJdbcDataSourcePerTenantService
+        implements RoutingDataSourceService, ApplicationListener<ContextRefreshedEvent> {
+
+    private static final Map<Long, DataSource> TENANT_TO_DATA_SOURCE_MAP = new ConcurrentHashMap<>();
+
+    @Qualifier("hikariTenantDataSource")
+    private final DataSource tenantDataSource;
+    private final TenantDetailsService tenantDetailsService;
+    private final DataSourcePerTenantServiceFactory dataSourcePerTenantServiceFactory;
+
+    @Override
+    public DataSource retrieveDataSource() {
+        DataSource actualDataSource = this.tenantDataSource;
+        final FineractPlatformTenant tenant = ThreadLocalContextUtil.getTenant();
+        if (tenant != null) {
+            final FineractPlatformTenantConnection tenantConnection = tenant.getConnection();
+            Long tenantConnectionKey = tenantConnection.getConnectionId();
+            actualDataSource = TENANT_TO_DATA_SOURCE_MAP.computeIfAbsent(tenantConnectionKey,
+                    (key) -> dataSourcePerTenantServiceFactory.createNewDataSourceFor(tenant, tenantConnection));
+        }
+        // ... triggers MoneyHelperInitializationService once per tenant ...
+        return actualDataSource;
+    }
+}
+```
+
+Notes:
+
+- The map is **static** to survive bean re‑creation in tests; it is shared
+  across all instances. In production there is only one Spring context.
+- `tenantDataSource` (qualifier `hikariTenantDataSource`) is the
+  `fineract_tenants` connection — the default when no tenant has been set
+  yet (start‑up, scheduler bootstrap).
+- The lookup is **per `connectionId`**, not per `tenantIdentifier`. Multiple
+  tenants can share a connection row, in which case they share a Hikari
+  pool.
+- On `ContextRefreshedEvent` the service eagerly initialises pools for
+  every tenant (the implementation walks `findAllTenants()`).
+- The `MoneyHelperInitializationService` is triggered for each new pool so
+  the tenant's rounding mode and currency precision are available before
+  the first business operation runs.
+
+### Naming history
+
+The class is named `TomcatJdbcDataSourcePerTenantService` for historical
+reasons — earlier versions used Tomcat JDBC connection pools. The
+implementation now builds Hikari pools. The bean name is the public ABI for
+`RoutingDataSourceServiceFactory`, so the legacy name stays.
+
+## `DataSourcePerTenantServiceFactory`
+
+This is where Hikari pools are actually built from the tenant's
+`FineractPlatformTenantConnection`. The class is the bridge between the
+tenant catalog metadata and a live pool:
+
+```java
+public DataSource createNewDataSourceFor(FineractPlatformTenant tenant,
+                                         FineractPlatformTenantConnection tenantConnection) {
+    if (!databasePasswordEncryptor.isMasterPasswordHashValid(tenantConnection.getMasterPasswordHash())) {
+        throw new IllegalArgumentException(
+                "Invalid master password on tenant connection %d."
+                        .formatted(tenantConnection.getConnectionId()));
+    }
+
+    String protocol = toProtocol(tenantDataSource);
+    String schemaServer = tenantConnection.getSchemaServer();
+    String schemaPort = tenantConnection.getSchemaServerPort();
+    String schemaName = tenantConnection.getSchemaName();
+    String schemaUsername = tenantConnection.getSchemaUsername();
+    String schemaPassword = tenantConnection.getSchemaPassword();
+    String schemaConnectionParameters = tenantConnection.getSchemaConnectionParameters();
+
+    if (fineractProperties.getMode().isReadOnlyMode()) {
+        // swap to readonly_* fields when set
+        schemaServer = StringUtils.defaultIfBlank(tenantConnection.getReadOnlySchemaServer(), schemaServer);
+        schemaPort   = StringUtils.defaultIfBlank(tenantConnection.getReadOnlySchemaServerPort(), schemaPort);
+        // ... and so on
+    }
+
+    String jdbcUrl = toJdbcUrl(protocol, schemaServer, schemaPort, schemaName, schemaConnectionParameters);
+
+    HikariConfig config = new HikariConfig();
+    config.setReadOnly(fineractProperties.getMode().isReadOnlyMode());
+    config.setJdbcUrl(jdbcUrl);
+    config.setPoolName(schemaName + "_pool");
+    config.setUsername(schemaUsername);
+    config.setPassword(databasePasswordEncryptor.decrypt(schemaPassword));
+    config.setMinimumIdle(getMinPoolSize(tenantConnection));
+    config.setMaximumPoolSize(getMaxPoolSize(tenantConnection));
+    config.setValidationTimeout(tenantConnection.getValidationInterval());
+    config.setDriverClassName(hikariConfig.getDriverClassName());
+    config.setConnectionTestQuery(hikariConfig.getConnectionTestQuery());
+    config.setAutoCommit(hikariConfig.isAutoCommit());
+    config.setRegisterMbeans(true);
+    meterRegistry.ifPresent(registry -> config.setMetricsTrackerFactory(
+            new TenantConnectionPoolMetricsTrackerFactory(tenant.getTenantIdentifier(), registry)));
+    config.setDataSourceProperties(hikariConfig.getDataSourceProperties());
+
+    return hikariDataSourceFactory.create(config);
+}
+```
+
+Behaviours worth pinning down:
+
+| Concern | Behaviour |
+| --- | --- |
+| Master password | Decrypted via `DatabasePasswordEncryptor` (AES‑GCM, keyed by the platform master password). The hash on the connection row is verified before any pool is built. |
+| Read‑only mode | When `fineract.mode.read-enabled` is on (and write/batch are off), the read‑replica fields (`readonly_*`) take priority. |
+| Pool sizing | Defaults come from the connection row (`pool_min_idle`, `pool_max_active`, `pool_initial_size`). Overridable per‑deployment via `fineract.tenant.config.maxPoolSize` and `minPoolSize`. |
+| Driver class | Inherited from the master Hikari config (same driver for every tenant — MySQL or PostgreSQL). |
+| Metrics | If a Micrometer `MeterRegistry` is available, every pool exports `hikaricp.*` metrics tagged with the tenant identifier. |
+| MBeans | `setRegisterMbeans(true)` registers each pool under JMX for runtime introspection. |
+
+### `HikariDataSourceFactory`
+
+A trivial wrapper that calls `new HikariDataSource(config)`. The seam exists
+so tests can substitute a mock factory and assert on the configs passed in,
+without actually opening connections.
+
+## Tenant resolution: `JdbcTenantDetailsService`
+
+The HTTP filter that runs `loadTenantById(identifier)` ahead of every
+request is in `fineract-provider`. The lookup itself is here:
+
+```java
+@Service("tenantDetailsService")
+public class JdbcTenantDetailsService implements TenantDetailsService {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    public JdbcTenantDetailsService(@Qualifier("hikariTenantDataSource") final DataSource dataSource) {
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+    }
+
+    @Override
+    @Cacheable(value = "tenantsById")
+    public FineractPlatformTenant loadTenantById(final String tenantIdentifier) {
+        if (isBlank(tenantIdentifier)) {
+            throw new IllegalArgumentException("tenantIdentifier cannot be blank");
+        }
+        try {
+            final TenantMapper rm = new TenantMapper(false);
+            final String sql = "select " + rm.schema() + " where t.identifier = ?";
+            return this.jdbcTemplate.queryForObject(sql, rm, new Object[] { tenantIdentifier }); // NOSONAR
+        } catch (final EmptyResultDataAccessException e) {
+            throw new InvalidTenantIdentifierException(
+                    "The tenant identifier: " + tenantIdentifier + " is not valid.", e);
+        }
+    }
+
+    @Override
+    public List<FineractPlatformTenant> findAllTenants() {
+        final TenantMapper rm = new TenantMapper(false);
+        return this.jdbcTemplate.query("select " + rm.schema(), rm); // NOSONAR
+    }
+}
+```
+
+Notes:
+
+- The bean is named `"tenantDetailsService"` and is `@Cacheable` against the
+  `tenantsById` cache. After the first lookup, subsequent requests hit the
+  cache. The cache is invalidated when a new tenant connection is provisioned.
+- The constructor takes the qualified `hikariTenantDataSource` — the master
+  pool against `fineract_tenants`. This is the only path that reads the
+  catalog DB.
+- Missing identifiers throw `InvalidTenantIdentifierException`, mapped to
+  `401` by
+  [`InvalidTenantIdentifierExceptionMapper`](/core/exception-mappers).
+
+### `TenantMapper`
+
+The row mapper that turns the joined
+`tenants` / `tenant_server_connections` row into a
+`FineractPlatformTenant` plus `FineractPlatformTenantConnection`. The SQL
+projection is built once and includes every column needed to construct the
+records:
+
+```java
+" t.id, ts.id as connectionId, t.timezone_id as timezoneId, t.name, t.identifier,"
++ " ts.schema_name as schemaName, ts.schema_server as schemaServer, ts.schema_server_port as schemaServerPort,"
++ " ts.schema_connection_parameters as schemaConnectionParameters, ts.auto_update as autoUpdate,"
++ " ts.schema_username as schemaUsername, ts.schema_password as schemaPassword,"
++ " ts.pool_initial_size as initialSize, ts.pool_validation_interval as validationInterval,"
++ " ts.pool_remove_abandoned as removeAbandoned, ts.pool_remove_abandoned_timeout as removeAbandonedTimeout,"
++ " ts.pool_log_abandoned as logAbandoned, ts.pool_abandon_when_percentage_full as abandonedWhenPercentageFull,"
++ " ts.pool_test_on_borrow as testOnBorrow, ts.pool_max_active as poolMaxActive, ts.pool_min_idle as poolMinIdle,"
++ " ts.pool_max_idle as poolMaxIdle, ts.pool_suspect_timeout as poolSuspectTimeout,"
++ " ts.pool_time_between_eviction_runs_millis as poolTimeBetweenEvictionRunsMillis,"
++ " ts.pool_min_evictable_idle_time_millis as poolMinEvictableIdleTimeMillis,"
++ " ts.readonly_schema_server as readOnlySchemaServer, ts.readonly_schema_server_port as readOnlySchemaServerPort,"
++ " ts.readonly_schema_name as readOnlySchemaName, ts.readonly_schema_username as readOnlySchemaUsername,"
++ " ts.readonly_schema_password as readOnlySchemaPassword,"
++ " ts.readonly_schema_connection_parameters as readOnlySchemaConnectionParameters,"
++ " ts.master_password_hash as masterPasswordHash"
++ " from tenants t left join tenant_server_connections ts "
+```
+
+The `TenantMapper(boolean isReport)` constructor flips the join column —
+`t.report_id = ts.id` for the read‑replica connection, otherwise
+`t.oltp_id = ts.id`.
+
+## The data model: `FineractPlatformTenant`
+
+```java
+@Jacksonized @Builder @EqualsAndHashCode @RequiredArgsConstructor @Getter
+public class FineractPlatformTenant implements Serializable {
+    private final Long                            id;
+    private final String                          tenantIdentifier;
+    private final String                          name;
+    private final String                          timezoneId;
+    private final FineractPlatformTenantConnection connection;
+}
+```
+
+A read‑only record with the tenant's identifier (used in HTTP header
+lookups), display name, IANA timezone and its connection details. The
+`timezoneId` is the source of truth for `DateUtils.getBusinessLocalDate()`.
+
+## `FineractPlatformTenantConnection`
+
+Holds everything Hikari needs to open a pool plus the read‑replica
+counterpart and the pool tuning knobs:
+
+| Field | Purpose |
+| --- | --- |
+| `connectionId` | Primary key of the `tenant_server_connections` row. The pool cache key. |
+| `schemaServer`, `schemaServerPort`, `schemaName`, `schemaUsername`, `schemaPassword`, `schemaConnectionParameters` | OLTP connection details. |
+| `readOnlySchemaServer`, …`Port`, …`Name`, …`Username`, …`Password`, …`Parameters` | Read‑replica details. Used when `fineract.mode.read-enabled` is on. |
+| `autoUpdateEnabled` | Whether Liquibase migrations run automatically on bootstrap for this tenant. |
+| `initialSize`, `validationInterval`, `removeAbandoned`, `removeAbandonedTimeout`, `logAbandoned`, `abandonWhenPercentageFull`, `maxActive`, `minIdle`, `maxIdle`, `suspectTimeout`, `timeBetweenEvictionRunsMillis`, `minEvictableIdleTimeMillis`, `testOnBorrow` | Tomcat‑JDBC‑era pool knobs reused by the Hikari translator. |
+| `masterPasswordHash` | The encrypted master password — verified by `DatabasePasswordEncryptor.isMasterPasswordHashValid` before the pool is built. |
+
+The class is `@Builder @Jacksonized @AllArgsConstructor` and exposes a
+back‑compatible secondary constructor for the legacy column set.
+
+## End‑to‑end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Filter as TenantAwareBasicAuthFilter
+    participant Details as JdbcTenantDetailsService
+    participant Tenants as fineract_tenants DB
+    participant TLC as ThreadLocalContextUtil
+    participant RDS as RoutingDataSource
+    participant SF as RoutingDataSourceServiceFactory
+    participant SVC as TomcatJdbcDataSourcePerTenantService
+    participant PF as DataSourcePerTenantServiceFactory
+    participant Pool as Hikari (tenant)
+
+    Client->>Filter: GET /clients (X-Fineract-Tenant-Id: default)
+    Filter->>Details: loadTenantById("default")
+    Details->>Tenants: SELECT … FROM tenants t JOIN tenant_server_connections ts
+    Tenants-->>Details: FineractPlatformTenant
+    Details-->>Filter: tenant
+    Filter->>TLC: setTenant(tenant)
+    Filter->>RDS: jdbcTemplate.query / EntityManager
+    RDS->>SF: determineDataSourceService()
+    SF-->>RDS: tomcatJdbcDataSourcePerTenantService
+    RDS->>SVC: retrieveDataSource()
+    SVC->>TLC: getTenant()
+    SVC->>SVC: TENANT_TO_DATA_SOURCE_MAP.computeIfAbsent(connId)
+    alt pool absent
+        SVC->>PF: createNewDataSourceFor(tenant, connection)
+        PF-->>SVC: new HikariDataSource
+    end
+    SVC-->>RDS: tenant Hikari pool
+    RDS->>Pool: getConnection()
+    Pool-->>RDS: java.sql.Connection
+    RDS-->>Client: query results
+```
+
+## Database introspection: `DatabaseSpecificSQLGenerator` & `DatabaseTypeResolver`
+
+The routing layer also drives the SQL dialect:
+
+- `DatabaseTypeResolver` reads the JDBC URL on the master pool and returns
+  `DatabaseType.MYSQL` or `DatabaseType.POSTGRESQL`.
+- `DatabaseSpecificSQLGenerator` produces dialect‑specific fragments —
+  identifier quoting (`backtick` vs `"`), `LIMIT/OFFSET` vs `LIMIT n OFFSET
+  m`, current date functions, escape patterns, and the maximum `IN` clause
+  size (`IN_CLAUSE_MAX_PARAMS = 10_000`).
+- `MySQLQueryService` / `PostgreSQLQueryService` implement
+  `DatabaseQueryService` for vendor‑specific introspection used by the
+  datatable engine and by Liquibase preconditions.
+
+The persistence unit picks up the right `eclipselink.target-database`
+through `DatabaseSelectingPersistenceUnitPostProcessor` (see
+[persistence & JPA](/core/persistence-and-jpa)).
+
+## Common operational tasks
+
+<AccordionGroup>
+  <Accordion title="Adding a new tenant">
+    Insert rows into `tenants` and `tenant_server_connections` against the
+    master `fineract_tenants` DB, then invalidate the `tenantsById` cache so
+    the next request triggers a fresh `loadTenantById`. The
+    `TomcatJdbcDataSourcePerTenantService` will lazily build the Hikari pool
+    on first use.
+  </Accordion>
+  <Accordion title="Rotating a tenant database password">
+    Update the encrypted `schema_password` in `tenant_server_connections`,
+    bounce the JVM (or invalidate the cache + clear
+    `TENANT_TO_DATA_SOURCE_MAP`) so the next `retrieveDataSource()` builds a
+    pool with the new credentials.
+  </Accordion>
+  <Accordion title="Forcing read-only routing">
+    Set `fineract.mode.read-enabled=true` and `write-enabled=false` on the
+    JVM. `DataSourcePerTenantServiceFactory` will use the
+    `readonly_schema_*` columns and Hikari will be configured with
+    `setReadOnly(true)`, which `ExtendedJpaTransactionManager` honours by
+    switching the EntityManager to `FlushModeType.COMMIT`.
+  </Accordion>
+  <Accordion title="Querying the catalog DB from code">
+    Wrap the call in `ThreadLocalContextUtil.setDataSourceContext("tenants")`
+    so `RoutingDataSourceServiceFactory` selects the master pool. Reset the
+    slot with `clearDataSourceContext()` in a `finally`.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Tenancy overview" href="/tenancy/overview">
+    Higher-level architecture of multi-tenant Fineract.
+  </Card>
+  <Card title="Database overview" href="/database/overview">
+    Schemas, vendor differences, Liquibase changelog layout.
+  </Card>
+  <Card title="Auditing & context" href="/core/auditing-and-context">
+    `ThreadLocalContextUtil.tenantContext` is what `RoutingDataSource` reads.
+  </Card>
+  <Card title="Persistence & JPA" href="/core/persistence-and-jpa">
+    `ExtendedJpaTransactionManager` and the `read-only` flush mode interaction.
+  </Card>
+</CardGroup>

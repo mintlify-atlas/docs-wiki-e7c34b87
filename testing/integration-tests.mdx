@@ -1,0 +1,449 @@
+---
+title: "Integration Tests: Cargo Tomcat + RestAssured Reference Guide"
+sidebarTitle: "Integration Tests"
+description: "Deep dive into the integration-tests subproject: Cargo Tomcat 10x deployment, the wait-for-Fineract task, the Utils/Helper test scaffold, and representative RestAssured patterns."
+---
+
+The `integration-tests/` Gradle subproject is the heaviest REST-level safety net in Apache Fineract. It deploys the production `fineract-provider.war` into an embedded Tomcat 10x through the Cargo plugin, waits for the actuator health endpoint, and then runs the JUnit Jupiter suite against the live HTTPS port. Tests are written with **RestAssured** and a hand-rolled `Utils` helper plus a fleet of domain `*Helper` classes under `org.apache.fineract.integrationtests.common`.
+
+## Module shape
+
+```text
+integration-tests/
+├── README.md
+├── build.gradle
+├── dependencies.gradle
+└── src/test/java/org/apache/fineract/integrationtests/
+    ├── ConfigProperties.java        # env-driven config (Backend protocol/host/port/user/pwd/tenant)
+    ├── AuthenticationIntegrationTest.java
+    ├── ClientTest.java
+    ├── ChargesTest.java
+    ├── BatchApiTest.java
+    ├── BaseLoanIntegrationTest.java
+    ├── ApiDocsTest.java
+    ├── ActuatorIntegrationTest.java
+    ├── common/                      # shared helpers (see below)
+    ├── client/                      # FineractClient-based variants
+    │   └── feign/                   # FineractFeignClient-based variants
+    ├── cob/                         # COB-specific scenarios
+    ├── loan/{penalty,pointintime,reaging,reamortization,repayment}/
+    ├── bulkimport/{importhandler,populator}/{client,loan,office,savings}/
+    └── …
+```
+
+There is no `ServerStartHelper` or `TestUtilHelper` class — the equivalent responsibilities live in:
+
+- **`Utils`** (`integrationtests/common/Utils.java`) for RestAssured wiring, login, GET/POST/PUT/DELETE wrappers, random generators, etc.
+- **`ConfigProperties.Backend`** for the environment-overridable connection settings.
+- The Cargo plugin in `build.gradle` for the lifecycle of the container.
+- The `waitForFineract` Gradle task in the same file for the readiness probe.
+
+## How the server is started
+
+`build.gradle` applies the `com.bmuschko.cargo` plugin and configures a Tomcat 10x container that deploys `fineract-war/build/libs/fineract-provider.war`:
+
+```groovy
+apply plugin: 'com.bmuschko.cargo'
+
+cargo {
+    containerId "tomcat10x"
+    deployable {
+        file = file("$rootDir/fineract-war/build/libs/fineract-provider.war")
+        context = 'fineract-provider'
+    }
+    local {
+        logLevel = 'low'
+        outputFile = file("$buildDir/cargo/integration-tests-output.log")
+        installer {
+            installConfiguration = configurations.tomcat
+            downloadDir = file("$buildDir/download")
+            extractDir = file("$buildDir/tomcat-integration-tests")
+        }
+        startStopTimeout = 1200000
+        sharedClasspath = configurations.driver
+        containerProperties {
+            def jvmArgs = '--add-exports=java.naming/com.sun.jndi.ldap=ALL-UNNAMED ' +
+                '--add-opens=java.base/java.lang=ALL-UNNAMED ' +
+                '--add-opens=java.base/java.io=ALL-UNNAMED ...'
+            jvmArgs += ' -Dspring.profiles.active=test ' +
+                       ' -Dfineract.events.external.enabled=true'
+            property 'cargo.start.jvmargs', jvmArgs
+            property 'cargo.tomcat.connector.keystoreFile',
+                     file("$rootDir/fineract-provider/src/main/resources/keystore.jks")
+            property 'cargo.tomcat.connector.keystorePass', 'openmf'
+            property 'cargo.tomcat.connector.keystoreType', 'JKS'
+            property 'cargo.tomcat.httpSecure', true
+            property 'cargo.protocol', 'https'
+            property 'cargo.servlet.port', 8443
+        }
+    }
+}
+```
+
+The MySQL JDBC driver is provided via a separate `driver` configuration so license-incompatible drivers can be supplied without re-packaging:
+
+```groovy
+configurations { driver }
+dependencies {
+    driver 'com.mysql:mysql-connector-j'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+}
+```
+
+### Database flavour switching
+
+The same `containerProperties` block picks the JDBC URL from a `-PdbType=postgresql|mysql` Gradle property. Without it, MariaDB is used:
+
+```groovy
+if (project.hasProperty('dbType')) {
+    if ('postgresql'.equalsIgnoreCase(dbType)) {
+        jvmArgs += '-Dspring.datasource.hikari.driverClassName=org.postgresql.Driver ' +
+                   '-Dspring.datasource.hikari.jdbcUrl=jdbc:postgresql://localhost:5432/fineract_tenants ...'
+    } else if ('mysql'.equalsIgnoreCase(dbType)) {
+        jvmArgs += '-Dspring.datasource.hikari.driverClassName=com.mysql.cj.jdbc.Driver ' +
+                   '-Dspring.datasource.hikari.jdbcUrl=jdbc:mysql://localhost:3306/fineract_tenants ...'
+    } else { throw new GradleException('Provided dbType is not supported') }
+} else {
+    jvmArgs += '-Dspring.datasource.hikari.driverClassName=org.mariadb.jdbc.Driver ...'
+}
+```
+
+### The `waitForFineract` task
+
+After Cargo starts the container, Gradle runs a custom task that hits `https://localhost:8443/fineract-provider/actuator/health` with a relaxed SSL trust manager every 5 seconds until the response is `200` or the configurable timeout expires:
+
+```groovy
+tasks.register('waitForFineract') {
+    doLast {
+        int timeoutSeconds = (project.findProperty('waitForFineractTimeoutSeconds') ?: '600') as int
+        int waited = 0
+        int interval = 5
+        // …trust-all manager + hostname verifier setup…
+        URL url = new URL("https://localhost:8443/fineract-provider/actuator/health")
+        while (waited < timeoutSeconds) {
+            try {
+                HttpURLConnection connection = (HttpURLConnection) url.openConnection()
+                if (connection.getResponseCode() == 200) { return }
+            } catch (Exception ignored) {}
+            sleep(interval * 1000)
+            waited += interval
+        }
+        throw new GradleException("Fineract did not start within ${timeoutSeconds} seconds")
+    }
+}
+```
+
+The `test` task is wired to depend on Cargo + the readiness probe, and to stop the container on completion:
+
+```groovy
+tasks.named('test').configure {
+    if (!project.hasProperty('cargoDisabled')) {
+        dependsOn cargoStartLocal, waitForFineract
+        finalizedBy cargoStopLocal
+    }
+}
+```
+
+Passing `-PcargoDisabled` bypasses this and runs the tests against a pre-existing instance (typically when working iteratively against a container started by `docker-compose`).
+
+## Backend configuration
+
+All connection details are funnelled through `ConfigProperties.Backend`:
+
+```java
+public class ConfigProperties {
+    public static class Backend {
+        public static final String PROTOCOL = getValueFromEnvOrDefault("BACKEND_PROTOCOL", "https");
+        public static final String HOST     = getValueFromEnvOrDefault("BACKEND_HOST", "localhost");
+        public static final Integer PORT    = Integer.parseInt(getValueFromEnvOrDefault("BACKEND_PORT", "8443"));
+        public static final String USERNAME = getValueFromEnvOrDefault("BACKEND_USERNAME", "mifos");
+        public static final String PASSWORD = getValueFromEnvOrDefault("BACKEND_PASSWORD", "password");
+        public static final String TENANT   = getValueFromEnvOrDefault("BACKEND_TENANT",   "default");
+    }
+    private static String getValueFromEnvOrDefault(final String key, final String defaultValue) {
+        return System.getenv(key) == null ? defaultValue : System.getenv(key);
+    }
+}
+```
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `BACKEND_PROTOCOL` | `https` | scheme used by RestAssured |
+| `BACKEND_HOST` | `localhost` | host portion of the base URI |
+| `BACKEND_PORT` | `8443` | port (Cargo's HTTPS connector) |
+| `BACKEND_USERNAME` | `mifos` | basic-auth user |
+| `BACKEND_PASSWORD` | `password` | basic-auth password |
+| `BACKEND_TENANT` | `default` | `tenantIdentifier` query parameter |
+
+## The `Utils` helper
+
+`org.apache.fineract.integrationtests.common.Utils` is the single most-used class. Key constants:
+
+```java
+public static final String TENANT_PARAM_NAME = "tenantIdentifier";
+public static final String DEFAULT_TENANT    = ConfigProperties.Backend.TENANT;
+public static final String TENANT_IDENTIFIER = TENANT_PARAM_NAME + '=' + DEFAULT_TENANT;
+private static final String LOGIN_URL  = "/fineract-provider/api/v1/authentication?" + TENANT_IDENTIFIER;
+public static final String TENANT_TIME_ZONE = "Asia/Kolkata";
+public static final String DATE_FORMAT      = "dd MMMM yyyy";
+public static final String DATE_TIME_FORMAT = "dd MMMM yyyy HH:mm";
+public static final String LOCALE           = "en";
+private static final String HEALTH_URL = "/fineract-provider/actuator/health";
+```
+
+### RestAssured bootstrap
+
+`initializeRESTAssured()` configures the global RestAssured client to trust the self-signed Tomcat certificate and use the same keystore the server uses:
+
+```java
+@Deprecated(forRemoval = true)
+public static void initializeRESTAssured() {
+    RestAssured.baseURI = ConfigProperties.Backend.PROTOCOL + "://" + ConfigProperties.Backend.HOST;
+    RestAssured.port    = ConfigProperties.Backend.PORT;
+    RestAssured.keyStore("src/main/resources/keystore.jks", "openmf");
+    RestAssured.useRelaxedHTTPSValidation();
+}
+```
+
+The `@Deprecated(forRemoval = true)` markers signal an ongoing migration toward the `FineractClientHelper` / `FineractFeignClientHelper` pair (see [Fineract Client](/clients/fineract-client) and [Fineract Client Feign](/clients/fineract-client-feign)). Until the migration completes, the legacy `Utils` API remains canonical.
+
+### Login
+
+`loginIntoServerAndGetBase64EncodedAuthenticationKey()` POSTs to `/api/v1/authentication`, asserts a base64-encoded key is returned, and is what every helper-derived `RequestSpecification` puts in the `Authorization` header:
+
+```java
+public static String loginIntoServerAndGetBase64EncodedAuthenticationKey() {
+    return loginIntoServerAndGetBase64EncodedAuthenticationKey(
+        ConfigProperties.Backend.USERNAME, ConfigProperties.Backend.PASSWORD);
+}
+
+@Deprecated(forRemoval = true)
+public static String loginIntoServerAndGetBase64EncodedAuthenticationKey(String username, String password) {
+    awaitSpringBootActuatorHealthyUp();
+    String json = RestAssured.given().contentType(ContentType.JSON)
+        .body("{\"username\":\"" + username + "\", \"password\":\"" + password + "\"}")
+        .expect().log().ifError().when().post(LOGIN_URL).asString();
+    assertThat("Failed to login into fineract platform", StringUtils.isBlank(json), is(false));
+    String key = JsonPath.with(json).get("base64EncodedAuthenticationKey");
+    assertThat("Failed to obtain key: " + json, StringUtils.isBlank(key), is(false));
+    return key;
+}
+```
+
+The login routine first calls `awaitSpringBootActuatorHealthyUp()` which polls `/actuator/health` with retry and sleep — a second-level safety net in case the test process raced ahead of Cargo's wait.
+
+### Default specs
+
+Two factory methods produce the standard `RequestSpecification` / `ResponseSpecification`:
+
+```java
+@Deprecated(forRemoval = true)
+public static RequestSpecification initializeDefaultRequestSpecification() {
+    RequestSpecification requestSpec = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+    requestSpec.header("Authorization", "Basic " + Utils.loginIntoServerAndGetBase64EncodedAuthenticationKey());
+    return requestSpec;
+}
+
+@Deprecated(forRemoval = true)
+public static ResponseSpecification initializeDefaultResponseSpecification() {
+    return new ResponseSpecBuilder().expectStatusCode(200).build();
+}
+```
+
+### HTTP method wrappers
+
+`Utils` exposes overloads for GET/POST/PUT/PATCH/DELETE with optional JSON-path extraction:
+
+| Method | Purpose |
+| --- | --- |
+| `performServerGet(req, resp, getURL, jsonAttribute)` | GET returning `T` parsed from `jsonAttribute`, or the raw body when `null` |
+| `performServerGetRaw(req, resp, getURL)` | GET returning the raw RestAssured `Response` |
+| `performServerGetList(req, resp, getURL, jsonAttribute)` | GET returning `List<String>` |
+| `performServerGetArray(req, resp, getURL, jsonAttribute)` | GET returning a `JsonElement` array |
+| `performGetTextResponse(req, resp, getURL)` | GET returning the response body as `String` |
+| `performGetBinaryResponse(req, resp, getURL)` | GET returning `byte[]` |
+| `performServerPost(req, resp, postURL, json, jsonAttribute)` | POST with JSON body |
+| `performServerPut(req, resp, putURL, json, jsonAttribute)` | PUT with JSON body |
+| `performServerPutRaw(req, resp, putURL, json)` | PUT returning the raw `Response` |
+| `performServerPatch(req, resp, patchURL, json, jsonAttribute)` | PATCH |
+| `performServerDelete(req, resp, deleteURL, jsonAttribute)` | DELETE |
+
+### Random data generators
+
+To make tests collision-free across parallel runs the same class exposes a battery of generators backed by a `ConcurrentHashMap<String, Set<String>>` to track already-issued values:
+
+| Helper | Purpose |
+| --- | --- |
+| `randomStringGenerator(prefix, len)` | Plain random 0–9A–Z string with prefix |
+| `uniqueRandomStringGenerator(prefix, lenOfRandomSuffix)` | Same, guaranteed unique within the JVM run |
+| `uniqueRandomNumberGenerator(lenOfRandomSuffix)` | Random `Integer`, guaranteed unique |
+| `randomNumberGenerator(expectedLength)` | Random `Integer` of N digits |
+| `randomDecimalGenerator(whole, fraction)` | Random `Float` with N whole and M fraction digits |
+
+There are also `SOURCE_SET_NUMBERS_AND_LETTERS`, `SOURCE_SET_NUMBERS` constants for callers that want to plug a custom alphabet into `randomStringGenerator(prefix, len, sourceSet)`.
+
+## Domain helpers
+
+The `org.apache.fineract.integrationtests.common` package contains around 40 `*Helper` classes. Each owns the JSON construction, URL building, and assertion conventions for one Fineract domain object. A non-exhaustive list:
+
+| Helper | Owns |
+| --- | --- |
+| `ClientHelper` | `/clients/**` CRUD, addresses, charges, undo/reject/withdraw |
+| `LoanTransactionHelper` (`common/loans`) | loan application, approval, disbursal, repayment, charges |
+| `GlobalConfigurationHelper` | `/globalconfigurations/**` (with `resetAllDefaultGlobalConfigurations()`) |
+| `BatchHelper` | `/batches` batch API |
+| `BusinessDateHelper` | `/businessdate` set/get for COB scenarios |
+| `BusinessStepConfigurationHelper` | COB business-step config |
+| `OfficeHelper`, `GroupHelper`, `CenterHelper` | organisation tree |
+| `CalendarHelper`, `HolidayHelper`, `WorkingDaysHelper` | calendar setup |
+| `PaymentTypeHelper`, `PaymentTypeDomain` | payment type management |
+| `ChargesHelper` (`common/charges`) | charge product CRUD |
+| `AccountHelper` (`common/accounting`) | GL account creation + journal entries |
+| `ExternalEventConfigurationHelper`, `ExternalAssetOwnerHelper` | external-event toggling and asset transfer |
+| `IdempotencyHelper` | `Idempotency-Key` header experiments |
+| `NotificationHelper`, `NotesHelper` | notifications, notes |
+| `SchedulerJobHelper` | trigger scheduler jobs and poll their status |
+| `FineractClientHelper`, `FineractFeignClientHelper` | typed access via the OpenAPI-generated SDKs |
+
+## Representative test patterns
+
+### A canonical happy-path test
+
+`AuthenticationIntegrationTest` is the cleanest illustration of how a typical test class is wired:
+
+```java
+@Slf4j
+@ExtendWith(LoanTestLifecycleExtension.class)
+public class AuthenticationIntegrationTest {
+
+    private ResponseSpecification responseSpec;
+    private RequestSpecification  requestSpec;
+    private LoanTransactionHelper loanTransactionHelper;
+    private Integer loanID;
+
+    @BeforeEach
+    public void setup() {
+        Utils.initializeRESTAssured();
+        setupAuthenticatedRequestSpec();
+        this.responseSpec = new ResponseSpecBuilder().expectStatusCode(200).build();
+        this.loanTransactionHelper = new LoanTransactionHelper(this.requestSpec, this.responseSpec);
+
+        AccountHelper accountHelper = new AccountHelper(this.requestSpec, this.responseSpec);
+        Integer staffId   = StaffHelper.createStaff(this.requestSpec, this.responseSpec);
+        String  username  = Utils.uniqueRandomStringGenerator("user", 8);
+        UserHelper.createUser(this.requestSpec, this.responseSpec, 1, staffId, username, "A1b2c3d4e5f$", "resourceId");
+        Integer clientID  = ClientHelper.createClient(requestSpec, responseSpec);
+        Integer loanProductID = setupLoanProduct(accountHelper);
+        this.loanID = loanTransactionHelper.applyForLoanApplicationWithPaymentStrategyAndPastMonth(
+            clientID, loanProductID, Collections.emptyList(), null, "10000",
+            LoanApplicationTestBuilder.DEFAULT_STRATEGY, "10 July 2022", LOAN_DATE);
+    }
+
+    @Test
+    public void shouldAllowAccessForAuthenticatedUser() {
+        setupAuthenticatedRequestSpec();
+        String loanApprovalCommand = createLoanApprovalCommand();
+        String loanApprovalRequest = createLoanApprovalRequest();
+
+        HashMap response = Utils.performServerPost(this.requestSpec, this.responseSpec,
+            loanApprovalCommand, loanApprovalRequest, "changes");
+        HashMap status = (HashMap) response.get("status");
+        assertEquals(200, (Integer) status.get("id"));
+    }
+}
+```
+
+Things to note:
+
+- `Utils.initializeRESTAssured()` and a fresh login happen in `@BeforeEach`.
+- `LoanTestLifecycleExtension` (a JUnit Jupiter extension under `common/loans`) takes care of business-date and configuration state that should be reset between tests.
+- The test mutates server state freely; each scenario sets up its own client/staff/user with `Utils.uniqueRandomStringGenerator(...)` to avoid clashes.
+
+### Negative test pattern
+
+```java
+@Test
+public void shouldReturnUnauthorizedForUnauthenticatedAccess() throws JsonProcessingException {
+    setupUnauthenticatedRequestSpec();
+    this.responseSpec = new ResponseSpecBuilder().expectStatusCode(401).build();
+
+    String loanApprovalCommand = createLoanApprovalCommand();
+    String loanApprovalRequest = createLoanApprovalRequest();
+
+    String rawResponse = Utils.performServerPost(this.requestSpec, this.responseSpec,
+        loanApprovalCommand, loanApprovalRequest, null);
+
+    ObjectMapper objectMapper = new ObjectMapper();
+    HashMap response = objectMapper.readValue(rawResponse, HashMap.class);
+    assertEquals(401, (Integer) response.get("status"));
+    assertEquals("Unauthorized", response.get("error"));
+}
+```
+
+The pattern: build a *new* `ResponseSpecification` with `expectStatusCode(401)` and a `RequestSpecification` *without* the `Authorization` header before issuing the call.
+
+### `ClientTest` setup with config reset
+
+`ClientTest` shows the standard "snapshot global config in `@BeforeEach`, restore in `@AfterEach`" pattern that prevents tests from poisoning each other:
+
+```java
+@BeforeEach
+public void setup() {
+    Utils.initializeRESTAssured();
+    requestSpec  = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+    requestSpec.header("Authorization", "Basic " + Utils.loginIntoServerAndGetBase64EncodedAuthenticationKey());
+    responseSpec = new ResponseSpecBuilder().expectStatusCode(200).build();
+    clientHelper             = new ClientHelper(requestSpec, responseSpec);
+    globalConfigurationHelper = new GlobalConfigurationHelper();
+}
+
+@AfterEach
+public void tearDown() {
+    globalConfigurationHelper.resetAllDefaultGlobalConfigurations();
+    globalConfigurationHelper.verifyAllDefaultGlobalConfigurations();
+}
+```
+
+## Running locally
+
+```bash
+# Build the WAR once
+./gradlew :fineract-war:war
+
+# Run all integration tests against a Cargo-managed Tomcat (default MariaDB)
+./gradlew :integration-tests:test
+
+# Same, but against PostgreSQL
+./gradlew :integration-tests:test -PdbType=postgresql
+
+# Run a single test class against an already-running server
+./gradlew :integration-tests:test -PcargoDisabled \
+    --tests org.apache.fineract.integrationtests.AuthenticationIntegrationTest
+
+# Override the endpoint
+BACKEND_PROTOCOL=http BACKEND_HOST=fineract.local BACKEND_PORT=8080 \
+    ./gradlew :integration-tests:test -PcargoDisabled
+
+# Increase the readiness probe timeout from the default 600 s
+./gradlew :integration-tests:test -PwaitForFineractTimeoutSeconds=900
+
+# Attach a debugger to the Cargo-spawned Tomcat (port 9000)
+./gradlew :integration-tests:test -PlocalDebug
+```
+
+## Conventions and gotchas
+
+- **No parallel execution by default.** Tests share the same Tomcat instance and the same default tenant; running them in parallel without isolation has historically caused flake.
+- **Random unique IDs are mandatory.** Use `Utils.uniqueRandomStringGenerator("client", 8)` rather than fixed names; the same JVM run may collide otherwise.
+- **Always restore global config.** Tests that touch `GlobalConfigurationHelper`, business-date overrides, or external-event toggles are expected to restore them in `@AfterEach`.
+- **Helpers, not inline JSON.** Prefer extending the existing `*Helper` rather than embedding ad-hoc JSON in your test — the helpers already understand the locale/dateFormat envelope Fineract expects.
+- **Deprecation.** `Utils.initializeRESTAssured`, `initializeDefaultRequestSpecification`, and the `String username/password` overload of the login helper are all marked `@Deprecated(forRemoval = true)`. New tests should be ported to the typed clients (see [Fineract Client](/clients/fineract-client) / [Fineract Client Feign](/clients/fineract-client-feign)).
+
+## Related pages
+
+- [Testing Overview](/testing/overview) — the layer map this module fits into.
+- [OAuth2 Tests](/testing/oauth2-tests) — same Cargo scaffolding with the oauth2 profile.
+- [Two-Factor Tests](/testing/twofactor-tests) — same Cargo scaffolding with the 2FA profile.
+- [Gradle Multi-Module Build](/build/gradle-multi-module) — how `integration-tests` is wired into `settings.gradle`.
+- [Fineract Client](/clients/fineract-client), [Fineract Client Feign](/clients/fineract-client-feign) — the typed alternatives that the suite is gradually migrating to.

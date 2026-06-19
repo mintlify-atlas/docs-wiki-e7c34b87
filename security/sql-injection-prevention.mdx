@@ -1,0 +1,347 @@
+---
+title: "SQL Injection Prevention — Validator and Literal Quoting"
+sidebarTitle: "SQL Injection"
+description: "How SqlValidator, SqlInjectionPreventerService, and the pattern-based DefaultSqlValidator defend datatables, ad-hoc reporting, and search APIs."
+---
+
+Fineract carries a substantial "user-supplied SQL" surface area — ad-hoc reports, parameterised stretchy reports, custom datatables, advanced search filters — and a corresponding defence-in-depth strategy. Three abstractions cooperate to keep that surface safe:
+
+| Type | Module | Role |
+| --- | --- | --- |
+| `SqlInjectionPreventerService` | `fineract-core` (interface), `fineract-security` (impl) | Escapes literal values and validates/quotes database identifiers. |
+| `SqlValidator` | `fineract-core` (interface), `fineract-core` (default impl) | Pattern-based statement validator that rejects strings matching known injection signatures. |
+| `ColumnValidator`, `SQLBuilder` | `fineract-core/security/utils` | Helpers for whitelisting column names and parameterising queries. |
+
+This page documents the two services in detail, lists where they're called, and shows an end-to-end "blocked input → exception" example.
+
+## The contracts
+
+### `SqlInjectionPreventerService`
+
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/security/service/SqlInjectionPreventerService.java`:
+
+```java
+public interface SqlInjectionPreventerService {
+
+    String encodeSql(String literal);
+
+    /**
+     * Validates and quotes a database identifier (table name, column name) using database-specific
+     * quoting rules. This method ensures that identifiers are safely quoted to prevent SQL injection
+     * attacks.
+     */
+    String quoteIdentifier(String identifier, java.util.Set<String> allowedValues);
+
+    /** Validates and quotes a database identifier without whitelist validation. */
+    String quoteIdentifier(String identifier);
+}
+```
+
+Three jobs:
+
+1. **`encodeSql(literal)`** — turn a raw user-supplied string into something safe to splice into a SQL **literal** (between single quotes). Backed by `Utils.escapeLiteral` (PostgreSQL) or hand-rolled MySQL escaping.
+2. **`quoteIdentifier(id, allowed)`** — validate that a candidate identifier is `[A-Za-z_][A-Za-z0-9_]*` and belongs to a whitelist, then quote it with backticks (MySQL/MariaDB) or double quotes (PostgreSQL).
+3. **`quoteIdentifier(id)`** — same without the whitelist step.
+
+### `SqlValidator`
+
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/security/service/SqlValidator.java`:
+
+```java
+public interface SqlValidator {
+    void validate(String statement) throws SqlValidationException;
+    void validate(String profile, String statement) throws SqlValidationException;
+}
+```
+
+A regex-driven gauntlet. Statements are matched against a configurable list of patterns; any match means **reject**.
+
+## SqlInjectionPreventerServiceImpl
+
+`fineract-security/.../service/SqlInjectionPreventerServiceImpl.java`:
+
+```java
+@Service
+public class SqlInjectionPreventerServiceImpl implements SqlInjectionPreventerService {
+
+    private final DatabaseTypeResolver databaseTypeResolver;
+
+    public SqlInjectionPreventerServiceImpl(DatabaseTypeResolver databaseTypeResolver) {
+        this.databaseTypeResolver = databaseTypeResolver;
+    }
+
+    @Override
+    public String encodeSql(String literal) {
+        if (literal == null) {
+            return "NULL";
+        }
+        if (databaseTypeResolver.isMySQL()) {
+            return escapeMySQLLiteral(literal);
+        } else if (databaseTypeResolver.isPostgreSQL()) {
+            try {
+                return Utils.escapeLiteral(null, literal, true).toString();
+            } catch (SQLException e) {
+                throw new EscapeSqlLiteralException("Failed to escape SQL literal", e);
+            }
+        } else {
+            // For unknown database types, return the input unchanged.
+            return literal;
+        }
+    }
+    …
+}
+```
+
+Highlights:
+
+- **`null` literals become the SQL keyword `NULL`** so callers can splice safely without conditional logic.
+- **PostgreSQL** delegates to `org.postgresql.core.Utils.escapeLiteral(null, literal, true)` — the same code that the JDBC driver uses for `PreparedStatement` toString rendering. The `true` flag enables the `E'…'` extended-escape syntax.
+- **MySQL/MariaDB** uses hand-rolled escaping, see below.
+- **Unknown vendors** pass through unchanged. This is by design (developer-mode HSQL etc.) but means production deployments must be on MySQL/MariaDB or PostgreSQL to enjoy active protection.
+
+### MySQL literal escaping (post-CVE-2025-5878)
+
+The MySQL branch was rewritten to replace ESAPI's SQL encoder (the underlying vulnerability). The code is verbatim:
+
+```java
+private String escapeMySQLLiteral(String literal) {
+    StringBuilder escaped = new StringBuilder(literal.length() * 2);
+    for (int i = 0; i < literal.length(); i++) {
+        char c = literal.charAt(i);
+        switch (c) {
+            case '\0':    escaped.append("\\0");   break;
+            case '\'':    escaped.append("\\'");   break;
+            case '\"':    escaped.append("\\\"");  break;
+            case '\\':    escaped.append("\\\\");  break;
+            case '\n':    escaped.append("\\n");   break;
+            case '\r':    escaped.append("\\r");   break;
+            case '\t':    escaped.append("\\t");   break;
+            case '\032':  escaped.append("\\Z");   break;
+            default:      escaped.append(c);       break;
+        }
+    }
+    return escaped.toString();
+}
+```
+
+The characters covered are exactly those listed in the MySQL "String Literals" reference, including the ASCII 26 (Ctrl-Z) end-of-file marker that historically broke MySQL's Windows command-line tools.
+
+### Identifier quoting
+
+```java
+@Override
+public String quoteIdentifier(String identifier, Set<String> allowedValues) {
+    if (StringUtils.isBlank(identifier)) {
+        throw new IllegalArgumentException("Identifier cannot be null or empty");
+    }
+    if (allowedValues != null && !allowedValues.contains(identifier.toLowerCase())) {
+        throw new IllegalArgumentException("Identifier not in whitelist: " + identifier);
+    }
+    return quoteIdentifier(identifier);
+}
+
+@Override
+public String quoteIdentifier(String identifier) {
+    if (StringUtils.isBlank(identifier)) {
+        throw new IllegalArgumentException("Identifier cannot be null or empty");
+    }
+    if (!identifier.matches("^[a-zA-Z_][a-zA-Z0-9_]*$")) {
+        throw new IllegalArgumentException("Invalid identifier format: " + identifier);
+    }
+    if (databaseTypeResolver.isMySQL()) {
+        return "`" + identifier.replace("`", "``") + "`";
+    } else if (databaseTypeResolver.isPostgreSQL()) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    } else {
+        return identifier;
+    }
+}
+```
+
+Two layers of safety:
+
+1. **Charset whitelist**: `^[A-Za-z_][A-Za-z0-9_]*$`. No spaces, dots, hyphens, or operators. Anything fancier is rejected with `IllegalArgumentException`.
+2. **Optional value whitelist**: callers can pass in the set of allowed identifiers (e.g. column names from the datatable schema). The check is case-insensitive (`identifier.toLowerCase()` against the set).
+
+The quoting itself doubles any embedded quote character per SQL standard.
+
+## DefaultSqlValidator — pattern-based statement defense
+
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/security/utils/DefaultSqlValidator.java` is the default implementation, configured entirely from `application.properties`.
+
+### Bootstrap
+
+```java
+@PostConstruct
+public void init() {
+    properties.getSqlValidation().getPatterns().forEach(pattern -> {
+        patterns.put(pattern.getName(), Pattern.compile(pattern.getPattern(), Pattern.DOTALL));
+    });
+    properties.getSqlValidation().getProfiles().forEach(profile -> {
+        profile.getPatternRefs().sort(
+            Comparator.comparing(FineractProperties.FineractSqlValidationPatternReferenceProperties::getOrder));
+        profiles.put(profile.getName(), profile);
+    });
+
+    if (!profiles.containsKey(MAIN_PROFILE)) {
+        throw new IllegalStateException(
+            "SQL validation profile 'main' missing. … NOTE: YOU CANNOT DISABLE SQL VALIDATION!!!");
+    }
+    if (profiles.get(MAIN_PROFILE).getPatternRefs().isEmpty()) {
+        throw new IllegalStateException(
+            "SQL Validation pattern references in profile 'main' are empty. …");
+    }
+    profiles.get(MAIN_PROFILE).setEnabled(true);
+}
+```
+
+Boot enforces two invariants:
+
+1. A profile named `main` must exist.
+2. The `main` profile must reference at least one pattern.
+
+The class explicitly disables the ability to disable validation. Even an admin trying to clear out the patterns gets an `IllegalStateException` at startup.
+
+### Validation
+
+```java
+@Override
+public void validate(final String statement) throws SqlValidationException {
+    validate(MAIN_PROFILE, statement);
+}
+
+@Override
+public void validate(final String profile, final String statement) throws SqlValidationException {
+    if (StringUtils.isBlank(statement)) {
+        return;
+    }
+    for (var ref : profiles.getOrDefault(profile, profiles.get(MAIN_PROFILE)).getPatternRefs()) {
+        Matcher matcher = patterns.get(ref.getName()).matcher(statement);
+        if (matcher.matches()) {
+            log.warn("SQL validation error: >> {} <<", statement);
+            throw new SqlValidationException(
+                String.format("invalid SQL statement (detected '%s' pattern)", ref.getName()));
+        }
+    }
+}
+```
+
+Blank → allow (no statement, nothing to validate). Otherwise every pattern in profile order is tried; the first match throws.
+
+### Shipped patterns
+
+From `application.properties`:
+
+| Name | Intent (matches) | Regex (escaped) |
+| --- | --- | --- |
+| `inject-blind` | `a' OR '1'='1` style tautologies. | `(?i).*["\\\\'\`]?\\s*[and\|or]+\\s*["\\\\'\`]?([\\d\\w])+["\\\\'\`]?\\s*=\\s*["\\\\'\`]?(\\1)["\\\\'\`]?\\s*.*` |
+| `detect-entry-point` | Stray closing parens at the start of input. | `(?i)^["\\\\'\`]?[\\)\\s]+` |
+| `inject-timing` | `… AND sleep(5) …`, `pg_sleep`, `benchmark`. | `(?i).*["\\\\'\`]?\\s*[and\|\\+\|&\|\\|]+.*\\s*[sleep\|pg_sleep\|benchmark]+\\s*(\\(\\s*\\d+\\s*[,]?\\s*.*\\s*\\))+.*` |
+| `detect-backend` | DB-detector style fingerprinting payloads. | `(?i).*\\[\\s*\\"(\\w+\\(.*\\))=(\\1)\\"\\s*,\\s*\\"\\w+\\"\\s*\\].*` |
+| `detect-column` | `ORDER BY 1,2,3` / `UNION SELECT 1,null,3` column enumeration. | `(?i).*["\\\\'\`]?\\s*(order\\s*by\|group\\s*by\|union\\s*select)+\\s+([\\d+\|null]?\\s*,*\\s*)+\\s*.*` |
+| `detect-out-of-bands` | `SELECT load_file(…)` exfiltration. | `(?i).*(select)+\\s+(load_file)+.*` |
+| `inject-stacked-query` | Stacked queries (`; create/drop/alter/truncate/insert/…`). | `(?i).*[;]+\\s*(create\|drop\|alter\|truncate\|comment\|select\|insert\|update\|delete\|merge\|upsert\|call\|exec)+.*(from\|into\|set\|table\|column\|database)*.*` |
+| `inject-comment` | SQL comment markers (`--`, `/*`, `#`, `({`). | `(?i).*\\s+(--\|/\\*\|#\|\\(\\{)++.*` |
+
+The `main` profile pulls all eight in order 0–7. The `adhoc` profile (used for the ad-hoc query module) uses the same patterns; other profiles can be defined with subsets when a narrower rule set is sufficient.
+
+### Configurability
+
+Operators can extend or override the patterns without code changes:
+
+```properties
+fineract.sql-validation.patterns[8].name=detect-pg_read_file
+fineract.sql-validation.patterns[8].pattern=(?i).*(pg_read_file|pg_ls_dir)\\s*\\(.*
+
+fineract.sql-validation.profiles[0].patternRefs[8].name=detect-pg_read_file
+fineract.sql-validation.profiles[0].patternRefs[8].order=8
+```
+
+Restarting the process picks up the new pattern. Pattern `main` profile cannot be drained — see startup invariants above.
+
+## Where it's invoked
+
+### Datatables
+
+`fineract-provider/.../infrastructure/dataqueries/service/DatatableReadServiceImpl.java` is the canonical example:
+
+```java
+sqlValidator.validate(datatable);
+…
+datatable = datatableUtil.validateDatatableRegistered(datatable);
+…
+List<String> selectColumns = searchUtil.validateToJdbcColumnNames(resultColumns, headersByName, false);
+ResultsetColumnHeaderData column = searchUtil.validateToJdbcColumn(columnName, headersByName, false);
+```
+
+Sequence:
+
+1. `sqlValidator.validate(datatable)` runs the regex patterns on the **datatable name** received from the URL path (e.g. `/datatables/{datatable}`). This catches obvious payloads like `..; DROP TABLE x` early.
+2. `datatableUtil.validateDatatableRegistered(datatable)` confirms the name corresponds to a row in `x_registered_table`.
+3. `searchUtil.validateToJdbcColumnNames(...)` uses the actual column metadata as the whitelist, so user-supplied `columns=` parameters cannot reach the database unless they match registered columns.
+
+The pattern is repeated across `DatatableReportingProcessService`, `DatatableUtil`, and `ReadReportingServiceImpl`.
+
+### Reporting (`/v1/runreports`)
+
+`ReadReportingServiceImpl` calls both services:
+
+- `sqlValidator.validate(...)` on the stored report's SQL after parameter substitution.
+- `sqlInjectionPreventerService.encodeSql(...)` for parameters that must be embedded as literals (not bind variables).
+
+### Ad-hoc queries (`/v1/adhocquery`)
+
+`AdHocWritePlatformServiceJpaRepositoryImpl` uses the `adhoc` profile when validating user-uploaded SQL — this profile shares the same patterns but exists so ad-hoc validation can be tuned independently of API-driven validation.
+
+### Audit search
+
+`AuditReadPlatformServiceImpl` uses `SqlValidator` on the order-by / search clauses that the API exposes for `/v1/audits`.
+
+### Wherever an identifier is interpolated
+
+`SqlInjectionPreventerService.quoteIdentifier` is the universal helper. Search for `quoteIdentifier(` to find every call site — `JournalEntriesApiResource`, `SearchUtil`, and most datatable code paths.
+
+## Disallowed input → exception (end-to-end example)
+
+Suppose a malicious client calls:
+
+```http
+GET /api/v1/datatables/clients;DROP%20TABLE%20m_client/1 HTTP/1.1
+```
+
+1. Jersey routes the request to `DatatableReadServiceImpl`.
+2. `sqlValidator.validate("clients;DROP TABLE m_client")` runs the `main` profile.
+3. Pattern `inject-stacked-query`:
+   `(?i).*[;]+\\s*(create|drop|alter|truncate|comment|select|insert|update|delete|merge|upsert|call|exec)+.*(from|into|set|table|column|database)*.*`
+   matches `clients;DROP TABLE m_client`.
+4. `DefaultSqlValidator` logs a WARN: `SQL validation error: >> clients;DROP TABLE m_client <<`.
+5. It throws `SqlValidationException("invalid SQL statement (detected 'inject-stacked-query' pattern)")`.
+6. The exception bubbles up to a JAX-RS `ExceptionMapper`, which returns HTTP 400 with a structured error body.
+
+Identifier-quoting failure follows the same pattern but is more terse. Calling `quoteIdentifier("client; DROP TABLE x")` immediately throws `IllegalArgumentException("Invalid identifier format: client; DROP TABLE x")`, which similarly maps to a 400.
+
+## Performance considerations
+
+- All patterns are compiled once at startup (`Pattern.compile(...)`). Per-request cost is one match per pattern in the profile.
+- Patterns use `Pattern.DOTALL` so `.*` matches across newlines — important because user-supplied query bodies often contain `\n`.
+- For workloads that submit thousands of statement-validation calls per second (e.g. long-running reports), profile the matcher cost; consider narrowing the profile to a subset using `patternRefs`.
+
+## Pitfalls
+
+<Warning>
+`SqlInjectionPreventerService.encodeSql` is for **literals** — strings enclosed in single quotes. It does **not** make raw concatenation into table-name positions safe. Use `quoteIdentifier` (with a whitelist) for any identifier that came from user input.
+</Warning>
+
+<Warning>
+The MySQL escaper handles ASCII characters; it does **not** transform invalid UTF-8 sequences. Validate character set / collation at the database layer separately.
+</Warning>
+
+<Tip>
+You cannot disable validation. If you need to allow a benign payload that happens to match a pattern (e.g. a custom report selecting from `pg_ls_dir` for audit), define a dedicated profile that omits the offending pattern and route the call site through `validate(profile, statement)`.
+</Tip>
+
+## Related pages
+
+- [Security configuration](/security/security-config)
+- [Configuration overview](/config/overview)
+- [Password encoding](/security/password-encoding)

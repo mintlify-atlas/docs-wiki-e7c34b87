@@ -1,0 +1,308 @@
+---
+title: "Self-Service Users — Customer Portal Identity Model"
+sidebarTitle: "Self-Service Users"
+description: "Fineract self-service user model: seeded Self Service User role, is_self_service_user column, client linkage and what does not exist in this codebase."
+---
+
+In Apache Fineract a **self-service user** is an `AppUser` whose role membership grants them the bare minimum permissions needed to act as a customer on a portal or mobile app — read their own loan and savings accounts, request a new loan or a withdrawal, and not much else. The codebase models this distinction as a **flag on the user row** plus a **boolean on each stretchy report**, both gated by a single bootstrap role. There is no separate JAX-RS resource for self-service registration in the current sources; the same `/v1/users` endpoint creates portal logins as well as staff logins. This page documents what does exist and where the integration points sit, and is explicit about what *isn't* in this codebase.
+
+<Warning>
+The brief for this page mentions `SelfServiceUsersApiResource` and `SelfServiceRegistrationApiResource`. Neither class exists in the current Apache Fineract sources at `/home/daytona/repos/apache/fineract/`. Self-service identity is shaped by the seeded `Self Service User` role (id 2), the `m_appuser.is_self_service_user` schema column, the `stretchy_report.self_service_user_report` column, and the `Client.user.id` linkage — but customer registration and portal-specific identity APIs are not provided. Mifos's mobile clients historically called `/v1/self/*` endpoints from a Community-App-specific module; those endpoints are not part of this repository.
+</Warning>
+
+## Module layout — what is present
+
+| Concern | Where | Module |
+| --- | --- | --- |
+| `Self Service User` role (id 2) | `m_role` seed in `0002_initial_data.xml` | DB seed |
+| `is_self_service_user` flag | `m_appuser` column (schema only — not on `AppUser` entity in the current sources) | DB schema |
+| `self_service_user_report` flag | `stretchy_report` column | DB schema |
+| Reusable identity surface | `UsersApiResource` (`/v1/users`) | `fineract-provider` |
+| Per-user permission helpers | `AppUser` validation methods | `fineract-core` |
+
+## The seeded `Self Service User` role
+
+```xml
+<!-- 0002_initial_data.xml, changeSet 8 -->
+<insert tableName="m_role">
+  <column name="id"          valueNumeric="1"/>
+  <column name="name"        value="Super user"/>
+  <column name="description" value="This role provides all application permissions."/>
+  <column name="is_disabled" valueBoolean="false"/>
+</insert>
+<insert tableName="m_role">
+  <column name="id"          valueNumeric="2"/>
+  <column name="name"        value="Self Service User"/>
+  <column name="description" value="self service user role"/>
+  <column name="is_disabled" valueBoolean="true"/>
+</insert>
+```
+
+Notable details:
+
+- The role ships with `is_disabled = true`. An administrator must enable it (`POST /v1/roles/2?command=enable`) before any user may carry it.
+- It has **no seeded permissions**. The bootstrap leaves the permission set empty so each deployment can pick exactly which `READ_*` codes (and a few specific self-service write codes like `CREATE_LOAN`, `REPAYMENT_LOAN`) to grant.
+- The conventional configuration grants read access to client, loan and savings resources and selected write actions: `CREATE_LOAN` (with maker–checker), `REPAYMENT_LOAN`, etc. This is configured per deployment via `PUT /v1/roles/2/permissions` — see [roles and permissions](/users/roles-and-permissions).
+
+## The `is_self_service_user` column
+
+```xml
+<!-- 0001_initial_schema.xml — createTable m_appuser -->
+<column defaultValueBoolean="false" name="is_self_service_user" type="boolean">
+  <constraints nullable="false"/>
+</column>
+```
+
+The column is materialised on `m_appuser` with default `false`. **In the current codebase the `AppUser` JPA entity does not map this column** — the field is absent from `org.apache.fineract.useradministration.domain.AppUser`. Practically this means:
+
+- The column is preserved by JPA (it is filled by the DB default), but
+- The entity-level write paths cannot toggle it, and
+- Lookups by `is_self_service_user` happen exclusively in JDBC-level read services (e.g. the stretchy-reports filter shown below) — never through repository finders against the entity.
+
+If a downstream module needs the flag, it has to add the column mapping (a small refactor) or run a JDBC join. The legacy Mifos mobile client expected the flag in `POST /v1/users` request bodies and `GET /v1/users/{id}` responses (`"isSelfServiceUser": true`); that behaviour is not present in the current resource implementation.
+
+## The `self_service_user_report` flag on stretchy reports
+
+A second column rides on `stretchy_report`:
+
+```xml
+<column defaultValueBoolean="false" name="self_service_user_report" type="boolean">
+  <constraints nullable="false"/>
+</column>
+```
+
+The bootstrap stretchy-reports listing parameter joins on this column to scope what a self-service user can see:
+
+```sql
+-- excerpt from a seeded stretchy_parameter SQL
+SELECT  r.id AS report_id, r.report_name, r.report_type, r.report_subtype, r.report_category,
+        rp.id AS parameter_id, rp.report_parameter_name, p.parameter_name
+FROM    stretchy_report r
+LEFT JOIN stretchy_report_parameter rp ON rp.report_id = r.id
+LEFT JOIN stretchy_parameter         p  ON p.id        = rp.parameter_id
+WHERE   r.use_report                = TRUE
+  AND   r.self_service_user_report = '${isSelfServiceUser}'
+  AND EXISTS (
+      SELECT 'f'
+      FROM   m_appuser_role  ur
+      JOIN   m_role          rr ON rr.id   = ur.role_id
+      JOIN   m_role_permission rp2 ON rp2.role_id = rr.id
+      JOIN   m_permission    p2 ON p2.id   = rp2.permission_id
+      WHERE  ur.appuser_id = ${currentUserId}
+        AND (p2.code IN ('ALL_FUNCTIONS_READ', 'ALL_FUNCTIONS')
+             OR p2.code = concat('READ_', r.report_name)))
+ORDER BY r.report_category, r.report_name, rp.id;
+```
+
+The `${isSelfServiceUser}` placeholder is bound by the report runner from the caller's session — see [data queries](/core/dataqueries).
+
+## Self-service user → client linkage
+
+A self-service user is bound to one or more `Client` rows through the join table `m_selfservice_user_client_mapping` (created later in the schema). The legacy mobile API documentation (preserved in `static/legacy-docs/apiLive.htm`) demonstrates the body shape that downstream forks support:
+
+```json
+{
+  "username":         "client.portal.jdoe",
+  "firstname":        "Jane",
+  "lastname":         "Doe",
+  "email":            "jdoe@example.com",
+  "officeId":         1,
+  "roles":            [ 2 ],
+  "sendPasswordToEmail": true,
+  "isSelfServiceUser": true,
+  "clients":          [ 47 ]
+}
+```
+
+In the current codebase:
+
+- The `roles: [2]` carries the seeded `Self Service User` role — provided you have enabled it first.
+- `isSelfServiceUser` and `clients` are **ignored** by `UserDataValidator` — the columns are not exposed on the entity. Setting them in the request body has no effect on the persisted row.
+
+Deployments that need a working portal therefore typically:
+
+1. Fork or subclass `UsersApiResource` to map `isSelfServiceUser`, or
+2. Use a separate Spring Boot service that owns the portal identity and federates to Fineract via OAuth2 token introspection (`security/oauth2-authorization-server`).
+
+## Title in the home-office surveys table
+
+A small but visible artefact of the historical design: the SPM survey table (`spm_survey`) ships with a row titled `"Self Service User of Head Office"` whose questions probe whether the user has portal access. This is purely informational; it is not consulted by any code path.
+
+## What this means for your integration
+
+| Need | Recommendation |
+| --- | --- |
+| **Create a portal login** | Use `POST /v1/users` with `roles: [2]` (after enabling role 2). The user can authenticate immediately. |
+| **Filter what a portal user sees in reports** | Set `stretchy_report.self_service_user_report = true` on portal-visible reports and ensure the user holds `READ_<REPORT_NAME>` (or `ALL_FUNCTIONS_READ`). |
+| **Restrict a portal user to specific clients** | Either join via `m_selfservice_user_client_mapping` and filter in custom read services, or front Fineract with an identity broker that scopes the JWT. |
+| **Self-service signup (no admin involvement)** | Not supported by core Fineract. Build it as a separate service that uses an admin service account to POST `/v1/users`. |
+| **Force first-time password change** | `AppUser.firstTimeLoginRemaining` is set to `true` on create and cleared by `updatePassword(...)`. The portal can check the GET response and prompt accordingly. |
+
+## Lifecycle parallels with staff users
+
+A self-service user is otherwise just an `AppUser`. Everything that applies to staff users also applies:
+
+| Concern | Behaviour |
+| --- | --- |
+| Authentication | Basic auth (`BasicAuthTenantDetailsFilter`) or OAuth2 — see [authentication API](/security/authentication-api) |
+| Password policy | Same active `PasswordValidationPolicy` — see [password policy](/users/password-policy) |
+| Login retry counter | `loginRetryLimitEnabled` per user, capped by global `login-attempt-frequency` |
+| Self password reset | `POST /v1/users/{self}/pwd` — same endpoint as staff |
+| Soft delete | `AppUser.delete()` — same prefix-with-id behaviour |
+| Office scope | `office.hierarchy` still drives row-level filters; self-service users inherit the *head office* by convention |
+
+## What a portal-ready `AppUser` row looks like
+
+After the recipe in the next section runs, `m_appuser` carries a row roughly like this:
+
+```text
+id                       = 17
+username                 = client.portal.jdoe
+firstname                = Jane
+lastname                 = Doe
+email                    = jdoe@example.com
+office_id                = 1                              -- head office
+staff_id                 = NULL                           -- portal users are not employees
+enabled                  = true
+nonexpired               = true
+nonlocked                = true
+nonexpired_credentials   = true
+failed_login_attempts    = 0
+is_login_retries_enabled = false                          -- toggle to true for prod
+firsttime_login_remaining = true
+is_deleted               = false
+is_self_service_user     = false                          -- schema default; unmapped on the entity
+password_never_expires   = false
+cannot_change_password   = false
+password_reset_required  = false
+last_time_password_updated = 2024-05-12
+password                 = <BCrypt encoded with user id 17 as salt seed>
+```
+
+And the join tables:
+
+```text
+m_appuser_role
+  appuser_id = 17, role_id = 2    -- the Self Service User role
+
+m_selfservice_user_client_mapping (custom path — see step 4)
+  appuser_id = 17, client_id = 47
+```
+
+## Walk-through — provisioning a portal user against this codebase
+
+A minimal end-to-end recipe an integrator can follow against the current sources:
+
+### 1. Enable the seeded role
+
+```bash
+curl -X POST -u admin:password \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example/api/v1/roles/2?command=enable'
+```
+
+The bootstrap `Self Service User` role ships disabled to prevent accidental binding. The `ENABLE_ROLE` permission is required (see [roles and permissions](/users/roles-and-permissions)).
+
+### 2. Grant the necessary permissions
+
+Use the matrix endpoint to populate the role with the read codes that match what a portal needs to display, plus the write codes a portal needs to expose:
+
+```bash
+curl -X PUT -u admin:password \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "permissions": {
+      "READ_CLIENT":         true,
+      "READ_LOAN":           true,
+      "READ_SAVINGSACCOUNT": true,
+      "READ_LOANPRODUCT":    true,
+      "CREATE_LOAN":         true,
+      "REPAYMENT_LOAN":      true
+    }
+  }' \
+  https://fineract.example/api/v1/roles/2/permissions
+```
+
+The `CREATE_LOAN` and `REPAYMENT_LOAN` writes will trigger maker–checker if the corresponding `_CHECKER` permissions have been toggled via `PUT /v1/permissions` — see [roles and permissions](/users/roles-and-permissions).
+
+### 3. Create the portal `AppUser`
+
+```bash
+curl -X POST -u admin:password \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "username":            "client.portal.jdoe",
+    "firstname":           "Jane",
+    "lastname":            "Doe",
+    "email":               "jdoe@example.com",
+    "officeId":            1,
+    "roles":               [ 2 ],
+    "sendPasswordToEmail": true
+  }' \
+  https://fineract.example/api/v1/users
+```
+
+The user can now authenticate with the password mailed to `jdoe@example.com`. They are not yet bound to a specific `Client`.
+
+### 4. Bind the user to a client (custom JDBC)
+
+Because the entity does not map `is_self_service_user` and there is no `/v1/selfservice/clients` endpoint, the client mapping has to be applied directly:
+
+```sql
+INSERT INTO m_selfservice_user_client_mapping (appuser_id, client_id)
+VALUES (
+    (SELECT id FROM m_appuser WHERE username = 'client.portal.jdoe'),
+    47);
+```
+
+Custom read services in your integration layer can then join on `m_selfservice_user_client_mapping` to scope `/v1/clients/{id}` reads.
+
+### 5. Mark reports portal-visible (optional)
+
+```sql
+UPDATE stretchy_report
+SET    self_service_user_report = TRUE
+WHERE  report_name IN ('Loan Repayment Schedule', 'Savings Transaction History');
+```
+
+The seeded stretchy parameters then constrain that user's report list to exactly those rows.
+
+## Operational notes
+
+- **Account hygiene**: Portal users still consume `m_appuser` rows. A heavy mobile-app deployment may produce thousands of rows; index `m_appuser.is_self_service_user` if you query by it from custom reports.
+- **Failed-login lockout**: Setting `isLoginRetriesEnabled` on a portal user is recommended (defence in depth against credential-stuffing); the global `login-attempt-frequency` then caps the counter.
+- **Password reset email**: Triggered via the same auto-generate path as staff. Make sure SMTP is reachable from the Fineract instance — the mail send is **synchronous** and any failure rolls back the create.
+- **Audit**: Every action a portal user takes is logged to `m_portfolio_command_source` exactly like a staff action; the row carries their `AppUser` id.
+
+## Comparison with related concepts
+
+| Concept | Persisted as | Purpose |
+| --- | --- | --- |
+| **Self-service user** | `AppUser` carrying role id 2 | Customer-facing portal login |
+| **Staff** | `Staff` row, optionally linked to an `AppUser` | Employee directory entry (loan officer, branch manager, …) — see [staff](/organisation/staff) |
+| **Client** | `Client` row in the portfolio module | The customer themselves (KYC, accounts) |
+| **System user** | `AppUser` id 2, username `system` | Scheduler/COB identity |
+| **Admin user** | `AppUser` id 1, username `mifos`/`admin` | Bootstrap administrator |
+
+A `Client` is not the same thing as a self-service `AppUser` — the former is portfolio data, the latter is identity. The link between them (`m_selfservice_user_client_mapping`) lets one portal login control multiple clients (joint accounts, household, agent banking) and one client be addressable by multiple logins.
+
+## Why no dedicated registration endpoint exists
+
+The reasoning visible in the codebase and in the Apache project's mailing-list history:
+
+- **Security**: an open registration endpoint exposes Fineract to abuse (mass account creation, enumeration). Treating registration as an outside-Fineract concern lets each deployment plug its own anti-fraud measures.
+- **KYC coupling**: a portal user is meaningless without a `Client` row; that link has to be established by an authorised KYC flow which Fineract does not own.
+- **Tenant isolation**: registration would need to pick a tenant before any auth is attempted — easy to get wrong and hard to revoke.
+
+The recommended architecture is therefore: front Fineract with an identity layer (Keycloak, Okta, AWS Cognito, or a thin Spring Boot façade) that owns sign-up, KYC, and federated login, and have that layer create the corresponding `AppUser` + `m_selfservice_user_client_mapping` rows via a Fineract admin token.
+
+## See also
+
+- [Users overview](/users/overview) — module map.
+- [Users domain](/users/users-domain) — full `AppUser` reference (the column inventory and `firstTimeLoginRemaining`).
+- [Roles and permissions](/users/roles-and-permissions) — how to grant or revoke permissions on the `Self Service User` role.
+- [Password policy](/users/password-policy) — the same regex applies to portal users.
+- [Offices](/organisation/offices) — `office.hierarchy` constrains which clients a portal user can see in custom read services.
+- [Security overview](/security/overview) — how the `AppUser.getAuthorities()` surface drives auth on portal calls.
+- [Authentication API](/security/authentication-api) — `/authentication`, `/userdetails`, OAuth2 endpoints.
+- [Security APIs](/api/security-apis) — Swagger schemas.

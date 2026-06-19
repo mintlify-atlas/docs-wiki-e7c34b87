@@ -1,0 +1,338 @@
+---
+title: "Legacy Loan Collateral: CollateralsApiResource and LoanCollateral"
+sidebarTitle: "Collateral (Legacy)"
+description: "Reference for the legacy LoanCollateral entity, CollateralsApiResource at /loans/{loanId}/collaterals, write platform service and the migration path to Collateral Management."
+---
+
+Apache Fineract historically attached collateral directly to a loan through the `LoanCollateral` entity in `org.apache.fineract.portfolio.collateral.domain` and the JAX-RS resource at `/v1/loans/{loanId}/collaterals`. This page documents that **legacy** subsystem: the entity, the REST surface, the command handlers and the assemblers. The newer, more flexible system is described in [/portfolio/collateral-management](/portfolio/collateral-management) and [/loan/loan-collateral-management](/loan/loan-collateral-management); both subsystems still coexist in the codebase because outstanding loans created against the legacy collateral schema must continue to be serviceable.
+
+The legacy model is **per-loan**: a `LoanCollateral` row points at a single loan and a `CodeValue` describing the collateral type. There is no concept of a reusable, client-owned collateral pool, and no concept of partial release across multiple loans. Those gaps are precisely what motivated the new collateral-management module.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `LoanCollateral` entity | `fineract-loan` | `org.apache.fineract.portfolio.collateral.domain` |
+| `LoanCollateralRepository` | `fineract-provider` | `org.apache.fineract.portfolio.collateral.domain` |
+| `CollateralData` DTO | `fineract-provider` | `org.apache.fineract.portfolio.collateral.data` |
+| `CollateralCommand` (request struct) | `fineract-provider` | `org.apache.fineract.portfolio.collateral.command` |
+| `CollateralsApiResource` (`/v1/loans/{loanId}/collaterals`) | `fineract-provider` | `org.apache.fineract.portfolio.collateral.api` |
+| `CollateralReadPlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.collateral.service` |
+| `CollateralWritePlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.collateral.service` |
+| `CollateralAssembler` | `fineract-provider` | `org.apache.fineract.portfolio.collateral.service` |
+| `Create/Update/DeleteCollateralCommandHandler` | `fineract-provider` | `org.apache.fineract.portfolio.collateral.handler` |
+| `CollateralCommandFromApiJsonDeserializer` | `fineract-provider` | `org.apache.fineract.portfolio.collateral.serialization` |
+| Exceptions (`CollateralNotFoundException`, `CollateralCannotBeCreatedException`, `…Updated`, `…Deleted`) | `fineract-provider` | `org.apache.fineract.portfolio.collateral.exception` |
+| `CollateralConfiguration` (Spring `@Configuration`) | `fineract-provider` | `org.apache.fineract.portfolio.collateral.starter` |
+
+Note that the entity itself sits in `fineract-loan` (because it has a `@ManyToOne` to `Loan`), while everything else stays in `fineract-provider`.
+
+## Entity
+
+```java
+// fineract-loan/.../portfolio/collateral/domain/LoanCollateral.java
+@Entity
+@Table(name = "m_loan_collateral")
+public class LoanCollateral extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @ManyToOne
+    @JoinColumn(name = "type_cv_id", nullable = false)
+    private CodeValue type;
+
+    @Column(name = "value", scale = 6, precision = 19)
+    private BigDecimal value;
+
+    @Column(name = "description", length = 500)
+    private String description;
+```
+
+Field semantics:
+
+- **`loan`** — the parent loan. Required, non-null, no orphan-removal: deleting the loan does not cascade to collateral and vice versa, but the foreign key prevents loan deletion while collateral rows exist.
+- **`type`** — a `CodeValue` from the `LoanCollateral` code (`code_name = 'LoanCollateral'`). Examples: "Vehicle", "Land", "Gold", "Inventory". The code itself is configurable through the Code framework.
+- **`value`** — appraised value of the collateral, as a `BigDecimal(19, 6)`. Used by reporting and exposure-limit checks; never directly modifies the schedule.
+- **`description`** — short free-text identifier ("Honda Civic VIN ABC123").
+
+### Factories and updaters
+
+```java
+public static LoanCollateral from(final CodeValue collateralType, final BigDecimal value, final String description) {
+    return new LoanCollateral(null, collateralType, value, description);
+}
+
+public static LoanCollateral fromJson(final Loan loan, final CodeValue collateralType, final JsonCommand command) {
+    final String description = command.stringValueOfParameterNamed(CollateralJSONinputParams.DESCRIPTION.getValue());
+    final BigDecimal value   = command.bigDecimalValueOfParameterNamed(CollateralJSONinputParams.VALUE.getValue());
+    return new LoanCollateral(loan, collateralType, value, description);
+}
+
+public void assembleFrom(final CodeValue collateralType, final BigDecimal value, final String description) {
+    this.type = collateralType;
+    this.description = description;
+    this.value = value;
+}
+
+public void associateWith(final Loan loan) {
+    this.loan = loan;
+}
+```
+
+`from(...)` is used when the collateral is built at loan-application time (before the `Loan` aggregate has an id); `associateWith(loan)` is then called once the loan is persisted. `fromJson(...)` is the path taken by `CollateralsApiResource.createCollateral(...)` when the loan already exists.
+
+`update(JsonCommand command)` returns a `Map<String, Object> actualChanges` so the command handler can persist only the deltas — the standard pattern across Fineract.
+
+## REST surface — `CollateralsApiResource`
+
+```java
+// fineract-provider/.../portfolio/collateral/api/CollateralsApiResource.java
+@Path("/v1/loans/{loanId}/collaterals")
+@Component
+@Tag(name = "Loan Collateral",
+     description = "In lending agreements, collateral is a borrower's pledge of specific property to a lender, ...")
+@RequiredArgsConstructor
+public class CollateralsApiResource {
+
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = new HashSet<>(
+            Arrays.asList("id", "type", "value", "description", "allowedCollateralTypes", "currency"));
+
+    private static final String RESOURCE_NAME_FOR_PERMISSION = "COLLATERAL";
+```
+
+The five-method surface mirrors a standard CRUD resource plus a `template` for picking allowed types.
+
+### GET `/loans/{loanId}/collaterals/template`
+
+```java
+@GET
+@Path("template")
+@Operation(summary = "Retrieve Collateral Details Template", ...)
+public CollateralData newCollateralTemplate(@PathParam("loanId") final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSION);
+    final List<CodeValueData> codeValues = this.codeValueReadPlatformService.retrieveCodeValuesByCode("LoanCollateral");
+    return CollateralData.template(codeValues);
+}
+```
+
+Returns an empty `CollateralData` with the `allowedCollateralTypes` list populated from the `LoanCollateral` `CodeValue` code.
+
+### GET `/loans/{loanId}/collaterals` — list
+
+```java
+@GET
+public List<CollateralData> retrieveCollateralDetails(@PathParam("loanId") final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSION);
+    return this.collateralReadPlatformService.retrieveCollateralsForValidLoan(loanId);
+}
+```
+
+`retrieveCollateralsForValidLoan` first asserts the loan exists (via `LoanRepositoryWrapper.findOneWithNotFoundDetection`) and then does a single JDBC query joining `m_loan_collateral` to `m_code_value` to populate the response.
+
+### GET `/loans/{loanId}/collaterals/{collateralId}` — detail
+
+`retrieveCollateral(loanId, collateralId)` enforces both the loan and the collateral exist and returns a single `CollateralData`. With `?template=true`, the response also carries `allowedCollateralTypes` for inline edit screens.
+
+### POST `/loans/{loanId}/collaterals` — create
+
+```java
+@POST
+@Operation(summary = "Create a Collateral",
+           description = "Note: Currently, Collaterals may be added only before a Loan is approved")
+public CommandProcessingResult createCollateral(@PathParam("loanId") final Long loanId,
+                                                final LoansLoanIdCollateralsRequest loansLoanIdCollateralsRequest) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createCollateral(loanId)
+            .withJson(apiJsonSerializerService.serialize(loansLoanIdCollateralsRequest)).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The route is `?command=create` (implicit through `createCollateral(loanId)`). The handler is `CreateCollateralCommandHandler` and the underlying write service refuses if the loan is already in `APPROVED` or beyond — the rule "collaterals may be added only before a Loan is approved" is enforced in `CollateralWritePlatformServiceJpaRepositoryImpl.addCollateral(...)`.
+
+`LoansLoanIdCollateralsRequest` carries `collateralTypeId`, `value`, `description`. The serializer (`CollateralCommandFromApiJsonDeserializer`) validates that fields are present and well-typed, producing a `CollateralCommand` value object.
+
+### PUT `/loans/{loanId}/collaterals/{collateralId}` — update
+
+Maps to `UpdateCollateralCommandHandler`. The same "loan not yet approved" rule applies through `CollateralCannotBeUpdatedException`.
+
+### DELETE `/loans/{loanId}/collaterals/{collateralId}` — remove
+
+```java
+@DELETE
+@Path("{collateralId}")
+@Operation(summary = "Remove a Collateral",
+           description = "Note: A collateral can only be removed from Loans that are not yet approved.")
+public CommandProcessingResult deleteCollateral(@PathParam("loanId") final Long loanId,
+                                                @PathParam("collateralId") final Long collateralId) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().deleteCollateral(loanId, collateralId).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+Wired through `DeleteCollateralCommandHandler`, which raises `CollateralCannotBeDeletedException` when the loan is past `SUBMITTED_AND_PENDING_APPROVAL`.
+
+## `CollateralCommand`
+
+The intermediate command object is a typed value used by the deserializer and write service:
+
+```java
+// fineract-provider/.../portfolio/collateral/command/CollateralCommand.java
+public class CollateralCommand {
+    private final Long collateralTypeId;
+    private final BigDecimal value;
+    private final String description;
+    // getters, no setters
+}
+```
+
+The deserializer (`CollateralCommandFromApiJsonDeserializer.commandFromApiJson(String json)`) parses the JSON, validates the parameter set against `SUPPORTED_PARAMETERS` and produces a `CollateralCommand`. It rejects unknown fields with `UnsupportedParameterException`.
+
+## Write platform service
+
+```java
+public interface CollateralWritePlatformService {
+    CommandProcessingResult addCollateral(Long loanId, JsonCommand command);
+    CommandProcessingResult updateCollateral(Long loanId, Long collateralId, JsonCommand command);
+    CommandProcessingResult deleteCollateral(Long loanId, Long collateralId);
+}
+```
+
+`CollateralWritePlatformServiceJpaRepositoryImpl` performs:
+
+1. **Validation** — calls the JSON deserializer to produce a `CollateralCommand`.
+2. **Loan lookup** — `LoanRepositoryWrapper.findOneWithNotFoundDetection(loanId)`.
+3. **State check** — refuses mutation when loan status is not `SUBMITTED_AND_PENDING_APPROVAL`. Throws `CollateralCannotBeCreatedException` / `CollateralCannotBeUpdatedException` / `CollateralCannotBeDeletedException` accordingly.
+4. **CodeValue resolution** — `CodeValueRepositoryWrapper.findOneByCodeNameAndIdWithNotFoundDetection("LoanCollateral", collateralTypeId)`.
+5. **Persist** — `LoanCollateralRepository.saveAndFlush(...)`.
+6. **Result** — returns `CommandProcessingResult` with the new id (or the updated id, plus an `actualChanges` map for the audit).
+
+The assembler `CollateralAssembler.fromParsedJson(JsonElement element)` is used by the loan-application path to bulk-load collaterals when a loan is submitted with a `collateral: [...]` array in one POST.
+
+## Handlers
+
+| Command | Class | Description |
+| --- | --- | --- |
+| `CREATE_COLLATERAL` | `CreateCollateralCommandHandler` | Adds one collateral to a pre-approval loan. |
+| `UPDATE_COLLATERAL` | `UpdateCollateralCommandHandler` | Updates type/value/description of a single collateral. |
+| `DELETE_COLLATERAL` | `DeleteCollateralCommandHandler` | Removes one collateral row. |
+
+All three are `@CommandType`-annotated Spring components automatically picked up by the command dispatcher.
+
+## Exceptions
+
+- **`CollateralNotFoundException`** — HTTP 404; the `collateralId` does not exist or is not attached to the given loan.
+- **`CollateralCannotBeCreatedException`** — HTTP 403; the loan is no longer in `SUBMITTED_AND_PENDING_APPROVAL`.
+- **`CollateralCannotBeUpdatedException`** — HTTP 403; same reason.
+- **`CollateralCannotBeDeletedException`** — HTTP 403; same reason.
+
+The "approved" cut-off is intentional: once a loan is approved, the documented collateral becomes part of the legal record and the platform refuses to alter it. Operational corrections require an undo-approval, edit, then re-approve.
+
+## DTO — `CollateralData`
+
+`CollateralData` is built by the read service and the template factory:
+
+```java
+public class CollateralData {
+    private final Long id;
+    private final CodeValueData type;
+    private final BigDecimal value;
+    private final String description;
+    private final Collection<CodeValueData> allowedCollateralTypes; // template only
+    private final CurrencyData currency;                            // for reporting
+    // factories: instance(...), template(...), retrieved(...)
+}
+```
+
+The `currency` field is filled from the parent loan's currency at retrieval time. The `allowedCollateralTypes` field is only populated by the `template(...)` factory.
+
+## Relationship to the new system
+
+The new system (`org.apache.fineract.portfolio.collateralmanagement`) introduces three resources — `/v1/collateral-management`, `/v1/clients/{clientId}/collaterals`, `/v1/loan-collateral-management` — and a per-client pool of collateral that loans then **reference**. The two systems coexist:
+
+- Loans created with the legacy `m_loan_collateral` schema continue to use this resource. Existing rows still drive the legal record on those loans.
+- New loan products generally adopt the new model via `useClientCollateral=true` on the loan product, which routes the loan-application body's `collateral` array through the new `LoanCollateralManagement` chain instead.
+
+When migrating: write a Liquibase migration that, for each legacy `LoanCollateral` row, creates a `CollateralManagementDomain` template row (if missing), then a `ClientCollateralManagement` row, then a `LoanCollateralManagement` link to the loan. Both systems can be queried side by side for the duration of the migration.
+
+See [/portfolio/collateral-management](/portfolio/collateral-management) for the new system overview and [/loan/loan-collateral-management](/loan/loan-collateral-management) for the loan-side linkage.
+
+## Permissions
+
+The resource uses the single permission name `COLLATERAL`. Standard Fineract permissions apply: `READ_COLLATERAL`, `CREATE_COLLATERAL`, `UPDATE_COLLATERAL`, `DELETE_COLLATERAL`. Maker-checker support is automatic through the command pipeline.
+
+## Auditing
+
+Every successful create/update/delete is recorded as a `commands` row through `PortfolioCommandSourceWritePlatformService.logCommandSource(...)`. The `actualChanges` map produced by the entity's `update(...)` is included in the audit payload so reviewers can see exactly which fields changed.
+
+## Edge cases and gotchas
+
+- **Pre-approval only** — the trio of "cannot be created/updated/deleted" exceptions are surprising the first time you hit them. If you genuinely need to change collateral on an already-approved loan, the workflow is: undo approval → edit collateral → re-approve.
+- **No partial release** — there is no concept of "release 30% of the collateral as the loan is repaid". The new model in `collateralmanagement` adds this through `quantity` and `quantityFreed` columns on `LoanCollateralManagement`.
+- **One CodeValue scope** — all collateral types must share the single Code `LoanCollateral`. The new model removes this restriction by introducing per-collateral-type product templates.
+- **Value is not validated against loan principal.** Nothing in the legacy chain ties `LoanCollateral.value` to the loan amount or to a loan-to-value ratio. Such checks must be implemented externally or migrated to the new system.
+
+## SQL — read service shape
+
+The read service uses a single denormalised SQL joining `m_loan_collateral` with `m_code_value` and the loan's currency. A simplified version:
+
+```sql
+SELECT
+    lc.id                            AS id,
+    lc.value                         AS value,
+    lc.description                   AS description,
+    cv.id                            AS typeId,
+    cv.code_value                    AS typeName,
+    cv.code_description              AS typeDescription,
+    l.currency_code                  AS currencyCode,
+    l.currency_digits                AS currencyDigits,
+    l.currency_multiplesof           AS currencyMultiplesOf
+FROM m_loan_collateral lc
+JOIN m_code_value      cv ON cv.id = lc.type_cv_id
+JOIN m_loan            l  ON l.id  = lc.loan_id
+WHERE lc.loan_id = ?
+```
+
+This is intentionally a single query rather than a JPA-managed graph — `CollateralReadPlatformService` is a JDBC `RowMapper` over this result set.
+
+## Wire-level example
+
+```bash
+# Add collateral (requires loan in SUBMITTED_AND_PENDING_APPROVAL)
+curl -u admin:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/loans/12/collaterals' \
+  -d '{
+    "collateralTypeId": 51,
+    "value": 5000,
+    "description": "Honda Civic VIN ABC123"
+  }'
+
+# List
+curl -u admin:password \
+  'http://host/fineract-provider/api/v1/loans/12/collaterals'
+
+# Update (still pre-approval)
+curl -u admin:password -X PUT \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/loans/12/collaterals/1' \
+  -d '{ "value": 5500 }'
+
+# After loan is approved, all three mutating verbs return 403:
+# {
+#   "developerMessage":"Loan Collateral cannot be modified...",
+#   "userMessageGlobalisationCode":"error.msg.collateral.cannot.be.updated",
+#   ...
+# }
+```
+
+## Cross-references
+
+- [/portfolio/collateral-management](/portfolio/collateral-management) — the new, recommended system.
+- [/loan/loan-collateral-management](/loan/loan-collateral-management) — the loan-side wiring of the new model.
+- [/loan/loan-domain-model](/loan/loan-domain-model) — where `LoanCollateral` sits in the loan aggregate.
+- [/loan/loan-application-write-service](/loan/loan-application-write-service) — how the loan-application path consumes `CollateralAssembler`.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — `CodeValue` and the audit base class.
+- [/api/portfolio-apis](/api/portfolio-apis) — end-user API tour for collateral.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder`, `PortfolioCommandSourceWritePlatformService` and the audit pipeline.

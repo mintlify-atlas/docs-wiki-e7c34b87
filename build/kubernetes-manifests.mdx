@@ -1,0 +1,377 @@
+---
+title: "Kubernetes Manifests: fineract-server, MariaDB, Mifos UI"
+sidebarTitle: "Kubernetes Manifests"
+description: "The kubernetes/ directory shipped with Apache Fineract: server Deployment+Service, MariaDB Deployment+PV+ConfigMap, Mifos community UI, and the kubectl-startup/shutdown lifecycle scripts."
+---
+
+Apache Fineract ships a minimal but functional Kubernetes deployment under `kubernetes/` at the repository root. It is targeted at single-node demo clusters (Minikube, kind, Docker Desktop) — not at production multi-tenant operation. The five files implement a three-Deployment stack (fineract server, MariaDB, Mifos community UI) plus two shell scripts that drive `kubectl apply` / `kubectl delete` in the correct order. This page enumerates every manifest, calls out the secrets-and-init-container dance, and documents the gaps you must close before reusing the YAMLs in production.
+
+<Note>
+For production-grade Helm charts, operator-managed StatefulSets, or multi-AZ topologies, look at downstream distributions (Mifos X, Frollo, fineract-platform Helm chart). This page documents what is in **this** repository and only that.
+</Note>
+
+## Files at a glance
+
+```
+kubernetes/
+├── fineract-mifoscommunity-deployment.yml   # Mifos UI + nginx reverse proxy + ConfigMap
+├── fineract-server-deployment.yml           # Fineract server Deployment + LoadBalancer Service
+├── fineractmysql-configmap.yml              # init.sql ConfigMap mounted into MariaDB
+├── fineractmysql-deployment.yml             # MariaDB Deployment + Service + PV + PVC
+├── kubectl-shutdown.sh
+└── kubectl-startup.sh
+```
+
+| Manifest                                  | Kinds                                                                                                  |
+|-------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| `fineract-server-deployment.yml`          | `Service` (LoadBalancer, port 8443), `Deployment` (replicas=1, image `apache/fineract:latest`)          |
+| `fineractmysql-deployment.yml`            | `PersistentVolume` (hostPath /mnt/data, 10Gi), `PersistentVolumeClaim` (5Gi), `Service` (headless, port 3306), `Deployment` (mariadb:12.2) |
+| `fineractmysql-configmap.yml`             | `ConfigMap` `fineractmysql-initdb` with `init.sql` (creates `fineract_tenants`, `fineract_default`)    |
+| `fineract-mifoscommunity-deployment.yml`  | `ConfigMap` `web-app-config` (environment.json + nginx.conf), `Service` (LoadBalancer, port 9090), `Deployment` (mifos community image) |
+
+## Lifecycle scripts
+
+The two shell scripts under `kubernetes/` are the canonical bring-up / tear-down path. They encode ordering constraints that pure `kubectl apply -f .` would miss.
+
+### `kubectl-startup.sh`
+
+```bash
+# 1. Create the DB secret with a random 16-char password (skipped if it already exists)
+kubectl create secret generic fineract-tenants-db-secret \
+    --from-literal=username=root \
+    --from-literal=password=$(head /dev/urandom | LC_CTYPE=C tr -dc A-Za-z0-9 | head -c 16) \
+    2>/dev/null || echo "Secret already exists, skipping..."
+
+# 2. Mount init.sql
+kubectl apply -f fineractmysql-configmap.yml
+
+# 3. Bring up MariaDB and wait
+kubectl apply -f fineractmysql-deployment.yml
+kubectl wait --for=condition=ready pod -l tier=fineractmysql --timeout=300s
+
+# 4. Bring up the fineract server and wait
+kubectl apply -f fineract-server-deployment.yml
+kubectl wait --for=condition=ready pod -l app=fineract-server --timeout=300s
+
+# 5. Bring up the Mifos UI and wait
+kubectl apply -f fineract-mifoscommunity-deployment.yml
+kubectl wait --for=condition=ready pod -l app=mifos-community --timeout=300s
+```
+
+Three things to notice:
+
+1. **The DB password is generated at startup time** and stored in the `fineract-tenants-db-secret` Secret. There is no committed password in the repo. The MariaDB Deployment reads it via `MARIADB_ROOT_PASSWORD` (root credentials); the fineract server reads the same Secret to populate `FINERACT_HIKARI_PASSWORD` and `FINERACT_DEFAULT_TENANTDB_PWD`.
+2. **`kubectl wait` between steps** — the fineract server has both a Pod-level `initContainer` waiting for the MariaDB TCP port, *and* an outer `kubectl wait` before applying it. Belt and suspenders.
+3. **No Liquibase pre-flight** — the fineract server runs its own Liquibase migrations on startup; the only DDL applied by `init.sql` is `CREATE DATABASE` for `fineract_tenants` and `fineract_default`.
+
+### `kubectl-shutdown.sh`
+
+```bash
+kubectl delete -f fineract-mifoscommunity-deployment.yml --ignore-not-found=true
+kubectl delete -f fineract-server-deployment.yml         --ignore-not-found=true
+kubectl delete -f fineractmysql-deployment.yml           --ignore-not-found=true
+kubectl delete -f fineractmysql-configmap.yml            --ignore-not-found=true
+kubectl delete secret fineract-tenants-db-secret         --ignore-not-found=true
+```
+
+Reverse order of startup. **The PersistentVolumeClaim is deleted along with the MariaDB deployment**, but the PV is `storageClassName: manual` with hostPath `/mnt/data` and `reclaimPolicy` defaults to `Retain` at the cluster level — so the data on disk usually survives across `delete`/`apply` cycles. If you want a clean slate, `sudo rm -rf /mnt/data` on the node.
+
+## `fineract-server-deployment.yml`
+
+### Service (LoadBalancer, 8443)
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: fineract-server
+  name: fineract-server
+spec:
+  ports:
+    - protocol: TCP
+      port: 8443
+      targetPort: 8443
+  selector:
+    app: fineract-server
+    tier: backend
+  type: LoadBalancer
+```
+
+Only HTTPS (8443) is exposed. The Jib image also opens 8080, but it is not declared here — make sure your `FINERACT_SERVER_PORT` matches the Service port. On Minikube `LoadBalancer` resolves via `minikube tunnel`.
+
+### Deployment
+
+```yaml
+spec:
+  selector:
+    matchLabels:
+      app: fineract-server
+      tier: backend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: fineract-server
+        tier: backend
+    spec:
+      initContainers:
+        - name: init-mydb
+          image: busybox:1.28
+          command: ['sh', '-c',
+            'echo -e "Checking for the availability of MYSQL server deployment";
+             while ! nc -z "fineractmysql" 3306; do sleep 1; printf "-"; done;
+             echo -e " >> MYSQL server has started";']
+      containers:
+        - name: fineract-server
+          image: apache/fineract:latest
+          resources:
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+            requests:
+              cpu: "200m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /fineract-provider/actuator/health/liveness
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /fineract-provider/actuator/health/readiness
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 3
+```
+
+| Pattern             | Choice                              | Why                                                                                                                            |
+|---------------------|--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `strategy.type`     | `Recreate`                          | Liquibase requires that only one instance perform migrations. `RollingUpdate` would briefly run two Pods → migration race.    |
+| `initContainer`     | `busybox` waiting on DNS+TCP        | Liveness probe starts at 90s; the init container shortens the window where the server would spin on Hikari connection errors. |
+| Liveness scheme     | `HTTPS`                             | Even local probes go through the Spring Boot SSL connector. The kubelet must accept the self-signed cert (it does — `httpGet` does not validate). |
+| Liveness vs Readiness | `/actuator/health/liveness` vs `/actuator/health/readiness` | Spring Boot's `LivenessStateHealthIndicator` and `ReadinessStateHealthIndicator`. Readiness fails until `ApplicationContext` is fully refreshed and all health groups are green. |
+| `initialDelaySeconds` | 90 (live), 60 (ready)             | The server's cold start dominated by Liquibase on first boot (~30–60s) and JPA EntityManagerFactory init (~20s).               |
+
+### Environment variables
+
+```yaml
+env:
+  - name: FINERACT_NODE_ID
+    value: '1'
+  - name: FINERACT_HIKARI_DRIVER_CLASS_NAME
+    value: org.mariadb.jdbc.Driver
+  - name: FINERACT_HIKARI_JDBC_URL
+    value: jdbc:mariadb://fineractmysql:3306/fineract_tenants
+  - name: FINERACT_HIKARI_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: fineract-tenants-db-secret
+        key: username
+  - name: FINERACT_HIKARI_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: fineract-tenants-db-secret
+        key: password
+  - name: FINERACT_DEFAULT_TENANTDB_HOSTNAME
+    value: fineractmysql
+  - name: FINERACT_DEFAULT_TENANTDB_PORT
+    value: '3306'
+  - name: FINERACT_DEFAULT_TENANTDB_UID
+    valueFrom:
+      secretKeyRef: { name: fineract-tenants-db-secret, key: username }
+  - name: FINERACT_DEFAULT_TENANTDB_PWD
+    valueFrom:
+      secretKeyRef: { name: fineract-tenants-db-secret, key: password }
+  - name: FINERACT_DEFAULT_TENANTDB_CONN_PARAMS
+    value: ''
+  - name: FINERACT_SERVER_PORT
+    value: "8443"
+  - name: JAVA_TOOL_OPTIONS
+    value: '-Xmx1G -XX:MaxMetaspaceSize=256m'
+```
+
+The two relevant property families are:
+
+- `FINERACT_HIKARI_*` — credentials for the **tenants** registry DB (`fineract_tenants`). The server reads `m_tenants` from here to find per-tenant DBs.
+- `FINERACT_DEFAULT_TENANTDB_*` — the default tenant. On first boot Liquibase creates `fineract_default` and seeds it. Subsequent tenants are inserted with their own connection settings into `m_tenants`.
+
+`JAVA_TOOL_OPTIONS` matters because, as documented in [Dockerfile & Jib](/build/dockerfile-and-jib), the Jib image bakes only four `-D` args and **no heap settings**. The `2Gi` resource limit pairs with `-Xmx1G` to leave headroom for Metaspace, direct buffers, and the JVM's own footprint.
+
+## `fineractmysql-deployment.yml`
+
+The MariaDB deployment is intentionally simple — one Pod, one PVC, one Service.
+
+```yaml
+# PV: 10Gi hostPath
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fineractmysql-pv-volume
+spec:
+  storageClassName: manual
+  capacity: { storage: 10Gi }
+  accessModes: [ReadWriteMany]
+  hostPath: { path: "/mnt/data" }
+---
+# PVC: 5Gi
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: fineractmysql-pv-claim }
+spec:
+  storageClassName: manual
+  accessModes: [ReadWriteMany]
+  resources: { requests: { storage: 5Gi } }
+---
+# Headless Service on 3306
+apiVersion: v1
+kind: Service
+metadata:
+  labels: { app: fineract-server }
+  name: fineractmysql
+spec:
+  ports: [{ protocol: TCP, port: 3306, targetPort: 3306 }]
+  selector: { app: fineract-server, tier: fineractmysql }
+  clusterIP: None
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: fineractmysql }
+spec:
+  strategy: { type: Recreate }
+  template:
+    spec:
+      containers:
+        - image: mariadb:12.2
+          name: mysql
+          args: ["--innodb-snapshot-isolation=OFF"]
+          resources:
+            requests: { memory: "1Gi", cpu: "1000m" }
+            limits:   { memory: "5Gi", cpu: "2000m" }
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: fineract-tenants-db-secret, key: password } }
+          livenessProbe:
+            exec: { command: ["sh","-c","mariadb -uroot -p${MARIADB_ROOT_PASSWORD} -e 'SELECT 1'"] }
+            failureThreshold: 10
+            timeoutSeconds: 10
+          readinessProbe:
+            exec: { command: ["sh","-c","mariadb -uroot -p${MARIADB_ROOT_PASSWORD} -e 'SELECT 1'"] }
+            failureThreshold: 10
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          ports: [{ containerPort: 3306, name: fineractmysql }]
+          volumeMounts:
+            - name: fineractmysql-initdb
+              mountPath: /docker-entrypoint-initdb.d/
+            - name: fineractmysql-persistent-storage
+              mountPath: /var/lib/mysql/
+      volumes:
+        - name: fineractmysql-initdb
+          configMap: { name: fineractmysql-initdb }
+        - name: fineractmysql-persistent-storage
+          persistentVolumeClaim: { claimName: fineractmysql-pv-claim }
+```
+
+Two production-relevant choices to note:
+
+| Choice                                       | Reason                                                                                                                                         |
+|----------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--innodb-snapshot-isolation=OFF`            | MariaDB 11.4+ enables snapshot isolation by default; Liquibase migrations and several Fineract integration tests rely on the older REPEATABLE READ semantics. Toggling it off prevents subtle deadlocks on the COB tasklets. |
+| Headless Service (`clusterIP: None`)         | DNS resolves `fineractmysql` directly to the Pod IP. No kube-proxy in the data path — minimal latency on every JDBC call.                       |
+| `ReadWriteMany` access mode                  | Mostly cosmetic on hostPath (which only supports `ReadWriteOnce` semantically); makes the PV portable to NFS-backed clusters if you swap the volume driver. |
+
+### `fineractmysql-configmap.yml`
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fineractmysql-initdb
+  labels: { app: fineract-server }
+data:
+  init.sql: |
+    # create databases
+    CREATE DATABASE IF NOT EXISTS `fineract_tenants`;
+    CREATE DATABASE IF NOT EXISTS `fineract_default`;
+
+    # create root user and grant rights
+    GRANT ALL ON *.* TO 'root'@'%';
+```
+
+Mounted into `/docker-entrypoint-initdb.d/`; runs once on **first** MariaDB start (subsequent restarts skip the init scripts because `/var/lib/mysql/` is non-empty). The `GRANT ALL ON *.* TO 'root'@'%'` line is the bit that lets the server connect from another Pod over the cluster network — without it, MariaDB's default of restricting root to localhost would break the deployment.
+
+## `fineract-mifoscommunity-deployment.yml`
+
+This file packages the Mifos community Angular UI plus an nginx reverse proxy. The ConfigMap supplies both `environment.json` (which API base URL the app calls) and `nginx.conf` (which proxies `/fineract-provider/` to the backend over HTTPS, skipping cert validation).
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: web-app-config }
+data:
+  environment.json: |
+    {
+      "fineractApiUrls": ["/fineract-provider"],
+      "oauth": { "enabled": false },
+      "defaultLanguage": "en-US",
+      "supportedLanguages": ["en-US", "es-MX"],
+      "preloadClients": true
+    }
+  nginx.conf: |
+    server {
+        listen 80;
+        server_name localhost;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        location / { try_files $uri $uri/ /index.html; }
+
+        location /fineract-provider/ {
+            proxy_pass https://fineract-server:8443/fineract-provider/;
+            proxy_ssl_verify off;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_redirect https:// http://;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: mifos-community }
+spec:
+  ports: [{ protocol: TCP, port: 9090, targetPort: 80 }]
+  selector: { app: mifos-community, tier: frontend }
+  type: LoadBalancer
+```
+
+The Deployment (truncated above) runs an nginx-Alpine image with the SPA built into `/usr/share/nginx/html` plus the ConfigMap mounted as overrides. The browser hits `http://<lb>:9090/`, the SPA calls `/fineract-provider/...` which nginx proxies to `https://fineract-server:8443/fineract-provider/...` over the cluster network. `proxy_redirect https:// http://;` rewrites redirects from the backend (which always returns HTTPS Location headers) back to plain HTTP so the SPA can follow them.
+
+## What's missing for production
+
+| Concern                  | Status in this directory                                                                                          | Mitigation                                                                                              |
+|--------------------------|--------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| TLS termination          | Self-signed cert in the JVM truststore; nginx skips verification                                                  | Terminate TLS at an Ingress / cloud LB; serve the SPA from a proper cert; use cert-manager               |
+| Secrets management       | Generated once at `kubectl-startup.sh` time                                                                       | Use external-secrets, Vault, SOPS, or cloud KMS-backed secrets                                          |
+| HA database              | One MariaDB Pod, hostPath storage                                                                                | StatefulSet with replication, or a managed DB (RDS / CloudSQL / Cloud SQL for MySQL)                    |
+| HA fineract server       | Single replica + `Recreate` strategy                                                                              | Scale to 2+ replicas with a leader-elected Liquibase migration job (`change-log-context = init`)        |
+| Backups                  | None                                                                                                              | Velero, mariabackup CronJob, or DB-managed snapshots                                                    |
+| ActiveMQ / Kafka         | Not deployed                                                                                                      | Add `activemq` or `strimzi-kafka` manifests; point `FINERACT_EVENTS_EXTERNAL_PRODUCER_*` envs at them    |
+| Two-factor + OAuth2 mode | Off                                                                                                               | Set `FINERACT_SECURITY_BASICAUTH_ENABLED=false`, `SPRING_PROFILES_ACTIVE=oauth`; add JWKS env config     |
+| RBAC                     | No Role/RoleBinding declared                                                                                       | Run under a dedicated ServiceAccount with `automountServiceAccountToken: false`                         |
+
+## Cross-references
+
+- [Dockerfile & Jib](/build/dockerfile-and-jib) — the image referenced as `apache/fineract:latest`
+- [Compose Profiles](/build/docker-compose-profiles) — the docker-compose equivalents of these manifests
+- [Tenancy](/tenancy/multi-tenancy) — what `fineract_tenants` vs `fineract_default` mean
+- [Database changelog](/database/liquibase-overview) — what Liquibase does on the cold start the readinessProbe is waiting for

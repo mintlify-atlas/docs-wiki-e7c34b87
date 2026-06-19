@@ -1,0 +1,299 @@
+---
+title: "Swagger Core & OpenAPI Spec Generation in fineract-provider"
+sidebarTitle: "Swagger & OpenAPI"
+description: "How fineract-provider's resolve task generates fineract.json/yaml from Swagger-core annotations, the input.yaml.template seed, and the downstream consumers fineract-client and fineract-client-feign."
+---
+
+Apache Fineract publishes its REST API as an OpenAPI 3 specification (`fineract.json` / `fineract.yaml`) that is generated at build time from the Swagger-core annotations (`@Operation`, `@ApiResponse`, `@Schema`, `@Parameter`) sprinkled across the JAX-RS resources in `fineract-provider`. Generation is done by the `io.swagger.core.v3.swagger-gradle-plugin`'s `resolve` task. The output drives three downstream artifacts: the in-image static OpenAPI endpoint (`/fineract-provider/swagger-ui/`), the `fineract-client` Retrofit SDK, and the `fineract-client-feign` Feign SDK. This page documents the entire generation pipeline.
+
+## Plugins applied
+
+In `fineract-provider/build.gradle`:
+
+```groovy
+apply plugin: 'io.swagger.core.v3.swagger-gradle-plugin'   // line 26
+apply plugin: 'com.docktape.swagger-brake'                 // line 30 — see /build/swagger-brake
+```
+
+The Swagger plugin contributes two tasks: `resolve` (scans the classpath, generates the spec) and `installSwaggerUI` (not used in this build). The `swagger-brake` plugin is documented separately at [Swagger Brake](/build/swagger-brake).
+
+## The generation pipeline
+
+```mermaid
+flowchart LR
+    seed[config/swagger/<br/>fineract-input.yaml.template]
+    prep[Task: prepareInputYaml<br/>filter ${VERSION}]
+    inp[build/tmp/swagger/<br/>fineract-input.yaml]
+    rcp[runtime classpath:<br/>JAX-RS resources +<br/>Swagger annotations]
+    res[Task: resolve<br/>swagger-core scanner]
+    out_json[build/resources/main/static/<br/>fineract.json]
+    out_yaml[build/resources/main/static/<br/>fineract.yaml]
+    image[Jib image:<br/>/app/resources/static/<br/>fineract.{json,yaml}]
+    sdk[Tasks: buildJavaSdk<br/>buildTypescriptAngularSdk<br/>buildAsciidoc]
+    cli[fineract-client/<br/>fineract-client-feign<br/>generated sources]
+
+    seed --> prep --> inp --> res
+    rcp --> res
+    res --> out_json
+    res --> out_yaml
+    out_json --> image
+    out_json --> sdk --> cli
+```
+
+Two tasks do the work: `prepareInputYaml` and `resolve`.
+
+## Step 1 — `prepareInputYaml`
+
+The Swagger plugin needs a seed YAML file that supplies the top-level OpenAPI `info`, `servers`, `tags`, `security`, and `externalDocs` blocks — content that can't be expressed as an annotation on a method. The template lives at `fineract-provider/config/swagger/fineract-input.yaml.template`, and the version string is filtered in by Ant's `ReplaceTokens`:
+
+```groovy
+import org.apache.tools.ant.filters.ReplaceTokens
+
+tasks.register('prepareInputYaml') {
+    outputs.file("${buildDir}/tmp/swagger/fineract-input.yaml")
+
+    doLast {
+        copy {
+            from file("${projectDir}/config/swagger/fineract-input.yaml.template")
+            into file("${buildDir}/tmp/swagger")
+            rename { String filename -> return 'fineract-input.yaml' }
+            filter(ReplaceTokens, tokens: [VERSION: "${project.version}".toString()])
+        }
+    }
+}
+```
+
+| Field                          | Source                                            |
+|--------------------------------|---------------------------------------------------|
+| `outputs.file(...)`             | Declared so Gradle treats the task as up-to-date when the filtered YAML already exists. |
+| `from <template>`               | The committed template; replace `@VERSION@` tokens. |
+| `into build/tmp/swagger`        | Intermediate directory (not packaged).            |
+| `rename { 'fineract-input.yaml' }` | The plugin requires the file to be called exactly this; the template name keeps the `.template` suffix in git so it isn't accidentally treated as a spec. |
+| `filter(ReplaceTokens, …)`      | Substitutes `@VERSION@` with the Gradle project version (e.g. `1.13.0-SNAPSHOT`).        |
+
+Run the task in isolation:
+
+```bash
+./gradlew :fineract-provider:prepareInputYaml
+cat fineract-provider/build/tmp/swagger/fineract-input.yaml | head -20
+```
+
+## Step 2 — `resolve`
+
+```groovy
+resolve {
+    logging.captureStandardOutput LogLevel.INFO
+    outputFileName = 'fineract'
+    outputFormat = 'JSONANDYAML'
+    prettyPrint = false
+    classpath = sourceSets.main.runtimeClasspath
+    buildClasspath = classpath
+    outputDir = file("${buildDir}/resources/main/static")
+    openApiFile = file("${buildDir}/tmp/swagger/fineract-input.yaml")
+    sortOutput = true
+    dependsOn(prepareInputYaml)
+}
+```
+
+Field-by-field:
+
+| Field                | Value                                                 | Effect                                                                                                                        |
+|----------------------|-------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `outputFileName`     | `fineract`                                            | Base name; combined with `outputFormat` produces `fineract.json` and `fineract.yaml`.                                          |
+| `outputFormat`       | `JSONANDYAML`                                         | Emits both. JSON is consumed by code generators (faster to parse); YAML is the human-readable artifact.                       |
+| `prettyPrint`        | `false`                                               | Single-line JSON. Saves ~3× the bytes in the image. The YAML output is always pretty.                                          |
+| `classpath`          | `sourceSets.main.runtimeClasspath`                    | The scanner needs to load the JAX-RS resources and every annotation transitively referenced from `@Schema(implementation = …)`. |
+| `buildClasspath`     | `classpath` (same)                                    | Plugin requirement; tells Jib's reflection scanner where to look.                                                              |
+| `outputDir`          | `build/resources/main/static`                          | Directly into the Spring Boot static resources directory so the spec ships **inside the JAR / image** under `/static/`.        |
+| `openApiFile`        | `build/tmp/swagger/fineract-input.yaml`               | The filtered template from `prepareInputYaml`.                                                                                 |
+| `sortOutput`         | `true`                                                | Deterministic ordering of paths and schemas — critical for `swagger-brake` diffs to be meaningful and for Gradle build cache hits. |
+| `dependsOn`          | `prepareInputYaml`                                    | Wired so `./gradlew :fineract-provider:resolve` does both steps in one go.                                                     |
+
+The scan walks the runtime classpath, collects every class with `@Path` or any Swagger annotation, builds an in-memory OpenAPI tree, merges it on top of the seed YAML, and writes the two files. Typical run time on a warm cache: 5–10 seconds.
+
+## What ends up where
+
+After `./gradlew :fineract-provider:resolve` finishes:
+
+```
+fineract-provider/build/resources/main/static/
+├── fineract.json     (~6–9 MB depending on version)
+└── fineract.yaml     (~3–5 MB)
+```
+
+When the Spring Boot jar (or the Jib image) is assembled, these files are copied to `/static/fineract.json` and `/static/fineract.yaml` inside the artifact. At runtime they are served by Spring MVC's `ResourceHttpRequestHandler` at:
+
+| URL                                                       | Content              |
+|-----------------------------------------------------------|----------------------|
+| `https://<host>:8443/fineract-provider/swagger-ui/`        | Swagger UI HTML page |
+| `https://<host>:8443/fineract-provider/fineract.json`      | The OpenAPI 3 JSON   |
+| `https://<host>:8443/fineract-provider/fineract.yaml`      | The OpenAPI 3 YAML   |
+
+The Swagger UI configuration points at `fineract.json` for its spec URL — there is no `springdoc` or runtime regeneration; the spec is **static** content baked into the image.
+
+## What the scanner picks up
+
+Inside `fineract-provider/src/main/java/.../api/*ApiResource.java` and the equivalent files in the other Fineract modules, you'll find annotations like:
+
+```java
+@Path("/v1/datatables")
+@Component
+@Tag(name = "Data Tables", description = "...")
+public class DatatablesApiResource {
+
+    @POST
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    @Operation(summary = "Create Data Table",
+               description = "Create a new data table and registers it with the Apache Fineract Core application table…")
+    @RequestBody(required = true,
+                 content = @Content(schema = @Schema(
+                     implementation = DatatablesApiResourceSwagger.PostDataTablesRequest.class)))
+    @ApiResponse(responseCode = "200", description = "OK",
+                 content = @Content(schema = @Schema(
+                     implementation = DatatablesApiResourceSwagger.PostDataTablesResponse.class)))
+    public String createDatatable(@Parameter(hidden = true) final String apiRequestBodyAsJson) { … }
+}
+```
+
+The scanner uses:
+
+- **`@Path`** — pulled from JAX-RS.
+- **`@Tag` on the class** — populates the OpenAPI `tags[]` array.
+- **`@Operation` / `@ApiResponse`** — operation metadata.
+- **`@RequestBody` + `@Schema(implementation = X.class)`** — references a *Swagger schema class* (e.g. `DatatablesApiResourceSwagger.PostDataTablesRequest`). These swagger-only POJOs live in `…/api/*ApiResourceSwagger.java` and **mirror the actual command JSON** that the resource consumes. They are not used at runtime — they exist purely so the spec carries an explicit, versionable shape. The actual request body is deserialized with Gson by `JsonCommand`.
+- **`@Parameter(hidden = true)`** — excludes the raw `apiRequestBodyAsJson` `String` argument from the spec because it's a transport detail.
+
+## Downstream consumers
+
+### `fineract-client` (Retrofit2 SDK)
+
+In `fineract-client/build.gradle`:
+
+```groovy
+task buildJavaSdk(type: org.openapitools.generator.gradle.plugin.tasks.GenerateTask) {
+    generatorName = 'java'
+    inputSpec = "file:///$swaggerFile"
+    outputDir = "$buildDir/generated/temp-java".toString()
+    templateDir = "$projectDir/src/main/resources/templates/java"
+    groupId = 'org.apache.fineract'
+    apiPackage = 'org.apache.fineract.client.services'
+    invokerPackage = 'org.apache.fineract.client'
+    modelPackage = 'org.apache.fineract.client.models'
+    configOptions = [
+        dateLibrary: 'java8',
+        useRxJava2: 'false',
+        library: 'retrofit2',
+        hideGenerationTimestamp: 'true',
+        containerDefaultToNull: 'true',
+        oauth2Implementation: 'none'
+    ]
+    dependsOn(':fineract-provider:resolve')
+}
+```
+
+The `$swaggerFile` Gradle property points at `fineract-provider/build/resources/main/static/fineract.json` — that file **must** exist before the OpenAPI Generator can run, which is why `dependsOn(':fineract-provider:resolve')` is wired. The `library: 'retrofit2'` option chooses the Retrofit code generator; see [fineract-client](/clients/fineract-client) for what the generated code looks like.
+
+The same task also runs the TypeScript-Angular generator (`buildTypescriptAngularSdk`) and the AsciiDoc reference generator (`buildAsciidoc`), all from the same `fineract.json`.
+
+### `fineract-client-feign` (Feign SDK)
+
+In `fineract-client-feign/build.gradle`:
+
+```groovy
+tasks.register('buildJavaSdk', org.openapitools.generator.gradle.plugin.tasks.GenerateTask) {
+    generatorName = 'java'
+    library = 'feign'
+    inputSpec = "file:///$swaggerFile"
+    outputDir = "$buildDir/generated/temp-java".toString()
+    templateDir = "$projectDir/src/main/resources/templates/java"
+    apiPackage = 'org.apache.fineract.client.feign.services'
+    invokerPackage = 'org.apache.fineract.client.feign'
+    modelPackage = 'org.apache.fineract.client.models'
+    configOptions = [
+        dateLibrary             : 'java8',
+        library                 : 'feign',
+        feignVersion            : '13.6',
+        feignApacheHttpClient   : 'true',
+        useFeign13              : 'true',
+        useFeignApacheHttpClient: 'true',
+        hideGenerationTimestamp : 'true',
+        containerDefaultToNull  : 'true',
+        oauth2Implementation    : 'none',
+        useJakartaEe            : 'true'
+    ]
+    dependsOn(':fineract-provider:resolve')
+}
+```
+
+Same input spec, different runtime stack. See [fineract-client-feign](/clients/fineract-client-feign).
+
+### Custom Mustache templates
+
+Both client modules ship `src/main/resources/templates/java/` directories overriding OpenAPI Generator's defaults. The most important override is `api.mustache`, which:
+
+- Strips the `@Generated` Lombok-style timestamp.
+- Adds `Calls.ok(...)` static helpers (see `fineract-client/src/main/java/org/apache/fineract/client/util/Calls.java`) used to unwrap Retrofit `Response<T>` into a plain `T` or throw `CallFailedRuntimeException`.
+- For the Feign variant, wires the Apache HttpClient 5 transport instead of the JDK one.
+
+## Where the OpenAPI baseline lives
+
+The `swagger-brake` plugin compares the freshly generated spec against a baseline. The baseline path is:
+
+```groovy
+swaggerBrake {
+    newApi = "${project.buildDir}/resources/main/static/fineract.json"
+    oldApi = findProperty('apiBaseline') ?: "${projectDir}/config/swagger/fineract-baseline.json"
+    …
+}
+```
+
+So the canonical baseline lives in version control at `fineract-provider/config/swagger/fineract-baseline.json` and is rotated at every release branch cut. See [Swagger Brake](/build/swagger-brake) for the breaking-change detection rules.
+
+## Running the generation
+
+```bash
+# Generate fineract.json / fineract.yaml only
+./gradlew :fineract-provider:resolve
+
+# Trigger regeneration when an annotation changes
+rm -rf fineract-provider/build/resources/main/static/fineract.*
+./gradlew :fineract-provider:resolve --rerun-tasks
+
+# Regenerate the Java SDK from the freshly-built spec
+./gradlew :fineract-client:buildJavaSdk
+
+# Re-run the AsciiDoc reference
+./gradlew :fineract-client:buildAsciidoc
+```
+
+## Inspecting the generated spec
+
+The single-line JSON is awkward to read. Two useful one-liners:
+
+```bash
+# Pretty-print just the paths array for a quick endpoint list
+jq -r '.paths | keys[]' fineract-provider/build/resources/main/static/fineract.json | sort
+
+# Compare two builds
+diff <(jq -S . old.json) <(jq -S . new.json) | less
+```
+
+Or open Swagger UI at `https://localhost:8443/fineract-provider/swagger-ui/` after the server is running.
+
+## Common pitfalls
+
+| Symptom                                                                                                | Cause                                                                                                                                       | Fix                                                                                                                       |
+|--------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `resolve` fails with `ClassNotFoundException` for a JPA entity                                          | The `@Schema(implementation = …)` points at a class only available in another module not on the scanner's `classpath`                       | Move the swagger DTO class into `fineract-provider`'s swagger package, or add the missing module as `implementation` dep   |
+| Spec is missing an endpoint                                                                            | Resource class is not on the `runtimeClasspath` of `fineract-provider`                                                                       | Add the module as `implementation project(...)` in `fineract-provider/dependencies.gradle`                                |
+| New field is in the resource but not in the spec                                                       | The swagger mirror DTO (`*ApiResourceSwagger.java`) was not updated                                                                          | Add the field to the matching `Post…Request` / `Get…Response` class                                                       |
+| OpenAPI generator emits stale code after spec change                                                  | `buildJavaSdk` cache is honoring an older `inputSpec`                                                                                        | `./gradlew :fineract-client:buildJavaSdk --rerun-tasks`                                                                   |
+| `swagger-brake` flags a removal you intended to keep                                                  | Endpoint was renamed; baseline still has the old path                                                                                        | Rotate the baseline: `cp build/resources/main/static/fineract.json config/swagger/fineract-baseline.json`                  |
+
+## Cross-references
+
+- [Swagger Brake](/build/swagger-brake) — the breaking-change CI gate
+- [fineract-client](/clients/fineract-client) — Retrofit SDK generated from `fineract.json`
+- [fineract-client-feign](/clients/fineract-client-feign) — Feign SDK generated from `fineract.json`
+- [Clients Overview](/clients/overview) — comparison and selection guide

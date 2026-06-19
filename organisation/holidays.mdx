@@ -1,0 +1,378 @@
+---
+title: "Holidays — Per-Office Calendars and Repayment Rescheduling"
+sidebarTitle: "Holidays"
+description: "Fineract Holiday entity, HolidayStatusType lifecycle, RescheduleType options, HolidaysApiResource endpoints, activation flow and loan repayment shifting."
+---
+
+In Apache Fineract a **`Holiday`** is a named date range that applies to a set of offices and tells the loan-scheduling engine how to move a repayment instalment that would otherwise fall inside the range. Each holiday is created in a *pending* state, edited if needed, then **activated** — only active holidays influence schedules. The engine itself is driven by two interlocking concepts: the per-holiday `RescheduleType` (move to specific date / next repayment date) and the per-organisation `WorkingDays.repaymentReschedulingType` (see [working days](/organisation/working-days)).
+
+<Note>
+Holidays only fire when the global configuration toggle `reschedule-repayments-on-holidays` is enabled. A separate toggle `allow-transactions-on-holiday` controls whether repayment **postings** can land on a holiday at all. Both are flipped through [global configurations](/core/configuration-properties).
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `Holiday` | `fineract-core` |
+| Status enum | `HolidayStatusType` | `fineract-core` |
+| Reschedule enum | `RescheduleType` | `fineract-core` |
+| Helpers | `HolidayUtil`, `HolidayApiConstants` | `fineract-core` |
+| Repositories | `HolidayRepository`, `HolidayRepositoryWrapper` | `fineract-provider` |
+| Read service | `HolidayReadPlatformService` / `HolidayReadPlatformServiceImpl` | provider |
+| Write service | `HolidayWritePlatformService` / `…JpaRepositoryImpl` | provider |
+| Validator | `HolidayDataValidator` | provider |
+| Command handlers | `CreateHolidayCommandHandler`, `ActivateHolidayCommandHandler`, `UpdateHolidayCommandHandler`, `DeleteHolidayCommandHandler` | provider |
+| Enum DTO | `HolidayEnumerations` | provider |
+| JAX-RS | `HolidaysApiResource` (`/v1/holidays`) | provider |
+| Exceptions | `HolidayNotFoundException`, `HolidayDateException` | provider |
+
+## `Holiday` entity
+
+```java
+// fineract-core/.../holiday/domain/Holiday.java
+@Entity
+@Table(name = "m_holiday", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"name"}, name = "holiday_name")
+})
+@Getter @Setter @NoArgsConstructor
+@Accessors(chain = true)
+public class Holiday extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "name", unique = true, nullable = false, length = 100) private String name;
+    @Column(name = "from_date", nullable = false)                          private LocalDate fromDate;
+    @Column(name = "to_date",   nullable = false)                          private LocalDate toDate;
+    @Column(name = "repayments_rescheduled_to")                            private LocalDate repaymentsRescheduledTo;
+    @Column(name = "rescheduling_type", nullable = false)                  private int reschedulingType;
+    @Column(name = "status_enum",       nullable = false)                  private Integer status;
+    @Column(name = "processed",         nullable = false)                  private boolean processed;
+    @Column(name = "description", length = 100)                            private String description;
+
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(name = "m_holiday_office",
+        joinColumns        = @JoinColumn(name = "holiday_id"),
+        inverseJoinColumns = @JoinColumn(name = "office_id"))
+    private Set<Office> offices;
+}
+```
+
+### Column inventory
+
+| Column | Field | Constraint | Meaning |
+| --- | --- | --- | --- |
+| `name` | `name` | unique, `NOT NULL`, 100 chars | Display name |
+| `from_date` | `fromDate` | `NOT NULL` | Inclusive start of the holiday range |
+| `to_date` | `toDate` | `NOT NULL` | Inclusive end |
+| `repayments_rescheduled_to` | `repaymentsRescheduledTo` | nullable | Required only when `reschedulingType = 2` (specific date) |
+| `rescheduling_type` | `reschedulingType` | `int` | `1`: next repayment date, `2`: specific date |
+| `status_enum` | `status` | int | `100` pending, `300` active, `600` deleted |
+| `processed` | `processed` | `NOT NULL` | Flipped to `true` by the COB job after applying the holiday to loan schedules |
+| `description` | `description` | 100 chars | Free text |
+| `m_holiday_office` join table | `offices` | M:M to `Office` | Which branches observe this holiday |
+
+### `HolidayStatusType` lifecycle
+
+```java
+public enum HolidayStatusType {
+    INVALID(0,                   "holidayStatusType.invalid"),
+    PENDING_FOR_ACTIVATION(100,  "holidayStatusType.pending.for.activation"),
+    ACTIVE(300,                  "holidayStatusType.active"),
+    DELETED(600,                 "savingsAccountStatusType.transfer.in.progress");
+}
+```
+
+State machine:
+
+```
+                +----------+
+   create  -->  | PENDING  | --activate--> +--------+
+                | (100)    |               | ACTIVE |
+                +----------+               | (300)  |
+                     |                     +--------+
+                     | delete                 |
+                     v                        | delete
+                +----------+ <-----------------+
+                | DELETED  |
+                | (600)    |
+                +----------+
+```
+
+The transitions are enforced by `Holiday.activate()` and `Holiday.delete()`:
+
+```java
+public void activate() {
+    final HolidayStatusType currentStatus = HolidayStatusType.fromInt(this.status);
+    if (!currentStatus.isPendingActivation()) {
+        baseDataValidator.reset().failWithCodeNoParameterAddedToErrorCode("not.in.pending.for.activation.state");
+        if (!dataValidationErrors.isEmpty()) {
+            throw new PlatformApiDataValidationException(dataValidationErrors);
+        }
+    }
+    this.status = HolidayStatusType.ACTIVE.getValue();
+}
+
+public void delete() {
+    final HolidayStatusType currentStatus = HolidayStatusType.fromInt(this.status);
+    if (currentStatus.isDeleted()) {
+        baseDataValidator.reset().failWithCodeNoParameterAddedToErrorCode("already.in.deleted.state");
+        if (!dataValidationErrors.isEmpty()) {
+            throw new PlatformApiDataValidationException(dataValidationErrors);
+        }
+    }
+    this.status = HolidayStatusType.DELETED.getValue();
+}
+```
+
+<Tip>
+The `DELETED.code` reuses `savingsAccountStatusType.transfer.in.progress` — this is a copy-paste bug in the source; it is harmless because the code string is only used by message localisation, but be aware if you grep for it.
+</Tip>
+
+### Update rules (`Holiday.update(JsonCommand)`)
+
+The update method has two branches based on current status:
+
+- **Pending**: name, description, `reschedulingType`, `fromDate`, `toDate`, `repaymentsRescheduledTo`, and the office set are all editable.
+- **Active**: only `name`, `description` and `reschedulingType` (with the `repaymentsRescheduledTo` reset when switching to "next repayment date" mode) may change. Any attempt to change dates, `repaymentsRescheduledTo` or `offices` raises `cannot.edit.holiday.in.active.state`.
+
+```java
+if (currentStatus.isPendingActivation()) {
+    // dates, repaymentsRescheduledTo, offices editable
+} else {
+    if (command.isChangeInLocalDateParameterNamed(fromDateParamName, getFromDate())) {
+        baseDataValidator.reset().parameter(fromDateParamName)
+                .failWithCode("cannot.edit.holiday.in.active.state");
+    }
+    // … same for toDate, repaymentsRescheduledTo, offices …
+}
+```
+
+### `RescheduleType`
+
+```java
+public enum RescheduleType {
+    INVALID(0,                        "rescheduletype.invalid"),
+    RESCHEDULETOSPECIFICDATE(2,       "rescheduletype.rescheduletospecificdate"),
+    RESCHEDULETONEXTREPAYMENTDATE(1,  "rescheduletype.rescheduletonextrepaymentdate");
+}
+```
+
+| Value | Enum | What it does |
+| --- | --- | --- |
+| 1 | `RESCHEDULETONEXTREPAYMENTDATE` | Push the affected instalment to the **next scheduled** repayment date (after applying working-day rules). `repaymentsRescheduledTo` must be null. |
+| 2 | `RESCHEDULETOSPECIFICDATE` | Move the instalment to the explicit `repaymentsRescheduledTo` date. That date must itself be a working day in the [working days](/organisation/working-days) calendar. |
+
+`Holiday.createNew(...)` enforces the pairing:
+
+```java
+LocalDate repaymentsRescheduledTo = null;
+if (reschedulingType == null
+    || reschedulingType.equals(RescheduleType.RESCHEDULETOSPECIFICDATE.getValue())) {
+    repaymentsRescheduledTo = command.localDateValueOfParameterNamed(repaymentsRescheduledToParamName);
+}
+```
+
+If `reschedulingType` is omitted in the body, the *specific date* branch is taken (legacy default), so a `repaymentsRescheduledTo` is read.
+
+## How loan repayments respect holidays
+
+The runtime hook is in `loan` scheduling. The relevant code path (`LoanScheduleAssembler` / `LoanScheduleGeneratorFactory`) consults `HolidayRepositoryWrapper.findByOfficeAndGreaterThanDate(officeId, asOfDate)` to load any *active* holidays for the loan's office and then calls into `HolidayUtil.getRepaymentRescheduleDateToIfHoliday(...)`:
+
+```java
+// fineract-core/.../holiday/service/HolidayUtil.java
+public static LocalDate getRepaymentRescheduleDateToIfHoliday(final LocalDate date,
+        final List<Holiday> holidays) {
+    LocalDate newRepaymentDate = date;
+    for (Holiday holiday : holidays) {
+        if (HolidayUtil.isHoliday(date, holiday)) {
+            newRepaymentDate = HolidayUtil.getRepaymentRescheduleDate(holiday, date);
+            break;
+        }
+    }
+    return newRepaymentDate;
+}
+```
+
+After that the result is passed through `WorkingDaysUtil.getOffSetDateIfNonWorkingDay(...)` so the rescheduled date itself is moved off any weekend. The exact sequence is:
+
+1. Generator emits the original instalment date.
+2. `HolidayUtil` checks if any active holiday covers it. If yes:
+   - For `RESCHEDULETOSPECIFICDATE`: instalment is set to `holiday.repaymentsRescheduledTo`.
+   - For `RESCHEDULETONEXTREPAYMENTDATE`: instalment is set to `holiday.toDate + 1 day` (then the working-day rule runs).
+3. `WorkingDaysUtil` re-applies the weekly working-day calendar to bump weekends.
+
+### COB processing flag
+
+After a daily COB run picks up an active holiday and rewrites schedules for all loans of the affected offices, the job sets `processed = true`. This is just a marker so the job can skip already-handled holidays on subsequent runs; it does not prevent further edits (which are still blocked by `update(...)` when status is `ACTIVE`).
+
+## `HolidaysApiResource` — `/v1/holidays`
+
+```java
+@Path("/v1/holidays")
+@Component
+@Tag(name = "Holidays",
+     description = "Some MFI's span large regions where different branch offices might observe different holidays …")
+public class HolidaysApiResource {
+    private final DefaultToApiJsonSerializer<HolidayData>        toApiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService     commandsSourceWritePlatformService;
+    private final PlatformSecurityContext                        context;
+    private final ApiRequestParameterHelper                      apiRequestParameterHelper;
+    private final HolidayReadPlatformService                     holidayReadPlatformService;
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Notes |
+| --- | --- | --- | --- | --- |
+| POST | `/v1/holidays` | `createNewHoliday` | `CREATE_HOLIDAY` | Always creates in `PENDING_FOR_ACTIVATION` |
+| POST | `/v1/holidays/{holidayId}?command=activate` | `handleCommands` | `ACTIVATE_HOLIDAY` | Only valid transition; other commands → `UnrecognizedQueryParamException` |
+| GET | `/v1/holidays/{holidayId}` | `retrieveOne` | — | One holiday by id |
+| PUT | `/v1/holidays/{holidayId}` | `update` | `UPDATE_HOLIDAY` | Field rules depend on status |
+| DELETE | `/v1/holidays/{holidayId}` | `delete` | `DELETE_HOLIDAY` | Soft delete |
+| GET | `/v1/holidays` | `retrieveAllHolidays` | — | `?officeId=`, `?fromDate=`, `?toDate=`, `?locale=`, `?dateFormat=` |
+| GET | `/v1/holidays/template` | `retrieveRepaymentScheduleUpdationTyeOptions` | — | Returns the `RescheduleType` enum options |
+
+### `POST /v1/holidays` — create
+
+```java
+@POST
+public String createNewHoliday(@Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .createHoliday().withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+The body shape, per `HolidayDataValidator`:
+
+```json
+{
+  "name":        "Christmas 2024",
+  "description": "Public holiday",
+  "fromDate":    "24 December 2024",
+  "toDate":      "26 December 2024",
+  "reschedulingType":        2,
+  "repaymentsRescheduledTo": "27 December 2024",
+  "offices": [ { "officeId": 1 }, { "officeId": 5 } ],
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Mandatory: `name`, `fromDate`, `toDate`, `offices`. `repaymentsRescheduledTo` is required only when `reschedulingType = 2` (specific date) or omitted. `description` is optional.
+
+### `POST /v1/holidays/{holidayId}?command=activate`
+
+```java
+public String handleCommands(@PathParam("holidayId") final Long holidayId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+
+    String jsonApiRequest = apiRequestBodyAsJson;
+    if (StringUtils.isBlank(jsonApiRequest)) {
+        jsonApiRequest = "{}";
+    }
+
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(jsonApiRequest);
+    CommandProcessingResult result = null;
+    if (is(commandParam, "activate")) {
+        final CommandWrapper commandRequest = builder.activateHoliday(holidayId).build();
+        result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    }
+    if (result == null) {
+        throw new UnrecognizedQueryParamException("command", commandParam, new Object[] { "activate" });
+    }
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Only `?command=activate` is accepted; anything else triggers `UnrecognizedQueryParamException` → HTTP 400.
+
+### `PUT /v1/holidays/{holidayId}`
+
+Body can carry any of the fields listed under the entity. Edits while `ACTIVE` are restricted to `name`, `description` and `reschedulingType` as described above. The validator (`HolidayDataValidator.validateForUpdate`) checks date ordering (`fromDate <= toDate`) and that, when switching to specific-date mode, `repaymentsRescheduledTo > toDate`.
+
+### `DELETE /v1/holidays/{holidayId}`
+
+```java
+@DELETE
+@Path("{holidayId}")
+public String delete(@PathParam("holidayId") final Long holidayId) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().deleteHoliday(holidayId).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Soft delete — flips `status_enum` to `600`. The row is preserved so historical loan schedules can still join `m_holiday` for explanation.
+
+### `GET /v1/holidays`
+
+```java
+public String retrieveAllHolidays(@Context final UriInfo uriInfo,
+        @QueryParam("officeId") final Long officeId,
+        @QueryParam("fromDate") final DateParam fromDateParam,
+        @QueryParam("toDate")   final DateParam toDateParam,
+        @QueryParam("locale")   final String locale,
+        @QueryParam("dateFormat") final String rawDateFormat) {
+
+    context.authenticatedUser().validateHasReadPermission(HOLIDAY_RESOURCE_NAME);
+    final DateFormat dateFormat = StringUtils.isBlank(rawDateFormat) ? null : new DateFormat(rawDateFormat);
+    LocalDate fromDate = fromDateParam != null ? fromDateParam.getDate("fromDate", dateFormat, locale) : null;
+    LocalDate toDate   = toDateParam   != null ? toDateParam  .getDate("toDate",   dateFormat, locale) : null;
+    final Collection<HolidayData> holidays = holidayReadPlatformService
+            .retrieveAllHolidaysBySearchParamerters(officeId, fromDate, toDate);
+    // …
+}
+```
+
+`officeId` resolves to a JOIN on `m_holiday_office`; date filters select holidays whose interval overlaps `[fromDate, toDate]`.
+
+### `GET /v1/holidays/template`
+
+Returns the enum options used to populate the `reschedulingType` dropdown (typed as `EnumOptionData[]` via `HolidayEnumerations.rescheduleType(...)`).
+
+## Repository wrappers
+
+`HolidayRepositoryWrapper` exposes the two finders the runtime uses:
+
+- `findOneWithNotFoundDetection(Long id)` — throws `HolidayNotFoundException`.
+- `findByOfficeAndGreaterThanDate(Long officeId, LocalDate date)` — loads all **active** holidays for an office whose `toDate >= date`. Used by `LoanScheduleAssembler`.
+
+## Exceptions
+
+| Exception | HTTP | Message key | Raised when |
+| --- | --- | --- | --- |
+| `HolidayNotFoundException` | 404 | `error.msg.holiday.id.invalid` | Lookup miss |
+| `HolidayDateException` | 400 | `error.msg.holiday.dates.invalid` | `toDate < fromDate`, or `repaymentsRescheduledTo` falls within the holiday range itself |
+| `PlatformApiDataValidationException` | 400 | `validation.msg.holiday.<field>.<rule>` | All other validation failures via `DataValidatorBuilder` |
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_HOLIDAY` | List/retrieve |
+| `CREATE_HOLIDAY`, `CREATE_HOLIDAY_CHECKER` | Create + maker–checker |
+| `ACTIVATE_HOLIDAY`, `ACTIVATE_HOLIDAY_CHECKER` | Activate |
+| `UPDATE_HOLIDAY`, `UPDATE_HOLIDAY_CHECKER` | Update |
+| `DELETE_HOLIDAY`, `DELETE_HOLIDAY_CHECKER` | Soft delete |
+
+## Cross-references with `WorkingDays`
+
+The two systems compose, not replace. A repayment date that lands on **both** a holiday and a non-working day is processed as follows:
+
+1. Holiday rule runs first → the date is moved to either the specific date or "next repayment date".
+2. The result is then passed through `WorkingDaysUtil.getOffSetDateIfNonWorkingDay(...)` to bump it off any weekend per the organisation-wide `WorkingDays.repaymentReschedulingType`.
+
+For full coverage of step 2 and the `RepaymentRescheduleType` enum, see [working days](/organisation/working-days).
+
+## See also
+
+- [Working days](/organisation/working-days) — the weekly working-day pattern that runs after holiday adjustment.
+- [Offices](/organisation/offices) — the `Holiday.offices` set is many-to-many to `m_office`.
+- [Organisation shared domain](/core/organisation-shared-domain) — package map.
+- [Commands framework](/core/commands-framework) — `CommandWrapperBuilder.createHoliday()/activateHoliday()` etc.
+- [Configuration properties](/core/configuration-properties) — `reschedule-repayments-on-holidays`, `allow-transactions-on-holiday`.
+- [Organisation APIs](/api/organisation-apis) — Swagger payloads for `/v1/holidays`.
+- [Security overview](/security/overview) — `HOLIDAY` permission resource.

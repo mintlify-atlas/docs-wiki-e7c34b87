@@ -1,0 +1,317 @@
+---
+title: "buildSrc Convention Plugins and Shared Quality Gates"
+sidebarTitle: "buildSrc"
+description: "Inside Fineract's buildSrc/: the FineractPlugin extension, dependency-management script, release automation services, and the conventions injected into every Java subproject."
+---
+
+Apache Fineract uses Gradle's `buildSrc/` mechanism to host shared logic that is consumed by every subproject. Rather than scatter dependency versions, Spring BOM imports, or release-automation glue across each module, the project collapses them into one Gradle plugin (`org.apache.fineract.gradle`) and two convention scripts that the root `build.gradle` applies to every Java project. This page indexes everything inside `buildSrc/` and explains how the conventions reach a leaf module.
+
+## Why buildSrc?
+
+`buildSrc/` is compiled and put on the classpath of the main build automatically. Any class, plugin, or script file declared there is available to `build.gradle` without publishing or version bumping. Fineract uses this to:
+
+1. Centralise the **Spring Boot BOM** and a hand-curated dependency catalogue (`org.apache.fineract.dependencies.gradle`).
+2. Implement the **release orchestration plugin** (`FineractPlugin`) used by the Apache Software Foundation release process.
+3. Apply the same `io.spring.dependency-management` BOM to every Java subproject so all modules see the same Logback, Mockito, Cucumber, AWS SDK, etc. versions.
+
+## Directory layout
+
+```
+buildSrc/
+├── build.gradle
+└── src/main/
+    ├── groovy/
+    │   ├── org.apache.fineract.dependencies.gradle      # version catalogue (BOMs + pins)
+    │   ├── org.apache.fineract.release.gradle           # release config DSL for FineractPlugin
+    │   └── org/apache/fineract/gradle/
+    │       ├── FineractPlugin.groovy                    # Gradle plugin entry point
+    │       ├── FineractPluginExtension.groovy           # `fineract { … }` DSL container
+    │       └── service/
+    │           ├── ConfluenceService.groovy             # post release announcements
+    │           ├── EmailService.groovy                  # send VOTE / RESULT mails
+    │           ├── GitService.groovy                    # branch / tag / commit helpers
+    │           ├── GpgService.groovy                    # sign artifacts and tags
+    │           ├── JiraService.groovy                   # fetch fixVersion changelog
+    │           ├── SubversionService.groovy             # upload to dist.apache.org
+    │           └── TemplateService.groovy               # Freemarker template renderer
+    └── resources/
+        ├── META-INF/gradle-plugins/org.apache.fineract.gradle.properties
+        ├── confluence/release.html.ftl
+        ├── email/release.step01.headsup.*.ftl
+        ├── email/release.step03.branch.*.ftl
+        ├── git/release.step05.tag.message.ftl
+        ├── instructions/step{2,4,9,10..15}.txt.ftl
+        ├── jira/changelog.{adoc,txt}.ftl
+        └── vote/result.{1.8.0,1.12.1,1.13.0,template}.json
+```
+
+The `META-INF/gradle-plugins/org.apache.fineract.gradle.properties` file registers `FineractPlugin` as a Gradle plugin so `apply plugin: 'org.apache.fineract.gradle'` works (used by `org.apache.fineract.release.gradle`).
+
+## buildSrc/build.gradle
+
+`buildSrc` itself is a Gradle project:
+
+```groovy
+plugins {
+    id 'io.spring.dependency-management' version '1.1.7'
+    id 'groovy'
+    id 'java-gradle-plugin'
+    id 'groovy-gradle-plugin'
+}
+
+apply from: "${projectDir}/src/main/groovy/org.apache.fineract.dependencies.gradle"
+
+repositories {
+    gradlePluginPortal()
+    mavenCentral()
+}
+
+configurations.all {
+    resolutionStrategy {
+        dependencySubstitution {
+            // Substitution is to resolve CVE-2025-12183
+            substitute module('org.lz4:lz4-java') using module('at.yawk.lz4:lz4-java:1.10.1')
+        }
+    }
+}
+
+dependencies {
+    implementation 'com.sun.activation:jakarta.activation'
+    implementation 'com.sun.mail:jakarta.mail'
+    implementation 'org.freemarker:freemarker'
+    implementation ('com.tmatesoft.svnkit:svnkit') {
+        exclude group: 'net.i2p.crypto', module: 'eddsa'
+    }
+    implementation 'org.bouncycastle:bcprov-jdk18on'
+    implementation 'org.bouncycastle:bcutil-jdk18on'
+    implementation 'org.bouncycastle:bcpg-jdk18on'
+    implementation 'org.eclipse.jgit:org.eclipse.jgit'
+    implementation 'org.eclipse.jgit:org.eclipse.jgit.gpg.bc'
+    implementation 'org.eclipse.jgit:org.eclipse.jgit.ssh.apache'
+    implementation 'com.vdurmont:semver4j'
+    implementation 'org.beryx:text-io'
+    implementation 'commons-io:commons-io'
+    implementation 'com.squareup.okhttp3:okhttp'
+    implementation 'com.squareup.okhttp3:logging-interceptor'
+    implementation 'com.squareup.retrofit2:retrofit'
+    implementation 'com.squareup.retrofit2:converter-jackson'
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+}
+```
+
+The `apply from:` line is critical: `buildSrc` reuses the **same** dependency catalogue script as the main build, so JGit, Freemarker, SVNKit, BouncyCastle, etc. all get versions from the Spring/Jackson/Mockito BOMs and the explicit pin list. There is no version duplication.
+
+The `java-gradle-plugin` and `groovy-gradle-plugin` plugins are what let `org.apache.fineract.dependencies.gradle` and `org.apache.fineract.release.gradle` be applied via the `id 'org.apache.fineract.…'` form (Gradle script plugins are automatically published from `src/main/groovy/`).
+
+## Convention script: org.apache.fineract.dependencies.gradle
+
+This is the single source of truth for transitive versions across the whole repository. The root `build.gradle` applies it to every Java subproject inside `configure(project.fineractJavaProjects) { … }`:
+
+```groovy
+apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"
+```
+
+The script applies `io.spring.dependency-management` and then declares BOM imports and explicit dependency pins:
+
+```groovy
+dependencyManagement {
+    imports {
+        mavenBom 'com.squareup.okhttp3:okhttp-bom:4.12.0'
+        mavenBom 'org.slf4j:slf4j-bom:2.0.17'
+        mavenBom 'io.micrometer:micrometer-bom:1.13.6'
+        mavenBom 'org.springframework.boot:spring-boot-dependencies:3.5.6'
+        mavenBom 'io.awspring.cloud:spring-cloud-aws-dependencies:3.2.1'
+        mavenBom 'io.opentelemetry:opentelemetry-bom:1.44.1'
+        mavenBom 'org.jetbrains.kotlin:kotlin-bom:2.0.21'
+        mavenBom 'org.junit:junit-bom:5.11.3'
+        mavenBom 'com.fasterxml.jackson:jackson-bom:2.19.2'
+        mavenBom 'io.cucumber:cucumber-bom:7.20.1'
+        mavenBom 'org.mockito:mockito-bom:5.14.2'
+        mavenBom 'software.amazon.awssdk:bom:2.29.9'
+        mavenBom 'io.github.resilience4j:resilience4j-bom:2.2.0'
+        mavenBom 'org.testcontainers:testcontainers-bom:1.20.4'
+        mavenBom 'org.glassfish.jersey:jersey-bom:3.1.10'
+    }
+    dependencies {
+        // explicit pins for things not covered by a BOM …
+    }
+}
+```
+
+For the full catalogue of pinned versions (EclipseLink, Liquibase, Quartz, BouncyCastle, AWS MSK auth, Tika, MapStruct, etc.) see the dedicated [dependencies](/build/dependencies) page.
+
+### Why pins on top of BOMs?
+
+The script's own comment is the canonical explanation:
+
+> We use fixed versions, instead of inheriting them from the Spring BOM, to be able to be on more recent ones. We do not use `:+` to get the latest available version available on Maven Central, as that could suddenly break things. We use the Renovate Bot to automatically propose Pull Requests (PRs) when upgrades for all of these versions are available.
+
+Renovate is configured via `renovate.json` at the repo root. When a new patch ships, Renovate opens a PR editing this single file.
+
+## Convention script: org.apache.fineract.release.gradle
+
+Applied only by the **root** build (not subprojects). It enables `apply plugin: 'org.apache.fineract.gradle'` and configures the entire ASF release dance via the `fineract { … }` DSL:
+
+```groovy
+apply plugin: 'org.apache.fineract.gradle'
+apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"
+
+fineract {
+    config {
+        username = "${findProperty('fineract.config.username')}"
+        password = "${findProperty('fineract.config.password')}"
+
+        doc { url = 'git@github.com:apache/fineract-site.git'; … }
+        git { dir = "${projectDir.absolutePath}/.git"; sections = [ … ] }
+        template { templateDir = "${projectDir}/buildSrc/src/main/resources" }
+        gpg { keyName = …; publicKeyring = …; secretKeyring = …; password = … }
+        smtp { host = 'smtp.gmail.com'; tls = true; ssl = true; … }
+        subversion { username = …; password = …; revision = 'HEAD' }
+        jira { url = 'https://issues.apache.org/jira/rest/api/2/'; … }
+        confluence { url = 'https://cwiki.apache.org/confluence/rest/api/'; … }
+    }
+    steps = [ test: …, step1: …, step2: …, …, step15: … ]
+}
+```
+
+Each `stepN` defines a discrete action: send a heads-up email, cut a release branch, sign artifacts, upload to `dist.apache.org`, post an announcement to Confluence, etc. The plugin's services (`GitService`, `GpgService`, `JiraService`, `SubversionService`, `ConfluenceService`, `EmailService`, `TemplateService`) are wired together to make these reproducible from a CI runner with the right `~/.gradle/gradle.properties` secrets.
+
+Casual contributors do **not** need to interact with this — it is used by Release Managers.
+
+## FineractPlugin and FineractPluginExtension
+
+The plugin class is the boilerplate that registers the `fineract` extension and adds Gradle tasks for each release step:
+
+- `FineractPluginExtension` is the DSL container that holds `config` and `steps`.
+- `FineractPlugin` reads the extension at apply time and registers a `Task` for every entry in `steps` (`releaseStep1`, `releaseStep2`, …).
+
+The services are pure Groovy classes that wrap external APIs:
+
+| Service | Responsibility |
+| --- | --- |
+| `GitService` | Read/write Git config (user, email, signing key), create branches, create signed tags, push to ASF Gitbox. Backed by JGit. |
+| `GpgService` | Generate detached signatures and `.asc` files for staged artifacts using BouncyCastle. |
+| `JiraService` | Query Jira REST API for issues with `fixVersion = <version> and status in (CLOSED, RESOLVED)`, used to drive the changelog. |
+| `SubversionService` | Check out and commit to `https://dist.apache.org/repos/dist/dev/fineract` via SVNKit (the ASF distribution server is still Subversion-backed). |
+| `ConfluenceService` | Post HTML announcements to the ASF Confluence wiki. |
+| `EmailService` | Send `[VOTE]`, `[CANCEL]`, `[RESULT]` emails through SMTP using Jakarta Mail. |
+| `TemplateService` | Render Freemarker templates from `src/main/resources/{email,jira,instructions,confluence,git,vote}/*.ftl`. |
+
+Each release step in `org.apache.fineract.release.gradle` references templates and prior vote artifacts (`result.1.8.0.json`, `result.1.12.1.json`, `result.1.13.0.json`) so each new release reuses historical data.
+
+## What every Java subproject inherits
+
+Putting it all together, an Apache subproject (or any custom module) gets the following without writing it itself:
+
+1. **JDK 21 toolchain** with `withSourcesJar()` and `withJavadocJar()`.
+2. **Incremental, forked Java compilation** (`-Xlint:*`, `-parameters`, UTF-8, deprecation warnings on).
+3. **Spring Dependency Management** — the BOM stack listed above and every explicit pin.
+4. **Spotless** for `*.java` (Eclipse formatter `config/fineractdev-formatter.xml`, import order, modifier ordering, no unused imports, trailing-whitespace trim, UNIX line endings).
+5. **Checkstyle** (`com.puppycrawl.tools:checkstyle:11.0.0` + `sevntu-checks:1.44.1`) using `config/checkstyle/checkstyle.xml` with suppressions from `config/checkstyle/suppressions.xml`.
+6. **SpotBugs 6.0.26** using `config/spotbugs/exclude.xml`. ASM 9.5 is forced for JDK 21 support.
+7. **ErrorProne 2.35.1** with a curated list of disabled checks and a list of warnings promoted to errors (`DefaultCharset`, `RemoveUnusedImports`, `BigDecimalEquals`, `BoxedPrimitiveEquality`, etc.).
+8. **Modernizer** to flag pre-JDK API usage; `Optional.get()` is whitelisted.
+9. **JaCoCo 0.8.12** for coverage reports.
+10. **Apache RAT** with a large excludes list for third-party / generated content.
+11. **License plugin** (`com.github.hierynomus.license`) that injects `APACHE_LICENSETEXT.md` as the header (with carefully chosen excludes for generated client code and templates).
+12. **License Report** writing to `${projectDir}/licenses/`.
+13. **test-logger** with `logLevel 'quiet'`.
+14. **Lombok** as both `compileOnly` and `annotationProcessor`.
+15. **Logback** as the only runtime logging implementation; `commons-logging` and direct `slf4j-api` from `logback-classic` are excluded.
+16. **JUnit 5 / Mockito / Awaitility / BouncyCastle** as the standard test stack.
+17. **EclipseLink static weaving** if the module ships a `persistence.xml` — see [static weaving](/build/static-weaving).
+
+## Spotless rules (excerpt)
+
+The Java-specific Spotless block enforces ordering of modifiers (`public protected private abstract default static final transient volatile synchronized native strictfp`) using a regex transform, and sorts imports alphabetically:
+
+```groovy
+spotless {
+    java {
+        targetExclude '**/build/**', '**/bin/**', '**/out/**'
+        importOrder()
+        removeUnusedImports()
+        eclipse().configFile "$rootDir/config/fineractdev-formatter.xml"
+        endWithNewline()
+        trimTrailingWhitespace()
+        custom 'Modifier ordering', {
+            def modifierRanking = [
+                public:1, protected:2, private:3, abstract:4, default:5,
+                static:6, final:7, transient:8, volatile:9,
+                synchronized:10, native:11, strictfp:12]
+            // … regex that sorts multi-modifier declarations …
+        }
+    }
+    lineEndings 'UNIX'
+}
+```
+
+Run `./gradlew spotlessApply` to fix formatting locally; CI runs `spotlessCheck` and fails the build on diffs.
+
+## License headers
+
+Every source file must start with the Apache 2.0 header from `APACHE_LICENSETEXT.md`. The license plugin auto-injects this on `licenseFormat` and verifies on `licenseMain` / `licenseTest`. Excludes (declared in the root `build.gradle`):
+
+```groovy
+license {
+    header rootProject.file("$rootDir/APACHE_LICENSETEXT.md")
+    excludes([
+        "**/gradlew*",
+        "**/git.properties",
+        "**/*.html",
+        "**/templates/**",
+        "**/features/**",
+        "**/results/**",
+        "**/package-info.java",
+        "**/keystore.jks",
+        "**/legacy-docs/**",
+        "**/banner.txt",
+        "**/build.gradle.mustache",
+        "**/pom.mustache",
+        "**/avro/**/*.java",
+        "**/org/apache/fineract/client/**/*.java"
+    ])
+    strictCheck true
+}
+```
+
+The `org/apache/fineract/client/**/*.java` exclusion is what allows the **generated** OpenAPI client (in `fineract-client`) to ship without us reformatting it.
+
+## ErrorProne policy
+
+The root build configures ErrorProne in two passes — first at the `allprojects` level with a small disabled set, then in the `fineractJavaProjects` block with a much longer list. Highlights:
+
+- ErrorProne only runs on `build` and `check` (`enabled = project.gradle.startParameter.taskNames.contains('build') || project.gradle.startParameter.taskNames.contains('check')`).
+- Generated code in `fineract-client` and `fineract-client-feign` (`build/generated/java/src/main/java`) is excluded.
+- `JavaUtilDate` is disabled with a TODO (FINERACT-1298) — the codebase is still migrating to `java.time`.
+- Errors include `DefaultCharset`, `RemoveUnusedImports`, `BoxedPrimitiveEquality`, `BigDecimalEquals`, `StreamResourceLeak`, `StringSplitter`, `MutablePublicArray`, `EqualsGetClass`, `FutureReturnValueIgnored`, and dozens more.
+
+If you hit one of the disabled checks in a code review, propose a fix and move it from the `disable(...)` list to the `error(...)` list.
+
+## Modernizer policy
+
+```groovy
+modernizer {
+    includeTestClasses = true
+    failOnViolations = true
+    violationLogLevel = "error"
+    javaVersion = project.targetCompatibility
+    ignoreGeneratedClasses = true
+    exclusions = [
+        'java/util/Optional.get:()Ljava/lang/Object;'
+    ]
+}
+```
+
+It flags pre-modern APIs (e.g. `new Double(…)`, `Vector`, `Collections.sort(list, comparator)`) according to its bundled rules; we whitelist `Optional.get` because forcing `orElseThrow(Supplier)` everywhere would be churn.
+
+## How a custom module inherits all of this
+
+Because `settings.gradle` includes every `custom/<co>/<cat>/<mod>/` as a Gradle subproject and the root `build.gradle` adds them to `fineractCustomProjects` (and `fineractJavaProjects` via the dynamic loop), **a custom module gets the same checks, formatting, license header, Lombok, and dependency catalogue for free**. The custom-only block additionally adds MapStruct and `spring-boot-autoconfigure-processor` annotation processors so starter modules can declare `@AutoConfiguration` classes cleanly. See [custom modules](/build/custom-modules) and [custom overview](/custom/overview) for the authoring flow.
+
+## Related
+
+- [Multi-module build](/build/gradle-multi-module) — the higher-level structure that this convention layer plugs into.
+- [Dependencies catalogue](/build/dependencies) — the full pin list and BOM stack.
+- [Static weaving](/build/static-weaving) — the JPA bytecode enhancement applied by another root script.
+- [Testing overview](/testing/overview) — how the Cucumber, Rest-Assured, and JUnit Platform stacks integrate with these conventions.

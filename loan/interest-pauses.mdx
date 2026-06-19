@@ -1,0 +1,292 @@
+---
+title: "Loan Interest Pauses, REST Surface and Term Variations"
+sidebarTitle: "Interest Pauses"
+description: "InterestPauseWritePlatformService, LoanInterestPauseApiResource and the term-variation rows that pause interest accrual on active Fineract loans."
+---
+
+An **interest pause** in Apache Fineract is a `[startDate, endDate]` window during which a loan's interest stops accruing. Pauses are stored as `LoanTermVariations` rows with type `INTEREST_PAUSE` and are honoured by the schedule generator and by COB-time interest computation. This page covers the REST surface (`LoanInterestPauseApiResource`), the write/read platform services (`InterestPauseWritePlatformService`, `InterestPauseReadPlatformService`), the command handlers and how pauses interact with delinquency.
+
+<Note>
+Do not confuse **interest pause** (this page — stops interest accrual) with a **delinquency pause** (see [Delinquency](/loan/delinquency)), which only halts the classification job. Both are stored separately and can coexist on the same loan.
+</Note>
+
+Cross references: [Loan overview](/loan/overview), [Schedule API](/loan/loan-schedule-api), [Delinquency](/loan/delinquency), [Loan REST handlers](/loan/loan-rest-handlers), [Loan COB business steps](/cob/loan-cob-business-steps).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| REST resource | `portfolio/interestpauses/api/LoanInterestPauseApiResource.java` | `fineract-loan` |
+| Request DTO | `portfolio/interestpauses/data/InterestPauseRequestDto.java` | `fineract-loan` |
+| Response DTO | `portfolio/interestpauses/data/InterestPauseResponseDto.java` | `fineract-loan` |
+| Create handler | `portfolio/interestpauses/handler/CreateInterestPauseCommandHandler.java` | `fineract-loan` |
+| Update handler | `portfolio/interestpauses/handler/UpdateInterestPauseCommandHandler.java` | `fineract-loan` |
+| Delete handler | `portfolio/interestpauses/handler/DeleteInterestPauseCommandHandler.java` | `fineract-loan` |
+| Write service | `portfolio/interestpauses/service/InterestPauseWritePlatformService(Impl)` | `fineract-loan` |
+| Read service | `portfolio/interestpauses/service/InterestPauseReadPlatformService(Impl)` | `fineract-loan` |
+| Internal transfers helper | `portfolio/interestpauses/service/LoanAccountTransfersService.java` | `fineract-loan` |
+| Batch command strategies (Batch API) | `batch/command/internal/CreateLoanInterestPauseByLoanIdCommandStrategy.java` (+ variants) | `fineract-provider` |
+
+## REST surface — `LoanInterestPauseApiResource`
+
+```java
+@Path("/v1/loans")
+@Component
+public class LoanInterestPauseApiResource {
+
+    private final InterestPauseWritePlatformService writeService;
+    private final InterestPauseReadPlatformService readService;
+```
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `POST` | `/loans/{loanId}/interest-pauses` | Create pause by id |
+| `POST` | `/loans/external-id/{loanExternalId}/interest-pauses` | Create pause by external id |
+| `GET` | `/loans/{loanId}/interest-pauses` | List pauses |
+| `GET` | `/loans/external-id/{loanExternalId}/interest-pauses` | List pauses by external id |
+| `DELETE` | `/loans/{loanId}/interest-pauses/{variationId}` | Remove pause |
+| `DELETE` | `/loans/external-id/{loanExternalId}/interest-pauses/{variationId}` | Remove by external id |
+| `PUT` | `/loans/{loanId}/interest-pauses/{variationId}` | Update window |
+| `PUT` | `/loans/external-id/{loanExternalId}/interest-pauses/{variationId}` | Update by external id |
+
+### Create
+
+```java
+@POST
+@Path("/{loanId}/interest-pauses")
+public CommandProcessingResult createInterestPause(
+        @PathParam("loanId") final Long loanId,
+        @Parameter(description = "Request body") final InterestPauseRequestDto request) {
+    return writeService.createInterestPause(loanId, request.getStartDate(),
+            request.getEndDate(), request.getDateFormat(), request.getLocale());
+}
+```
+
+Request body:
+
+```json
+{
+  "startDate": "01 February 2024",
+  "endDate":   "29 February 2024",
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Response: `CommandProcessingResult` with `resourceId` = the new `LoanTermVariations.id`.
+
+### List
+
+```java
+@GET
+@Path("/{loanId}/interest-pauses")
+public List<InterestPauseResponseDto> retrieveInterestPauses(@PathParam("loanId") final Long loanId) {
+    return readService.retrieveInterestPauses(loanId);
+}
+```
+
+`InterestPauseResponseDto` carries `id`, `startDate`, `endDate`, `loanId`, `loanExternalId`.
+
+### Update
+
+```java
+@PUT
+@Path("/{loanId}/interest-pauses/{variationId}")
+public CommandProcessingResult updateInterestPause(...) {
+    return writeService.updateInterestPause(loanId, variationId,
+            request.getStartDate(), request.getEndDate(), request.getDateFormat(), request.getLocale());
+}
+```
+
+### Delete
+
+```java
+@DELETE
+@Path("/{loanId}/interest-pauses/{variationId}")
+public Response deleteInterestPause(@PathParam("loanId") final Long loanId,
+        @PathParam("variationId") final Long variationId) {
+    writeService.deleteInterestPause(loanId, variationId);
+    return Response.noContent().build();
+}
+```
+
+## Command handlers (Maker-Checker path)
+
+When the resource is invoked through the Maker-Checker pipeline (e.g. from Batch API or with `command` wrappers), it routes to these handlers:
+
+| Handler | Component name | Service method |
+| --- | --- | --- |
+| `CreateInterestPauseCommandHandler` | `createInterestPauseCommandHandler` | `InterestPauseWritePlatformService.createInterestPause(...)` |
+| `UpdateInterestPauseCommandHandler` | `updateInterestPauseCommandHandler` | `updateInterestPause(...)` |
+| `DeleteInterestPauseCommandHandler` | `deleteInterestPauseCommandHandler` | `deleteInterestPause(...)` |
+
+Create handler source:
+
+```java
+@Component("createInterestPauseCommandHandler")
+@RequiredArgsConstructor
+public class CreateInterestPauseCommandHandler implements NewCommandSourceHandler {
+    private final InterestPauseWritePlatformService interestPauseService;
+
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        final String startDate = command.stringValueOfParameterNamed("startDate");
+        final String endDate = command.stringValueOfParameterNamed("endDate");
+        final String dateFormat = command.stringValueOfParameterNamed("dateFormat");
+        final String locale = command.stringValueOfParameterNamed("locale");
+
+        if (command.getLoanId() != null) {
+            return interestPauseService.createInterestPause(
+                    command.getLoanId(), startDate, endDate, dateFormat, locale);
+        } else if (command.getLoanExternalId() != null) {
+            return interestPauseService.createInterestPause(
+                    command.getLoanExternalId(), startDate, endDate, dateFormat, locale);
+        } else {
+            throw new PlatformApiDataValidationException(
+                    "validation.msg.missing.loan.id.or.external.id",
+                    "Either loanId or loanExternalId must be provided.", "loanId");
+        }
+    }
+}
+```
+
+The handler does *not* declare `@CommandType` — the components are looked up by Spring bean name from `LoanInterestPauseApiResource` flows.
+
+## `InterestPauseWritePlatformService`
+
+```java
+public interface InterestPauseWritePlatformService {
+    CommandProcessingResult createInterestPause(Long loanId, String start, String end,
+            String dateFormat, String locale);
+    CommandProcessingResult createInterestPause(ExternalId loanExternalId, String start, String end,
+            String dateFormat, String locale);
+    CommandProcessingResult updateInterestPause(Long loanId, Long variationId, ...);
+    CommandProcessingResult updateInterestPause(ExternalId loanExternalId, Long variationId, ...);
+    void deleteInterestPause(Long loanId, Long variationId);
+    void deleteInterestPause(ExternalId loanExternalId, Long variationId);
+}
+```
+
+`InterestPauseWritePlatformServiceImpl` flow for create:
+
+1. Resolve `Loan` from id or external id.
+2. Parse `startDate`, `endDate` against `locale`/`dateFormat`.
+3. Validate:
+   - Loan status: `Active` (or active in arrears) — not closed, written off, charged off.
+   - `startDate <= endDate`.
+   - `startDate >= loan.getDisbursementDate()` and `<= loan.getMaturityDate()`.
+   - No overlap with existing `INTEREST_PAUSE` variations.
+4. Build a `LoanTermVariations` row:
+   ```java
+   LoanTermVariations variation = new LoanTermVariations(
+       LoanTermVariationType.INTEREST_PAUSE.getValue(),
+       startDate, /*decimalValue*/ null, endDate, /*isSpecificToInstallment*/ false,
+       loan, loan.getStatus().getValue());
+   ```
+5. Persist and re-project the schedule (interest for periods overlapping the pause is set to zero and the unpaid principal is amortised over the remaining periods or pushed to the final installment, depending on product settings).
+6. Fire a business event (`LoanInterestPauseCreatedBusinessEvent` if registered).
+7. Return `CommandProcessingResultBuilder.withLoanId(loan.getId()).withResourceIdAsString(variationId).build()`.
+
+Update behaves similarly but locates the existing variation by id, validates it is an `INTEREST_PAUSE`, and re-projects. Delete removes the row and reverts the schedule.
+
+## Schedule effect
+
+Term variations of type `INTEREST_PAUSE` are honoured by:
+
+- `LoanScheduleGenerator` implementations (declining-balance and progressive), which skip interest accrual for days inside the pause window.
+- The COB step `LOAN_INTEREST_RECALCULATION` (`LoanInterestRecalculationCOBBusinessStep`), which recomputes outstanding interest with pauses applied.
+
+Concretely, when generating an installment that spans a pause window `[ps, pe]`:
+
+```text
+interest_for_period = principal * rate * (period_days - overlap(period, [ps, pe])) / days_in_year
+```
+
+`LoanMapper.regenerateScheduleModel` ([Mappers & serialization](/loan/loan-mappers-and-serialization)) is the entry point used by the write services to re-build the model after a pause is added or removed.
+
+## Interaction with delinquency pauses
+
+Adding an interest pause does *not* automatically pause delinquency classification. If operators want both effects, they must:
+
+1. `POST /loans/{loanId}/interest-pauses` — stop interest accrual.
+2. `POST /loans/{loanId}/delinquency-actions {"action":"PAUSE", ...}` — stop bucket progression (see [Delinquency](/loan/delinquency)).
+
+The `DelinquencyEffectivePauseHelper` reads `LoanDelinquencyAction` rows (not term variations), so the two systems are independent.
+
+## Batch API integration
+
+Each REST operation has a Batch API strategy in `fineract-provider/batch/command/internal/`:
+
+| Strategy | Endpoint |
+| --- | --- |
+| `CreateLoanInterestPauseByLoanIdCommandStrategy` | `POST /loans/{loanId}/interest-pauses` |
+| `CreateLoanInterestPauseByExternalIdCommandStrategy` | `POST /loans/external-id/{loanExternalId}/interest-pauses` |
+| `GetLoanInterestPausesByLoanIdCommandStrategy` | `GET /loans/{loanId}/interest-pauses` |
+| `GetLoanInterestPausesByExternalIdCommandStrategy` | `GET /loans/external-id/{loanExternalId}/interest-pauses` |
+| `UpdateLoanInterestPauseByLoanIdCommandStrategy` | `PUT /loans/{loanId}/interest-pauses/{variationId}` |
+| `UpdateLoanInterestPauseByExternalIdCommandStrategy` | `PUT /loans/external-id/{loanExternalId}/interest-pauses/{variationId}` |
+
+These let a single `POST /v1/batches` request bundle a pause creation together with other loan operations.
+
+## Validation rules summary
+
+| Rule | Trigger |
+| --- | --- |
+| Missing `startDate`, `endDate`, `dateFormat`, `locale` | All operations |
+| `startDate > endDate` | Create / update |
+| Pause window outside `[disbursementDate, maturityDate]` | Create / update |
+| Overlap with another pause | Create / update |
+| Loan status not Active | Create |
+| Variation not of `INTEREST_PAUSE` type | Update / delete |
+| Variation belongs to a different loan | Update / delete |
+| Loan written-off / charged-off / closed | All mutating ops |
+
+Errors surface as `PlatformApiDataValidationException` with codes `validation.msg.loan.interestPause.*`.
+
+## REST examples
+
+### Create
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"startDate":"01 February 2024","endDate":"29 February 2024","dateFormat":"dd MMMM yyyy","locale":"en"}' \
+  http://host/fineract-provider/api/v1/loans/123/interest-pauses
+```
+
+### List
+
+```bash
+curl http://host/fineract-provider/api/v1/loans/123/interest-pauses
+```
+
+Sample response:
+
+```json
+[
+  { "id": 17, "startDate": "2024-02-01", "endDate": "2024-02-29",
+    "loanId": 123, "loanExternalId": null }
+]
+```
+
+### Update
+
+```bash
+curl -X PUT -H 'Content-Type: application/json' \
+  -d '{"startDate":"01 February 2024","endDate":"15 March 2024","dateFormat":"dd MMMM yyyy","locale":"en"}' \
+  http://host/fineract-provider/api/v1/loans/123/interest-pauses/17
+```
+
+### Delete
+
+```bash
+curl -X DELETE http://host/fineract-provider/api/v1/loans/123/interest-pauses/17
+```
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Schedule API](/loan/loan-schedule-api)
+- [Delinquency](/loan/delinquency)
+- [Loan COB business steps](/cob/loan-cob-business-steps)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

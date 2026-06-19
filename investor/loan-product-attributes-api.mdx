@@ -1,0 +1,319 @@
+---
+title: "External Asset Owner Loan Product Attributes API Reference"
+sidebarTitle: "Loan Product Attributes"
+description: "Configure which Apache Fineract loan products are eligible for external asset transfer and which settlement model — SETTLEMENT_MODEL capability flag."
+---
+
+The `ExternalAssetOwnerLoanProductAttributesApiResource` is the second JAX-RS resource shipped by `fineract-investor`. It governs **per–loan-product capability flags** for asset externalization. Today the only flag is `SETTLEMENT_MODEL`, which switches a product between the default sale/buyback flow and a two-hop *delayed settlement* flow that involves an intermediary owner. This page documents the resource, the persistence model, the validation and reflection trick the write service uses, and the runtime read paths that consume the flag.
+
+The resource lives at `fineract-investor/src/main/java/org/apache/fineract/investor/api/ExternalAssetOwnerLoanProductAttributesApiResource.java`. Like its sibling, it is conditional on `fineract.module.investor.enabled`:
+
+```java
+@Path("/v1/external-asset-owners/loan-product")
+@Component
+@Tag(name = "External Asset Owner Loan Product Attributes",
+     description = "External Asset Owner Loan Product Attributes")
+@RequiredArgsConstructor
+@Conditional(InvestorModuleIsEnabledCondition.class)
+public class ExternalAssetOwnerLoanProductAttributesApiResource {
+    private final PlatformUserRightsContext platformUserRightsContext;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final ExternalAssetOwnerLoanProductAttributesReadService
+        externalAssetOwnerLoanProductAttributesReadService;
+    // ...
+}
+```
+
+## Endpoint inventory
+
+| Method | Path | Body | Command / read | Returns |
+|---|---|---|---|---|
+| `POST` | `/v1/external-asset-owners/loan-product/{loanProductId}/attributes` | `PostExternalAssetOwnerLoanProductAttributeRequest` (`attributeKey`, `attributeValue`) | `CreateExternalAssetOwnerLoanProductAttributeHandler` → `…WriteService.createExternalAssetOwnerLoanProductAttribute(command)` | `CommandProcessingResult` (entity id = new attribute id) |
+| `GET` | `/v1/external-asset-owners/loan-product/{loanProductId}/attributes?attributeKey=...` | — | `…ReadService.retrieveAllLoanProductAttributesByLoanProductId(loanProductId, attributeKey)` | `Page<ExternalTransferLoanProductAttributesData>` |
+| `PUT` | `/v1/external-asset-owners/loan-product/{loanProductId}/attributes/{id}` | `PutExternalAssetOwnerLoanProductAttributeRequest` (`attributeKey`, `attributeValue`) | `UpdateExternalAssetOwnerLoanProductAttributeHandler` → `…WriteService.updateExternalAssetOwnerLoanProductAttribute(command, …)` | `CommandProcessingResult` |
+
+The `attributeKey` query parameter on GET is optional. If supplied the result is filtered server-side.
+
+### POST endpoint
+
+```java
+@POST
+@Path("/{loanProductId}/attributes")
+@Consumes(MediaType.APPLICATION_JSON)
+@Produces(MediaType.APPLICATION_JSON)
+public CommandProcessingResult postExternalAssetOwnerLoanProductAttribute(
+        @PathParam("loanProductId") final Long loanProductId,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    platformUserRightsContext.isAuthenticated();
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder()
+        .withJson(apiRequestBodyAsJson);
+    CommandWrapper request = builder
+        .createExternalAssetOwnerLoanProductAttribute(loanProductId).build();
+    return commandsSourceWritePlatformService.logCommandSource(request);
+}
+```
+
+The request body is two strings:
+
+```json
+{
+  "attributeKey":   "SETTLEMENT_MODEL",
+  "attributeValue": "DELAYED_SETTLEMENT"
+}
+```
+
+### GET endpoint
+
+```java
+@GET
+@Path("/{loanProductId}/attributes")
+@Operation(summary = "Retrieve All Loan Product Attributes",
+    description = "Retrieves all Loan Product Attributes with a given loanProductId",
+    parameters = {
+        @Parameter(name = "loanProductId", description = "loanProductId"),
+        @Parameter(name = "attributeKey", description = "attributeKey") })
+public Page<ExternalTransferLoanProductAttributesData> getExternalAssetOwnerLoanProductAttributes(
+        @Context final UriInfo uriInfo,
+        @PathParam("loanProductId") final Long loanProductId,
+        @QueryParam("attributeKey") final String attributeKey) {
+    platformUserRightsContext.isAuthenticated();
+    return externalAssetOwnerLoanProductAttributesReadService
+        .retrieveAllLoanProductAttributesByLoanProductId(loanProductId, attributeKey);
+}
+```
+
+`Page<ExternalTransferLoanProductAttributesData>` is the Fineract `org.apache.fineract.infrastructure.core.service.Page` type — `{ totalFilteredRecords, pageItems }`.
+
+### PUT endpoint
+
+```java
+@PUT
+@Path("/{loanProductId}/attributes/{id}")
+public CommandProcessingResult updateLoanProductAttribute(
+        @PathParam("loanProductId") final Long loanProductId,
+        @PathParam("id") final Long attributeId,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    platformUserRightsContext.isAuthenticated();
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder()
+        .withJson(apiRequestBodyAsJson);
+    CommandWrapper request = builder
+        .updateExternalAssetOwnerLoanProductAttribute(loanProductId, attributeId).build();
+    return commandsSourceWritePlatformService.logCommandSource(request);
+}
+```
+
+The body shape matches POST. The write-service implementation guards against changing the *key* of an existing attribute — only the value can move.
+
+## Persistence model
+
+```java
+// domain/ExternalAssetOwnerLoanProductAttributes.java
+@Getter @Setter @Entity @NoArgsConstructor
+@Table(name = "m_external_asset_owner_loan_product_configurable_attributes")
+public class ExternalAssetOwnerLoanProductAttributes
+        extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Column(name = "loan_product_id", nullable = false) private Long loanProductId;
+    @Column(name = "attribute_key", nullable = false)   private String attributeKey;
+    @Column(name = "attribute_value", nullable = false) private String attributeValue;
+}
+```
+
+Each row is a `(loan_product_id, attribute_key, attribute_value)` triple. A uniqueness constraint at the database level enforces "at most one row per (loan product, key)" — `validateLoanProductAttributeDoesNotExist(...)` performs the same check in Java up-front and throws `ExternalAssetOwnerLoanProductAttributeAlreadyExistsException` if a POST would collide. To change the value of an existing key, use PUT.
+
+The matching read-only projection on the same table (`ExternalAssetOwnerLoanProductAttribute` in the same package, interface-based) is what the read service returns.
+
+## The reflective `(key, value)` whitelist
+
+`ExternalAssetOwnerLoanProductAttributesWriteServiceImpl` does **not** hard-code the list of valid keys. Instead it discovers them with [Reflections](https://github.com/ronmamo/reflections) at startup:
+
+```java
+private static final String INVESTOR_PATH = "org.apache.fineract.investor";
+
+private final Set<Class<?>> implementingClasses = new Reflections(INVESTOR_PATH)
+    .get(SubTypes.of(ExternalAssetOwnerLoanProductAttribute.class).asClass());
+```
+
+For each `Class` that implements `ExternalAssetOwnerLoanProductAttribute` and is an enum, the service iterates the enum constants and accepts the `(key, value)` pair if any constant matches:
+
+```java
+private void validateExternalAssetOwnerLoanProductAttribute(String attributeKey, String attributeValue) {
+    for (Class<?> implementingClass : implementingClasses) {
+        if (implementingClass.isEnum()) {
+            for (Object obj : implementingClass.getEnumConstants()) {
+                ExternalAssetOwnerLoanProductAttribute objEnum =
+                    (ExternalAssetOwnerLoanProductAttribute) obj;
+                if (objEnum.getAttributeKey().equals(attributeKey)
+                        && objEnum.getAttributeValue().equals(attributeValue.toUpperCase())) {
+                    return;        // valid
+                }
+            }
+        }
+    }
+    throw new ExternalAssetOwnerLoanProductAttributeInvalidSettlementAttributeException(/* ... */);
+}
+```
+
+So adding a new capability flag is a matter of dropping a new enum (with `getAttributeKey()` and `getAttributeValue()`) into the `org.apache.fineract.investor` classpath — no changes to the resource or write service.
+
+## The interface contract
+
+```java
+// domain/AttributeKey.java
+public interface AttributeKey {
+    String getKey();
+    String getValue();
+    String getDescription();
+}
+
+// data/attribute/ExternalAssetOwnerLoanProductAttribute.java
+public interface ExternalAssetOwnerLoanProductAttribute {
+    String getAttributeKey();
+    String getAttributeValue();
+}
+```
+
+`AttributeKey` is the more documentation-oriented spec (includes a description). The actual write-service whitelist uses the simpler two-method `ExternalAssetOwnerLoanProductAttribute` interface.
+
+## The only enum in the tree today — `SETTLEMENT_MODEL`
+
+```java
+// data/attribute/SettlementModelExternalAssetOwnerLoanProductAttribute.java
+public enum SettlementModelExternalAssetOwnerLoanProductAttribute
+        implements ExternalAssetOwnerLoanProductAttribute {
+
+    DEFAULT_SETTLEMENT("DEFAULT_SETTLEMENT"),
+    DELAYED_SETTLEMENT("DELAYED_SETTLEMENT");
+
+    private final String attributeKey;
+    private final String attributeValue;
+
+    SettlementModelExternalAssetOwnerLoanProductAttribute(String attributeValue) {
+        this.attributeKey = "SETTLEMENT_MODEL";
+        this.attributeValue = attributeValue;
+    }
+
+    @Override public String getAttributeKey()   { return attributeKey; }
+    @Override public String getAttributeValue() { return attributeValue; }
+}
+```
+
+So the only valid `(key, value)` pairs in stock Apache Fineract today are:
+
+| `attributeKey` | `attributeValue` | Effect |
+|---|---|---|
+| `SETTLEMENT_MODEL` | `DEFAULT_SETTLEMENT` | No special behaviour — same as not having an attribute at all. The sale/buyback flow runs in its simple two-status form (`PENDING ↔ ACTIVE`). |
+| `SETTLEMENT_MODEL` | `DELAYED_SETTLEMENT` | Unlocks the `intermediarySale` command and the `PENDING_INTERMEDIATE`/`ACTIVE_INTERMEDIATE`/`BUYBACK_INTERMEDIATE` statuses. Changes the loan-status whitelist used at sale time. |
+
+The value strings are case-insensitive — the write service calls `.toUpperCase()` on the incoming `attributeValue` before comparison.
+
+## Effect at runtime — `DelayedSettlementAttributeService`
+
+The capability flag is consulted via a thin service:
+
+```java
+// service/DelayedSettlementAttributeServiceImpl.java
+@Service @RequiredArgsConstructor
+public class DelayedSettlementAttributeServiceImpl implements DelayedSettlementAttributeService {
+
+    private final ExternalAssetOwnerLoanProductAttributesReadService readService;
+
+    @Override
+    public boolean isEnabled(final Long loanProductId) {
+        Page<ExternalTransferLoanProductAttributesData> attrs = readService
+            .retrieveAllLoanProductAttributesByLoanProductId(loanProductId,
+                DELAYED_SETTLEMENT.getAttributeKey());      // "SETTLEMENT_MODEL"
+        String attributeValue = attrs.getPageItems().stream().findFirst()
+            .map(ExternalTransferLoanProductAttributesData::getAttributeValue).orElse(null);
+        return DELAYED_SETTLEMENT.getAttributeValue().equals(attributeValue);
+    }
+}
+```
+
+This single boolean drives every downstream branch:
+
+| Caller | What `isEnabled(loanProductId)` controls |
+|---|---|
+| `ExternalAssetOwnersWriteServiceImpl.saleLoanByLoanId` | Whether to use `validateEffectiveTransferForSale` (zero or one effective transfers, ACTIVE only) or `validateEffectiveTransferForDelayedSettlementSale` (exactly one effective transfer in `ACTIVE_INTERMEDIATE`). |
+| `ExternalAssetOwnersWriteServiceImpl.intermediarySaleLoanByLoanId` | Throws if disabled — `"Delayed Settlement Configuration is not enabled for the loan product: <shortname>"`. |
+| `ExternalAssetOwnersWriteServiceImpl.fetchAndValidateEffectiveTransferForBuyback` | Switches between simple buyback validation and the delayed-settlement buyback flow (allows buyback against an `ACTIVE_INTERMEDIATE` row, expects `BUYBACK_INTERMEDIATE` status). |
+| `ExternalAssetOwnersWriteServiceImpl.validateLoanStatus` | Uses `configurationDomainService.getAllowedLoanStatusesOfDelayedSettlementForExternalAssetTransfer()` instead of the default whitelist. |
+| `LoanAccountOwnerTransferBusinessStep.handleSameDaySaleAndBuyback` | Throws `IllegalStateException` if delayed settlement is on and the COB step sees two effective transfers on the same day — that combination is illegal under delayed settlement. |
+| `LoanAccountOwnerTransferBusinessStep.determinePreviousOwnerAndCleanupIfNeeded` | When delayed settlement is on, the intermediate's row is the source of the previous owner instead of the active loan mapping. |
+| `LoanTransferabilityServiceImpl.shouldValidateTransferable` | When delayed settlement is on, only the originator → intermediate hop runs the balance-sanity check; the intermediate → investor hop skips it. |
+
+## Caching
+
+The read-service implementation caches the per-product lookup. The cache name is `"externalAssetOwnerLoanProductAttributes"` and the key includes the tenant id plus the `(loanProductId, attributeKey)` pair. The write path evicts on update:
+
+```java
+@CacheEvict(cacheNames = "externalAssetOwnerLoanProductAttributes",
+    key = "T(org.apache.fineract.infrastructure.core.service.ThreadLocalContextUtil)"
+        + ".getTenant().getTenantIdentifier().concat(#command.getProductId().toString() + #attributeKey)")
+public CommandProcessingResult updateExternalAssetOwnerLoanProductAttribute(
+        JsonCommand command, String attributeKey, String attributeValue) { ... }
+```
+
+This matters in COB: thousands of loans may share the same loan product, and `DelayedSettlementAttributeService.isEnabled(...)` is called once per loan per night per transfer — the cache keeps that to a single round trip.
+
+## Validation errors
+
+| Exception | Cause | HTTP |
+|---|---|---|
+| `PlatformApiDataValidationException` | Missing or blank `attributeKey`/`attributeValue`, length over 255 chars. | 400 |
+| `LoanProductNotFoundException` | `loanProductId` doesn't exist. | 404 |
+| `ExternalAssetOwnerLoanProductAttributeAlreadyExistsException` | POSTing the same `(loanProductId, attributeKey)` twice. The exception message advises using PUT to UPDATE. | 403 |
+| `ExternalAssetOwnerLoanProductAttributeNotFoundException` | PUT against a missing attribute id. | 404 |
+| `ExternalAssetOwnerLoanProductAttributeInvalidSettlementAttributeException` | The `(key, value)` pair is not a known constant of any registered `ExternalAssetOwnerLoanProductAttribute` enum. | 403 |
+| `ExternalAssetOwnerLoanProductAttributesException` | PUT body's `attributeKey` differs from the row's stored key. | 403 |
+
+## Example workflow
+
+```bash
+# 1. Configure loan product 7 for delayed-settlement asset externalization
+curl -X POST 'http://localhost:8080/fineract-provider/api/v1/external-asset-owners/loan-product/7/attributes' \
+     -H 'Content-Type: application/json' \
+     -H 'Fineract-Platform-TenantId: default' \
+     -d '{ "attributeKey": "SETTLEMENT_MODEL", "attributeValue": "DELAYED_SETTLEMENT" }'
+
+# 2. Verify
+curl 'http://localhost:8080/fineract-provider/api/v1/external-asset-owners/loan-product/7/attributes' \
+     -H 'Fineract-Platform-TenantId: default'
+
+# 3. Switch loan product 7 back to default settlement
+curl -X PUT 'http://localhost:8080/fineract-provider/api/v1/external-asset-owners/loan-product/7/attributes/42' \
+     -H 'Content-Type: application/json' \
+     -H 'Fineract-Platform-TenantId: default' \
+     -d '{ "attributeKey": "SETTLEMENT_MODEL", "attributeValue": "DEFAULT_SETTLEMENT" }'
+```
+
+After step 1, calls to `POST /transfers/loans/{loanId}?command=intermediarySale` succeed for loans of product 7. After step 3, the same call returns HTTP 403 with `"Delayed Settlement Configuration is not enabled for the loan product: ..."`.
+
+## Adding a new capability flag
+
+To add a new flag (say, `DEFAULT_PURCHASE_PRICE_RATIO` enforced server-side):
+
+1. Define an enum implementing `ExternalAssetOwnerLoanProductAttribute` somewhere under `org.apache.fineract.investor`:
+
+   ```java
+   public enum PriceRatioLoanProductAttribute implements ExternalAssetOwnerLoanProductAttribute {
+       LOW("0.95"), MID("1.00"), HIGH("1.05");
+       private final String attributeKey = "DEFAULT_PURCHASE_PRICE_RATIO";
+       private final String attributeValue;
+       PriceRatioLoanProductAttribute(String v) { this.attributeValue = v; }
+       public String getAttributeKey()   { return attributeKey; }
+       public String getAttributeValue() { return attributeValue; }
+   }
+   ```
+
+2. Restart Fineract. The reflection scanner picks up the new enum and the POST endpoint will now accept `(DEFAULT_PURCHASE_PRICE_RATIO, LOW|MID|HIGH)` pairs. No changes to the resource or to the write service are required.
+
+3. Add a consumer that reads the value at the relevant decision point (e.g. inside `ExternalAssetOwnersWriteServiceImpl.createSaleTransfer` to provide a default when the request omits `purchasePriceRatio`).
+
+## Cross-links
+
+- The two-hop sale lifecycle this flag unlocks: [/investor/transfer-lifecycle](/investor/transfer-lifecycle)
+- The COB-side consequence: [/investor/investor-cob-step](/investor/investor-cob-step)
+- Investor write API (sale/buyback): [/investor/investor-api](/investor/investor-api)
+- Loan product domain: [/loan/overview](/loan/overview)
+- Investor REST API consumer reference: [/api/investor-apis](/api/investor-apis)

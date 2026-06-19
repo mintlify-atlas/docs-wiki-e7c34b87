@@ -1,0 +1,391 @@
+---
+title: "Investor Module Journal Entry Integration With Accounting"
+sidebarTitle: "Journal Entries"
+description: "How sale and buyback transfers produce journal entries via AccountingServiceImpl and how every subsequent loan entry is tagged in Apache Fineract."
+---
+
+The `fineract-investor` module integrates with Apache Fineract's accounting subsystem in two distinct ways. First, when a sale or buyback executes during Close of Business, `AccountingServiceImpl` posts a balanced pair of journal entries against the `ASSET_TRANSFER` financial-activity GL account. Second, for as long as a loan is held by an external owner, every *subsequent* journal entry produced by normal loan activity — repayments, accruals, charges — is automatically tagged to that owner via the `ExternalAssetOwnerJournalEntryServiceImpl` listener. This page explains both flows, the GL account mapping, the debit/credit choreography (including the overpaid edge case), and the two mapping tables that make per-transfer and per-owner journal-entry queries cheap.
+
+The accounting concepts referenced here — `JournalEntry`, `GLAccount`, `ProductToGLAccountMapping`, `FinancialActivityAccount`, `GLClosure` — are documented in [Accounting overview](/accounting/overview). The transfer entities are in [External asset owner domain](/investor/external-asset-owner-domain). The lifecycle that triggers the posting is in [Transfer lifecycle](/investor/transfer-lifecycle).
+
+## The two integration points
+
+```mermaid
+flowchart LR
+    subgraph COB["LoanAccountOwnerTransferBusinessStep\n(at sale or buyback execution)"]
+        S1[sellAsset] --> P1[LoanJournalEntryPoster<br/>.postJournalEntries<br/>ForExternalOwnerTransfer]
+        S2[buybackAsset] --> P1
+        P1 --> AS[AccountingServiceImpl<br/>.createJournalEntries<br/>ForSaleAssetTransfer<br/>/ForBuybackAssetTransfer]
+    end
+
+    subgraph Ongoing["Every loan journal entry produced after sale"]
+        L[Loan repayment, accrual, fee,<br/>charge, etc.] --> JE[JournalEntry persisted]
+        JE --> Event[LoanJournalEntryCreatedBusinessEvent fired]
+        Event --> Listener[ExternalAssetOwnerJournalEntryServiceImpl<br/>@PostConstruct listener]
+        Listener --> Mapping[Insert<br/>ExternalAssetOwnerJournalEntryMapping]
+    end
+
+    AS --> Owner1[ExternalAssetOwner<br/>JournalEntryMapping<br/>per-owner side]
+    AS --> Transfer1[ExternalAssetOwnerTransfer<br/>JournalEntryMapping<br/>per-transfer side]
+```
+
+## The asset-transfer financial-activity account
+
+All transfer journal entries move money to/from a single clearing GL account identified by the financial-activity type `ASSET_TRANSFER`. The GL account behind that financial-activity row is configured at the organisation level (via `m_financial_activity_account`), not per loan product.
+
+`AccountingServiceImpl` resolves it once per transfer:
+
+```java
+FinancialActivityAccount financialActivityAccount = this.financialActivityAccountRepository
+    .findByFinancialActivityTypeWithNotFoundDetection(
+        AccountingConstants.FinancialActivity.ASSET_TRANSFER.getValue());
+```
+
+This is the *only* account that is treated specially in the owner-mapping step below.
+
+## Posting a sale transfer
+
+The COB step's `sellAsset(...)` method calls `LoanJournalEntryPoster.postJournalEntriesForExternalOwnerTransfer(loan, newTransfer, previousOwner)`. The poster lives in `fineract-provider` and delegates to `AccountingServiceImpl.createJournalEntriesForSaleAssetTransfer(loan, transfer, previousOwner)`:
+
+```java
+@Override
+public void createJournalEntriesForSaleAssetTransfer(final Loan loan,
+        final ExternalAssetOwnerTransfer transfer, final ExternalAssetOwner previousOwner) {
+
+    final ExternalAssetOwner newOwner = transfer.getOwner();
+    List<JournalEntry> journalEntryList = createJournalEntries(loan, transfer, true);
+    createMappingToTransfer(transfer, journalEntryList);
+
+    FinancialActivityAccount financialActivityAccount = this.financialActivityAccountRepository
+        .findByFinancialActivityTypeWithNotFoundDetection(
+            AccountingConstants.FinancialActivity.ASSET_TRANSFER.getValue());
+    journalEntryList.forEach(journalEntry -> {
+        if (isOwnedByFinancialActivityAccount(journalEntry, financialActivityAccount)) {
+            createMappingToOwner(null, journalEntry);
+            return;
+        }
+        ExternalAssetOwner owner = determineOwnerForSale(journalEntry, loan, previousOwner, newOwner);
+        createMappingToOwner(owner, journalEntry);
+    });
+}
+```
+
+The flow is:
+
+1. Build a balanced list of debit/credit `JournalEntry`s via `createJournalEntries(loan, transfer, isReversalOrder=true)`. Internally this produces **two** symmetric trips through the same account map: one set of entries that moves money to the asset-transfer clearing account, and a second set that moves money from the asset-transfer clearing account. The two passes together net to zero across the clearing account.
+2. For each created journal entry, write an `ExternalAssetOwnerTransferJournalEntryMapping` so the transfer can later be asked "what journal entries did your execution produce?".
+3. For each entry that is **not** against the asset-transfer clearing account, tag it with the relevant owner via `ExternalAssetOwnerJournalEntryMapping`. The asset-transfer entries themselves are skipped (the `if (isOwnedByFinancialActivityAccount(...)) return;` early-out).
+
+### `createJournalEntries(loan, transfer, isReversalOrder)`
+
+```java
+@NonNull
+private List<JournalEntry> createJournalEntries(final Loan loan,
+        final ExternalAssetOwnerTransfer transfer, final boolean isReversalOrder) {
+    this.helper.checkForBranchClosures(loan.getOffice().getId(), transfer.getSettlementDate());
+    final Long transactionId = transfer.getId();
+    final LocalDate transactionDate = transfer.getSettlementDate();
+    final BigDecimal principalAmount = loan.getSummary().getTotalPrincipalOutstanding();
+    final BigDecimal interestAmount =
+        externalAssetOwnerTransferOutstandingInterestCalculation.calculateOutstandingInterest(loan);
+    final BigDecimal feesAmount = loan.getSummary().getTotalFeeChargesOutstanding();
+    final BigDecimal penaltiesAmount = loan.getSummary().getTotalPenaltyChargesOutstanding();
+    final BigDecimal overPaymentAmount = loan.getTotalOverpaid();
+
+    // Pass 1 — entries that move money TO the asset transfer account
+    final List<JournalEntry> journalEntryList = createJournalEntries(loan, transactionId,
+        transactionDate, principalAmount, interestAmount, feesAmount, penaltiesAmount,
+        overPaymentAmount, !isReversalOrder);
+    // Pass 2 — entries that move money FROM the asset transfer account
+    journalEntryList.addAll(createJournalEntries(loan, transactionId, transactionDate,
+        principalAmount, interestAmount, feesAmount, penaltiesAmount, overPaymentAmount,
+        isReversalOrder));
+    return journalEntryList;
+}
+```
+
+Each pass returns one credit (or debit) per non-zero loan-summary component plus a single offsetting entry against the asset-transfer account for the total. Calling the helper twice — once with `isReversalOrder = !isReversalOrder`, once with `isReversalOrder` — produces the matched-pair structure.
+
+### Per-component account resolution
+
+```java
+// principal
+if (loan.isChargedOff()) {
+    final Long chargeOffReasonId = loan.fetchChargeOffReasonId();
+    final ProductToGLAccountMapping mapping = chargeOffReasonId != null
+        ? helper.getChargeOffMappingByCodeValue(loanProductId, PortfolioProductType.LOAN, chargeOffReasonId)
+        : null;
+    if (mapping != null) {
+        account = mapping.getGlAccount();
+    } else {
+        final AccountingConstants.AccrualAccountsForLoan accrualAccount = loan.isFraud()
+            ? AccountingConstants.AccrualAccountsForLoan.CHARGE_OFF_FRAUD_EXPENSE
+            : AccountingConstants.AccrualAccountsForLoan.CHARGE_OFF_EXPENSE;
+        account = helper.getLinkedGLAccountForLoanProduct(loanProductId, accrualAccount.getValue());
+    }
+} else {
+    account = helper.getLinkedGLAccountForLoanProduct(loanProductId,
+        AccountingConstants.AccrualAccountsForLoan.LOAN_PORTFOLIO.getValue());
+}
+```
+
+The full mapping table (for non-charged-off loans) is:
+
+| Loan summary component | Accrual constant resolved via `helper.getLinkedGLAccountForLoanProduct(loanProductId, …)` |
+|---|---|
+| `principalAmount = loan.getSummary().getTotalPrincipalOutstanding()` | `AccrualAccountsForLoan.LOAN_PORTFOLIO` |
+| `interestAmount = strategy.calculateOutstandingInterest(loan)` | `AccrualAccountsForLoan.INTEREST_RECEIVABLE` |
+| `feesAmount = loan.getSummary().getTotalFeeChargesOutstanding()` | `AccrualAccountsForLoan.FEES_RECEIVABLE` |
+| `penaltiesAmount = loan.getSummary().getTotalPenaltyChargesOutstanding()` | `AccrualAccountsForLoan.PENALTIES_RECEIVABLE` |
+| `overPaymentAmount = loan.getTotalOverpaid()` | `AccrualAccountsForLoan.OVERPAYMENT` |
+| total of all of the above | `FinancialActivity.ASSET_TRANSFER` (the clearing account) |
+
+If the loan is `chargedOff`, principal, interest, fees, and penalty accounts swap to the charge-off variants (`CHARGE_OFF_EXPENSE` / `CHARGE_OFF_FRAUD_EXPENSE` for principal — modulo product-level charge-off reason mapping; `INCOME_FROM_CHARGE_OFF_INTEREST` / `…_FEES` / `…_PENALTY` for the other three).
+
+### Same GL account collapsed into one row
+
+When two components resolve to the same GL account (common with custom product configurations), the amounts are summed before posting:
+
+```java
+if (accountMap.containsKey(account)) {
+    final BigDecimal amount = accountMap.get(account).add(interestAmount);
+    accountMap.put(account, amount);
+} else {
+    accountMap.put(account, interestAmount);
+}
+```
+
+So the resulting journal entry list contains at most one row per distinct GL account, plus the single offsetting row against the asset-transfer account.
+
+### The `"I"` transaction-id prefix
+
+`InvestorAccountingHelper` prefixes the transaction id stored on every investor-related journal entry with the literal `"I"`:
+
+```java
+public static final String INVESTOR_TRANSFER_IDENTIFIER = "I";
+
+private JournalEntry createCreditJournalEntryForInvestor(...,
+        final Long transactionId, ...) {
+    final String modifiedTransactionId = INVESTOR_TRANSFER_IDENTIFIER + transactionId;
+    final JournalEntry journalEntry = JournalEntry.createNew(office, null, account, currencyCode,
+        modifiedTransactionId, manualEntry, transactionDate, JournalEntryType.CREDIT, amount,
+        null, PortfolioProductType.LOAN.getValue(), loanId, null, null, null, null, null);
+    return this.glJournalEntryRepository.saveAndFlush(journalEntry);
+}
+```
+
+The `transactionId` is the `ExternalAssetOwnerTransfer.id`. So a transfer with id `4567` produces journal entries whose stored transaction id is `"I4567"`. This guarantees no collision with normal loan-transaction ids stored on `m_acc_gl_journal_entry`.
+
+### GL closure protection
+
+```java
+public void checkForBranchClosures(Long officeId, final LocalDate transactionDate) {
+    GLClosure gLClosure = getLatestClosureByBranch(officeId);
+    if (gLClosure != null && !DateUtils.isAfter(transactionDate, gLClosure.getClosingDate())) {
+        throw new JournalEntryInvalidException(
+            GlJournalEntryInvalidReason.ACCOUNTING_CLOSED, gLClosure.getClosingDate(), null, null);
+    }
+}
+```
+
+The transfer's settlement date (the date posted on the journal entry) must be strictly after the latest GL closure for the loan's office. If it is on or before the closing date, `JournalEntryInvalidException` aborts the whole COB step for that loan.
+
+## Per-owner mapping — `determineOwnerForSale`
+
+After the entries are persisted, each non-asset-transfer entry is tagged to the *right* owner. The rule has two cases:
+
+```java
+private ExternalAssetOwner determineOwnerForSale(JournalEntry journalEntry, Loan loan,
+        ExternalAssetOwner previousOwner, ExternalAssetOwner newOwner) {
+    final boolean isOverpaid = LoanStatus.OVERPAID.equals(loan.getStatus());
+
+    if (isOverpaid) {
+        if (journalEntry.isCreditEntry()) return newOwner;
+        if (journalEntry.isDebitEntry())  return previousOwner;
+    } else {
+        if (journalEntry.isCreditEntry()) return previousOwner;
+        if (journalEntry.isDebitEntry())  return newOwner;
+    }
+    throw new IllegalArgumentException("Given journalEntry has invalid type: " + journalEntry.getType());
+}
+```
+
+Intuition:
+
+- **Normal case (loan has positive outstanding):** the new owner is *receiving* the asset. Debit entries (which load up the new owner's side of the books) are tagged to the new owner. Credit entries (which clear the previous owner's side) are tagged to the previous owner.
+- **Overpaid case (loan has a negative outstanding):** the asset being transferred is actually a liability (the loan client overpaid; the bank owes them money). The sign flips, so credits go to the new owner and debits go to the previous owner.
+
+For the originator-to-investor case `previousOwner == null` — half the entries are tagged with `null`, which `createMappingToOwner(null, je)` simply skips. The result is that journal entries for the originator side are *not* stored in `m_external_asset_owner_journal_entry_mapping`; only the investor-side ones are.
+
+## Posting a buyback transfer
+
+```java
+@Override
+public void createJournalEntriesForBuybackAssetTransfer(final Loan loan,
+        final ExternalAssetOwnerTransfer transfer) {
+    final ExternalAssetOwner previousOwner = transfer.getOwner();
+    List<JournalEntry> journalEntryList = createJournalEntries(loan, transfer, false);
+    createMappingToTransfer(transfer, journalEntryList);
+    // ... per-owner mapping with determineOwnerForBuyback
+}
+
+private ExternalAssetOwner determineOwnerForBuyback(JournalEntry journalEntry, Loan loan,
+        ExternalAssetOwner previousOwner) {
+    final boolean isOverpaid = LoanStatus.OVERPAID.equals(loan.getStatus());
+    if (isOverpaid && journalEntry.isDebitEntry()) return previousOwner;
+    if (!isOverpaid && journalEntry.isCreditEntry()) return previousOwner;
+    return null;
+}
+```
+
+Two differences from sale:
+
+1. `isReversalOrder` is passed in as **`false`** (not `true`) — the pass ordering is reversed compared to sale, so the debit/credit direction against the clearing account is the mirror image.
+2. There is only one owner involved (the originator buys it back from the investor); the rule is "tag entries that affect the previous owner's side of the books, leave the originator side untagged".
+
+## The mapping tables
+
+Two distinct mapping entities are written from `AccountingServiceImpl`:
+
+```java
+private void createMappingToTransfer(ExternalAssetOwnerTransfer transfer,
+        List<JournalEntry> journalEntryList) {
+    journalEntryList.forEach(journalEntry -> {
+        ExternalAssetOwnerTransferJournalEntryMapping mapping =
+            new ExternalAssetOwnerTransferJournalEntryMapping();
+        mapping.setJournalEntry(journalEntry);
+        mapping.setOwnerTransfer(transfer);
+        externalAssetOwnerTransferJournalEntryMappingRepository.saveAndFlush(mapping);
+    });
+}
+
+@Override
+public void createMappingToOwner(final ExternalAssetOwner owner, final JournalEntry journalEntry) {
+    if (owner == null) return;
+    ExternalAssetOwnerJournalEntryMapping mapping = new ExternalAssetOwnerJournalEntryMapping();
+    mapping.setJournalEntry(journalEntry);
+    mapping.setOwner(owner);
+    externalAssetOwnerJournalEntryMappingRepository.saveAndFlush(mapping);
+}
+```
+
+| Mapping table | Cardinality | Used by |
+|---|---|---|
+| `m_external_asset_owner_transfer_journal_entry_mapping` | Many JEs per transfer, exactly one transfer per JE row. | `GET /transfers/{transferId}/journal-entries`. |
+| `m_external_asset_owner_journal_entry_mapping` | Many JEs per owner, exactly one owner per JE row (asset-transfer-account entries are excluded). | `GET /owners/external-id/{ownerExternalId}/journal-entries`. |
+
+## Tagging entries produced *after* the sale executes — `ExternalAssetOwnerJournalEntryServiceImpl`
+
+After a sale activates, the COB step writes one row into `m_external_asset_owner_transfer_loan_mapping`. From that moment forward — repayments, accruals, fee postings, write-offs, charge-offs — every new journal entry produced for the loan needs to be tagged to the current investor.
+
+That tagging is done by a listener registered at startup:
+
+```java
+// fineract-investor/.../service/ExternalAssetOwnerJournalEntryServiceImpl.java
+@Service @RequiredArgsConstructor @Slf4j
+@Conditional(InvestorModuleIsEnabledCondition.class)
+public class ExternalAssetOwnerJournalEntryServiceImpl
+        implements ExternalAssetOwnerJournalEntryService {
+
+    private final BusinessEventNotifierService businessEventNotifierService;
+    private final ExternalAssetOwnerJournalEntryMappingRepository
+        externalAssetOwnerJournalEntryMappingRepository;
+    private final ExternalAssetOwnerTransferLoanMappingRepository
+        externalAssetOwnerTransferLoanMappingRepository;
+    private final LoanTransactionRepository loanTransactionRepository;
+
+    @PostConstruct
+    public void addListeners() {
+        businessEventNotifierService.addPostBusinessEventListener(
+            LoanJournalEntryCreatedBusinessEvent.class, event -> {
+            JournalEntry journalEntry = event.get();
+            Long loanId = loanTransactionRepository
+                .findLoanIdById(journalEntry.getLoanTransactionId()).orElseThrow();
+            externalAssetOwnerTransferLoanMappingRepository.findByLoanId(loanId)
+                .ifPresent(transferLoanMapping -> {
+                    ExternalAssetOwnerJournalEntryMapping mapping =
+                        new ExternalAssetOwnerJournalEntryMapping();
+                    mapping.setJournalEntry(journalEntry);
+                    mapping.setOwner(transferLoanMapping.getOwnerTransfer().getOwner());
+                    externalAssetOwnerJournalEntryMappingRepository.saveAndFlush(mapping);
+                });
+        });
+    }
+}
+```
+
+The flow is:
+
+1. The loan-side accounting service creates a `JournalEntry` (e.g. for a repayment).
+2. After persisting, it fires `LoanJournalEntryCreatedBusinessEvent`.
+3. This listener resolves the journal entry → loan id via `m_loan_transaction.loan_id`.
+4. It looks the loan up in `m_external_asset_owner_transfer_loan_mapping`. If a row exists (loan currently externally owned), the listener writes a `m_external_asset_owner_journal_entry_mapping` row linking the journal entry to the owner of the mapped transfer.
+
+When the loan is *bought back*, the mapping row is deleted by the COB step's `buybackAsset(...)` — from that point forward, new journal entries stop being tagged.
+
+## Mapping table — what gets posted, by transfer kind
+
+| Trigger | `createJournalEntries...` called? | Mapping to transfer? | Per-owner mapping? |
+|---|---|---|---|
+| Sale activates (`sellAsset`) | Yes, `forSaleAssetTransfer` | Yes (all entries) | Yes, `determineOwnerForSale` |
+| Buyback executes (`buybackAsset`) | Yes, `forBuybackAssetTransfer` | Yes (all entries) | Yes, `determineOwnerForBuyback` (only previous-owner side) |
+| Pending sale declined | No journal entries posted | No | No |
+| Same-day pair cancelled | No journal entries posted | No | No |
+| Buyback cancelled (UNSOLD) | No journal entries posted | No | No |
+| Loan transaction *after* sale | Standard loan-side journal entries via `LoanJournalEntryPoster`; listener tags them | No | Yes — listener writes the per-owner mapping. |
+
+## Querying back
+
+The two read endpoints on `ExternalAssetOwnersApiResource` expose these mappings:
+
+| Endpoint | Source | Use case |
+|---|---|---|
+| `GET /transfers/{transferId}/journal-entries` | `m_external_asset_owner_transfer_journal_entry_mapping` JOIN `acc_gl_journal_entry` | "Show the books movement that this transfer's activation/execution produced." |
+| `GET /owners/external-id/{ownerExternalId}/journal-entries` | `m_external_asset_owner_journal_entry_mapping` JOIN `acc_gl_journal_entry` | "Show every journal entry that has ever belonged to investor X" — transfer creation entries plus every subsequent client-driven entry (repayments, accruals) while the investor held the asset. |
+
+## Worked example — sale of a simple loan
+
+Suppose loan 123 has these outstanding components on `2025-04-15` (the settlement date):
+
+| Component | Amount | GL account (default mapping) |
+|---|---|---|
+| Principal | 1000.00 | `LOAN_PORTFOLIO` (asset) |
+| Interest | 50.00 | `INTEREST_RECEIVABLE` (asset) |
+| Fees | 10.00 | `FEES_RECEIVABLE` (asset) |
+| Penalty | 0.00 | (skipped, amount is zero) |
+| Overpaid | 0.00 | (skipped) |
+| **Total** | **1060.00** | `ASSET_TRANSFER` (clearing) |
+
+Pass 1 (with `isReversalOrder = !true = false`, i.e. normal order):
+
+| # | Entry type | Account | Amount |
+|---|---|---|---|
+| 1 | CREDIT | LOAN_PORTFOLIO | 1000.00 |
+| 2 | CREDIT | INTEREST_RECEIVABLE | 50.00 |
+| 3 | CREDIT | FEES_RECEIVABLE | 10.00 |
+| 4 | DEBIT | ASSET_TRANSFER | 1060.00 |
+
+Pass 2 (with `isReversalOrder = true`):
+
+| # | Entry type | Account | Amount |
+|---|---|---|---|
+| 5 | DEBIT | LOAN_PORTFOLIO | 1000.00 |
+| 6 | DEBIT | INTEREST_RECEIVABLE | 50.00 |
+| 7 | DEBIT | FEES_RECEIVABLE | 10.00 |
+| 8 | CREDIT | ASSET_TRANSFER | 1060.00 |
+
+All 8 entries are linked to the transfer via `m_external_asset_owner_transfer_journal_entry_mapping`. Entries 4 and 8 (asset-transfer-account entries) are skipped for owner mapping. Of the remaining six:
+
+- Loan is not overpaid → "credit = previous owner, debit = new owner".
+- For the originator → investor case, `previousOwner = null`. So entries 1, 2, 3 are tagged with `null` and skipped; entries 5, 6, 7 are tagged with the new investor in `m_external_asset_owner_journal_entry_mapping`.
+
+End result: investor now holds three journal-entry-mapping rows tracing the principal, interest, and fees they bought.
+
+## Cross-links
+
+- Accounting overview: [/accounting/overview](/accounting/overview)
+- Transfer lifecycle that triggers these postings: [/investor/transfer-lifecycle](/investor/transfer-lifecycle)
+- Domain model with the mapping entities: [/investor/external-asset-owner-domain](/investor/external-asset-owner-domain)
+- COB step that calls the poster: [/investor/investor-cob-step](/investor/investor-cob-step), [/cob/investor-cob-steps](/cob/investor-cob-steps)
+- Events emitted alongside the postings: [/investor/investor-events](/investor/investor-events), [/events/overview](/events/overview)
+- Loan-side journal-entry generation: [/loan/overview](/loan/overview)

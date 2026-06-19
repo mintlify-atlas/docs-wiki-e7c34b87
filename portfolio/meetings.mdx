@@ -1,0 +1,329 @@
+---
+title: "Meetings: Attendance Tracking on Recurring Calendars"
+sidebarTitle: "Meetings"
+description: "Reference for the Fineract Meeting entity, MeetingAttendance, MeetingAttendanceType and the polymorphic /v1/{entityType}/{entityId}/meetings API."
+---
+
+# Meetings
+
+Meetings are the per-occurrence records that hang off a recurring
+`Calendar` in Apache Fineract. Each row in `m_meeting` represents one
+materialised date in the calendar's recurrence rule — typically the
+weekly or monthly collection visit for a group or centre — and carries
+the attendance roster for that visit.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `Meeting`, `MeetingAttendance` | `fineract-provider` | `org.apache.fineract.portfolio.meeting.domain` |
+| `MeetingAttendanceType` | `fineract-provider` | `org.apache.fineract.portfolio.meeting.data` |
+| `MeetingsApiResource` (polymorphic on `entityType`) | `fineract-provider` | `org.apache.fineract.portfolio.meeting.api` |
+| `MeetingReadPlatformService(Impl)`, `MeetingWritePlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.meeting.service` |
+| Command + handler classes | `fineract-provider` | `org.apache.fineract.portfolio.meeting.command` / `.handler` |
+| `MeetingApiConstants` | `fineract-provider` | `org.apache.fineract.portfolio.meeting` |
+
+See [Calendar](/portfolio/calendar) for the recurring schedule that
+spawns meetings, and [Groups and Centers](/portfolio/groups-and-centers)
+for the typical parents of a collection calendar.
+
+## Entity
+
+```java
+@AllArgsConstructor
+@NoArgsConstructor
+@Getter
+@Setter
+@Entity
+@Table(name = "m_meeting", uniqueConstraints = {
+    @UniqueConstraint(columnNames = { "calendar_instance_id", "meeting_date" },
+                      name = "unique_calendar_instance_id_meeting_date") })
+public class Meeting extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "calendar_instance_id", nullable = false)
+    private CalendarInstance calendarInstance;
+
+    @Column(name = "meeting_date", nullable = false)
+    private LocalDate meetingDate;
+
+    @OneToMany(fetch = FetchType.EAGER, cascade = CascadeType.ALL,
+               mappedBy = "meeting", orphanRemoval = true)
+    private Set<MeetingAttendance> clientsAttendance;
+}
+```
+
+### Field map
+
+| Column | Java field | Notes |
+| --- | --- | --- |
+| `calendar_instance_id` | `calendarInstance` | FK to `m_calendar_instance`; the recurring schedule |
+| `meeting_date` | `meetingDate` | Date of this particular occurrence; must match the calendar's RRULE |
+| (cascade) | `clientsAttendance` | One-to-many to `MeetingAttendance` rows, orphan-removed |
+
+The unique constraint `unique_calendar_instance_id_meeting_date` ensures
+exactly one meeting row per `(calendar instance, date)`.
+
+## MeetingAttendance
+
+```java
+@AllArgsConstructor
+@NoArgsConstructor
+@Getter
+@Setter
+@Entity
+@Table(name = "m_client_attendance", uniqueConstraints = {
+    @UniqueConstraint(columnNames = { "client_id", "meeting_id" },
+                      name = "unique_client_meeting_attendance") })
+public class MeetingAttendance extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "client_id", nullable = false)
+    private Client client;
+
+    @ManyToOne
+    @JoinColumn(name = "meeting_id", nullable = false)
+    private Meeting meeting;
+
+    @Column(name = "attendance_type_enum", nullable = false)
+    private Integer attendanceTypeId;
+}
+```
+
+One row per `(client, meeting)`. The integer value is interpreted as
+`MeetingAttendanceType`.
+
+## MeetingAttendanceType
+
+```java
+public enum MeetingAttendanceType {
+    INVALID(0,  "attendanceType.invalid"),
+    PRESENT(1,  "attendanceType.present"),
+    ABSENT(2,   "attendanceType.absent"),
+    APPROVED(3, "attendanceType.approved"),
+    LEAVE(4,    "attendanceType.leave"),
+    LATE(5,     "attendanceType.late");
+}
+```
+
+| Code | Meaning |
+| --- | --- |
+| 1 | Member showed up |
+| 2 | No-show, no excuse |
+| 3 | Approved absence (pre-authorised) |
+| 4 | On leave (extended absence) |
+| 5 | Came late |
+
+These codes are persisted in `attendance_type_enum`; consumers should
+not re-number them.
+
+## MeetingsApiResource
+
+The resource is mounted **polymorphically** on entity type:
+
+```java
+@Path("/v1/{entityType}/{entityId}/meetings")
+```
+
+Allowed `entityType` values mirror `CalendarEntityType`:
+
+| `entityType` | Used for |
+| --- | --- |
+| `clients` | Individual client meetings (rare) |
+| `groups` | Group-level collection meetings |
+| `centers` | Centre-level meetings |
+| `loans` | Loan-level (uncommon) |
+
+The resource resolves the right `CalendarInstance` by joining on
+`(entity_id, entity_type_enum)`. Endpoints:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/{entityType}/{entityId}/meetings/template` | Template: calendar context + attendance options | `READ_MEETING` |
+| `GET` | `/v1/{entityType}/{entityId}/meetings?limit=` | List meetings for the entity (most recent first) | `READ_MEETING` |
+| `GET` | `/v1/{entityType}/{entityId}/meetings/{meetingId}` | Single meeting + attendance roster | `READ_MEETING` |
+| `POST` | `/v1/{entityType}/{entityId}/meetings` | Create a meeting occurrence | `CREATE_MEETING` |
+| `PUT` | `/v1/{entityType}/{entityId}/meetings/{meetingId}` | Move the date or amend metadata | `UPDATE_MEETING` |
+| `DELETE` | `/v1/{entityType}/{entityId}/meetings/{meetingId}` | Delete a meeting | `DELETE_MEETING` |
+| `POST` | `/v1/{entityType}/{entityId}/meetings/{meetingId}?command=saveOrUpdateAttendance` | Stamp the roster | `UPDATE_MEETING` |
+
+### Create
+
+```http
+POST /v1/groups/{groupId}/meetings
+```
+
+```json
+{
+  "calendarId": 17,
+  "meetingDate": "27 January 2025",
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+The implementation validates that:
+
+- `meetingDate` is an occurrence date of the referenced calendar
+  (validated via `CalendarUtils.isValidRecurringDate(recurrence, …)`).
+- There is no existing row for the same `(calendarInstance, meetingDate)`
+  — the unique constraint catches this.
+
+### Save / update attendance
+
+`POST .../meetings/{meetingId}` toggles the attendance roster. Typical
+payload:
+
+```json
+{
+  "calendarId": 17,
+  "clientsAttendance": [
+    { "clientId": 109, "attendanceType": "PRESENT" },
+    { "clientId": 117, "attendanceType": "ABSENT"  },
+    { "clientId": 122, "attendanceType": "LATE"    }
+  ]
+}
+```
+
+The write service walks the array and reconciles `MeetingAttendance` rows
+(insert / update / orphan-remove) so the final state matches the payload
+exactly. Note the unique `(client_id, meeting_id)` constraint guarantees
+idempotency: re-posting the same body just updates the existing rows.
+
+### Update / delete
+
+`PUT` accepts a new `meetingDate` (still constrained by RRULE) and
+`location`. `DELETE` cascades orphan-removes the attendance rows, so the
+operation is safe to retry.
+
+## Read service
+
+`MeetingReadPlatformServiceImpl` builds:
+
+- `MeetingData` — meeting metadata + reference to `CalendarData`.
+- `MeetingAttendanceData` — `clientId`, `clientName`,
+  `attendanceType` (as `EnumOptionData`).
+
+The list endpoint orders by `meeting_date DESC` and applies an optional
+`limit`.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `MeetingNotFoundException` | Bad `meetingId` |
+| `MeetingDateException` | `meetingDate` not on the calendar's RRULE |
+| `MeetingNotSupportedException` | `entityType` does not allow meetings |
+| `CalendarInstanceNotFoundException` | The (entity, type) pair has no collection calendar |
+
+## Patterns
+
+### Driving collection sheets
+
+Group/centre **Collection Sheets** (`POST .../groups/{id}?command=
+generateCollectionSheet`) require a `calendarId` + `transactionDate`.
+The transaction date is in practice a `meetingDate` — pre-creating the
+`Meeting` row at the start of the day and then saving the attendance and
+collection sheet against the same date keeps the audit chain clean.
+
+### Late attendance
+
+`LATE` is treated as "present, but with a quality flag". For
+delinquency-tracking systems it is useful to count `ABSENT` and `LEAVE`
+separately because the latter is a pre-authorised condition (no penalty),
+whereas the former is unexcused.
+
+### No client list
+
+If `clientsAttendance` is empty, the meeting still represents a held
+session — useful for centre-only events where no per-client roster is
+needed.
+
+## Event listeners
+
+`org.apache.fineract.portfolio.meeting.listener` contains event listeners
+that react to `ClientCreateBusinessEvent` and group-membership changes
+so a fresh client added to a group is reflected the next time the meeting
+template is rendered.
+
+## Response shapes
+
+### Single meeting
+
+```json
+{
+  "id": 41,
+  "meetingDate": [2025, 1, 27],
+  "calendarData": {
+    "id": 17,
+    "title": "Weekly collection",
+    "startDate": [2024, 12, 30],
+    "recurrence": "FREQ=WEEKLY;BYDAY=MO",
+    "type": { "id": 1, "code": "calendarType.collection", "value": "COLLECTION" }
+  },
+  "clientsAttendance": [
+    { "clientId": 109, "clientName": "Petra Tan",
+      "attendanceType": { "id": 1, "code": "attendanceType.present", "value": "PRESENT" } },
+    { "clientId": 117, "clientName": "Sam Lee",
+      "attendanceType": { "id": 5, "code": "attendanceType.late",    "value": "LATE" } }
+  ]
+}
+```
+
+### Template
+
+```json
+{
+  "calendarData": { ... },
+  "attendanceTypeOptions": [
+    { "id": 1, "code": "attendanceType.present",  "value": "PRESENT" },
+    { "id": 2, "code": "attendanceType.absent",   "value": "ABSENT" },
+    { "id": 3, "code": "attendanceType.approved", "value": "APPROVED" },
+    { "id": 4, "code": "attendanceType.leave",    "value": "LEAVE" },
+    { "id": 5, "code": "attendanceType.late",     "value": "LATE" }
+  ]
+}
+```
+
+The template endpoint pre-fills `calendarData` so the caller can build a
+sensible "next meeting date" suggestion before posting.
+
+## Read service
+
+`MeetingReadPlatformServiceImpl` uses JDBC row mappers:
+
+```text
+SELECT m.id, m.meeting_date, c.id AS calendar_id, c.title, c.recurrence,
+       c.start_date, c.calendar_type_enum
+FROM m_meeting m
+JOIN m_calendar_instance ci ON ci.id = m.calendar_instance_id
+JOIN m_calendar c            ON c.id = ci.calendar_id
+WHERE ci.entity_id = ? AND ci.entity_type_enum = ?
+ORDER BY m.meeting_date DESC
+```
+
+(Schematic — the actual SQL lives in
+`MeetingReadPlatformServiceImpl.MeetingMapper`.)
+
+The list endpoint applies an optional `limit` and returns a flat array
+ordered by `meeting_date DESC`.
+
+## Command handlers
+
+| Handler | Triggered by |
+| --- | --- |
+| `CreateMeetingCommandHandler` | `POST .../meetings` |
+| `UpdateMeetingCommandHandler` | `PUT .../meetings/{id}` |
+| `DeleteMeetingCommandHandler` | `DELETE .../meetings/{id}` |
+| `SaveOrUpdateMeetingAttendanceCommandHandler` | `POST .../meetings/{id}?command=saveOrUpdateAttendance` |
+
+Each handler dispatches through the standard
+`CommandsSourceWritePlatformService` audit chain.
+
+## Cross-references
+
+- [Calendar](/portfolio/calendar) — RRULE source and `CalendarInstance`
+- [Groups and Centers](/portfolio/groups-and-centers) — typical parents
+- [Clients](/portfolio/clients) — `MeetingAttendance.client`
+- [Notes](/portfolio/notes) — annotate a meeting via a Group/Center note
+- [Loan overview](/loan/overview) — JLG repayment schedules that align
+  with the calendar
+- [Portfolio APIs index](/api/portfolio-apis)

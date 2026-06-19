@@ -1,0 +1,351 @@
+---
+title: "Campaign Jobs — Spring Batch Tasklets That Drive Messaging"
+sidebarTitle: "Campaign Jobs"
+description: "Apache Fineract campaign Spring Batch tasklets: EXECUTE_REPORT_MAILING_JOBS, EXECUTE_EMAIL, the UPDATE_*_OUTBOUND jobs and the SEND/GET SMS gateway loops."
+---
+
+Apache Fineract drives every part of the campaigns pipeline through Spring Batch tasklets registered in `fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/jobs/`. Five jobs share the surface and one extra job (`EXECUTE_EMAIL`) carries the bundled email dispatch. Each tasklet is a single-step Spring Batch job whose `JobName` is registered in `fineract-core` and which is launched by the scheduler runtime described in [Jobs overview](/jobs/overview).
+
+For the aggregates these jobs operate on see [Email campaigns](/campaigns/email-campaigns) and [SMS campaigns](/campaigns/sms-campaigns); for the outbound HTTP loop see [SMS gateway](/campaigns/sms-gateway).
+
+## Job catalogue
+
+| `JobName` constant | Display name | Tasklet | Direction |
+|---|---|---|---|
+| `EXECUTE_REPORT_MAILING_JOBS` | Execute Report Mailing Jobs | `ExecuteReportMailingJobsTasklet` | Render report + email attachment |
+| `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | Update Email Outbound with campaign message | `UpdateEmailOutboundWithCampaignMessageTasklet` | Expand SCHEDULE email campaigns into `scheduled_email_messages_outbound` |
+| `EXECUTE_EMAIL` | Execute Email | `ExecuteEmailTasklet` | Send `PENDING` `EmailMessage` rows |
+| `UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | Update SMS Outbound with Campaign Message | `UpdateSmsOutboundWithCampaignMessageTasklet` | Expand SCHEDULE SMS campaigns into `sms_messages_outbound` |
+| `SEND_MESSAGES_TO_SMS_GATEWAY` | Send Messages to SMS Gateway | `SendMessageToSmsGatewayTasklet` | Ship `PENDING` `SmsMessage` rows to the gateway |
+| `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` | Get Delivery Reports from SMS Gateway | `GetDeliveryReportsFromSmsGatewayTasklet` | Poll gateway for delivery confirmations |
+
+All names are declared in `fineract-core/.../infrastructure/jobs/service/JobName.java`:
+
+```java
+EXECUTE_REPORT_MAILING_JOBS("Execute Report Mailing Jobs"),
+UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE("Update SMS Outbound with Campaign Message"),
+SEND_MESSAGES_TO_SMS_GATEWAY("Send Messages to SMS Gateway"),
+GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY("Get Delivery Reports from SMS Gateway"),
+UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE("Update Email Outbound with campaign message"),
+```
+
+Each job is registered by its `*Config` Spring `@Configuration` class through the standard pattern:
+
+```java
+@Configuration
+public class SendMessageToSmsGatewayConfig {
+    @Autowired private JobRepository jobRepository;
+    @Autowired private PlatformTransactionManager transactionManager;
+    // ...collaborators autowired
+
+    @Bean
+    protected Step sendMessageToSmsGatewayStep() {
+        return new StepBuilder(JobName.SEND_MESSAGES_TO_SMS_GATEWAY.name(), jobRepository)
+                .tasklet(sendMessageToSmsGatewayTasklet(), transactionManager).build();
+    }
+
+    @Bean
+    public Job sendMessageToSmsGatewayJob() {
+        return new JobBuilder(JobName.SEND_MESSAGES_TO_SMS_GATEWAY.name(), jobRepository)
+                .start(sendMessageToSmsGatewayStep()).incrementer(new RunIdIncrementer()).build();
+    }
+}
+```
+
+The scheduler reads cron triggers from `job` / `job_config` rows and launches each Spring Batch job by its `JobName.name()`. See [Jobs overview](/jobs/overview) for the launcher and locking model.
+
+## Pipeline summary
+
+```
+            ┌──────────────────────────────────────────────────────────────────────┐
+SCHEDULE    │ UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE                            │
+campaign    │  • polls ACTIVE email campaigns with next_trigger_date <= tenantNow   │
+            │  • runs business-rule report, interpolates body, inserts EmailMessage │
+            │  • advances next_trigger_date via CalendarUtils                       │
+            └────────────────────────────┬─────────────────────────────────────────┘
+                                         ▼
+                              scheduled_email_messages_outbound
+                                         │
+            ┌────────────────────────────┴─────────────────────────────────────────┐
+            │ EXECUTE_EMAIL                                                        │
+            │  • pages PENDING EmailMessage rows                                   │
+            │  • calls EmailMessageJobEmailService.sendEmailWithAttachment(...)    │
+            │  • flips status to SENT(200) / FAILED(400)                           │
+            └──────────────────────────────────────────────────────────────────────┘
+
+SCHEDULE    ┌──────────────────────────────────────────────────────────────────────┐
+SMS         │ UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE                             │
+campaign    │  • polls ACTIVE+SCHEDULE SMS campaigns with next_trigger_date passed │
+            │  • runs business-rule report, interpolates body, inserts SmsMessage  │
+            └────────────────────────────┬─────────────────────────────────────────┘
+                                         ▼
+                              sms_messages_outbound  (status = PENDING)
+                                         │
+            ┌────────────────────────────┴─────────────────────────────────────────┐
+            │ SEND_MESSAGES_TO_SMS_GATEWAY                                          │
+            │  • pages PENDING SmsMessage rows (page size 200)                     │
+            │  • POSTs /sms to gateway, flips status to WAITING_FOR_DELIVERY_REPORT │
+            └────────────────────────────┬─────────────────────────────────────────┘
+                                         ▼
+                              gateway delivers asynchronously
+                                         │
+            ┌────────────────────────────┴─────────────────────────────────────────┐
+            │ GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY                                 │
+            │  • pages ids in WAITING_FOR_DELIVERY_REPORT (page size 200)          │
+            │  • POSTs /sms/report, maps gateway codes to SENT/DELIVERED/FAILED    │
+            └──────────────────────────────────────────────────────────────────────┘
+
+m_report_mailing_job ──► EXECUTE_REPORT_MAILING_JOBS
+                          • renders the stretchy/Pentaho report
+                          • emails it via EmailMessageJobEmailService
+                          • writes m_report_mailing_job_run_history row
+```
+
+## `EXECUTE_REPORT_MAILING_JOBS`
+
+Source: `fineract-provider/.../campaigns/jobs/executereportmailingjobs/ExecuteReportMailingJobsTasklet.java`.
+
+This job lives in the campaigns tree but operates against the **report mailing job** entities (`m_report_mailing_job`), not `EmailCampaign`. For the entity, REST surface and run-history model see [Report mailing job](/report/report-mailing-job).
+
+### Step logic
+
+```java
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    final Collection<ReportMailingJob> jobs = reportMailingJobRepository.findByIsActiveTrueAndIsDeletedFalse();
+
+    for (ReportMailingJob job : jobs) {
+        final LocalDateTime tenantNow = DateUtils.getLocalDateTimeOfTenant();
+        final LocalDateTime nextRun   = job.getNextRunDateTime();
+
+        if (nextRun != null && DateUtils.isBefore(nextRun, tenantNow)) {
+            final ReportMailingJobEmailAttachmentFileFormat fmt =
+                ReportMailingJobEmailAttachmentFileFormat.newInstance(job.getEmailAttachmentFileFormat());
+
+            if (fmt != null && fmt.isValid()) {
+                final Report stretchyReport = job.getStretchyReport();
+                final String reportName     = stretchyReport != null ? stretchyReport.getReportName() : null;
+                final StringBuilder errorLog = new StringBuilder();
+                final Map<String,String> params =
+                    reportMailingJobValidator.validateStretchyReportParamMap(job.getStretchyReportParamMap());
+                MultivaluedMap<String,String> reportParams = new MultivaluedStringMap();
+
+                // resolve ${date} tokens via ReportMailingJobStretchyReportParamDateOption
+                ...
+
+                generateReportOutputStream(job, fmt, reportParams, reportName, errorLog);
+                updateReportMailingJobAfterJobExecution(job, errorLog, tenantNow);
+            }
+        }
+    }
+    return RepeatStatus.FINISHED;
+}
+```
+
+Inside `generateReportOutputStream`:
+
+1. Resolves the report type (`stretchy` / `Pentaho Reports`) via `ReadReportingService.getReportType(reportName, false)`.
+2. Selects the matching `ReportingProcessService` from `ReportingProcessServiceProvider` (see [Report provider](/report/report-provider)).
+3. Calls `reportingProcessService.processRequest(reportName, reportParams)` and unwraps a `ByteArrayOutputStream`.
+4. Writes the bytes to `${fineract.content.filesystem.rootFolder}/{reportName}.{ext}` and calls `sendReportFileToEmailRecipients(...)`, which dispatches the email via `EmailMessageJobEmailService.sendEmailWithAttachment(...)` (see [Email configuration](/campaigns/email-configuration)).
+5. Records the outcome in `m_report_mailing_job_run_history` (`ReportMailingJobRunHistory`) regardless of success/failure.
+
+### Date-parameter substitution
+
+`ReportMailingJobStretchyReportParamDateOption` lets the job configuration carry tokens like `TODAY` or `YESTERDAY` for date parameters. The tasklet resolves them at run time via `ReportMailingJobDateUtil.getDateAsString(option)` before passing to the reporting service.
+
+## `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE`
+
+Source: `fineract-provider/.../campaigns/jobs/updateemailoutboundwithcampaignmessage/UpdateEmailOutboundWithCampaignMessageTasklet.java`.
+
+### Step logic
+
+```java
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    final Collection<EmailCampaignData> campaigns = emailCampaignReadPlatformService.retrieveAllScheduleActiveCampaign();
+
+    if (campaigns != null) {
+        for (EmailCampaignData campaign : campaigns) {
+            LocalDateTime tenantDateNow   = DateUtils.getLocalDateTimeOfTenant();
+            LocalDateTime nextTriggerDate = campaign.getNextTriggerDate().toLocalDateTime();
+
+            if (DateUtils.isBefore(nextTriggerDate, tenantDateNow)) {
+                insertDirectCampaignIntoEmailOutboundTable(
+                    campaign.getParamValue(),
+                    campaign.getEmailSubject(),
+                    campaign.getEmailMessage(),
+                    campaign.getCampaignName(),
+                    campaign.getId());
+                updateTriggerDates(campaign.getId());
+            }
+        }
+    }
+    return RepeatStatus.FINISHED;
+}
+```
+
+`retrieveAllScheduleActiveCampaign` filters to `triggerType = SCHEDULE` AND `status = ACTIVE`. For each due campaign:
+
+1. Runs the business-rule SQL with parameters from `paramValue`.
+2. Iterates rows, building a per-row context map.
+3. Interpolates `emailSubject` and `emailMessage` using a Mustache factory (`com.github.mustachejava.DefaultMustacheFactory`). The Mustache template syntax `{{columnName}}` is supported here in addition to the simpler `${columnName}` substitution used at campaign-creation time.
+4. Persists one `EmailMessage` per surviving row in `EmailMessageStatusType.PENDING`.
+5. `updateTriggerDates(campaignId)` advances `next_trigger_date` using `CalendarUtils.getNextRecurringDate(recurrence, nextTriggerDate, nextTriggerDate)` and copies the old value into `last_trigger_date`. If the computed next date is still in the past (job hasn't run for a while), it walks forward to the next slot past `tenantNow`.
+
+### Bad-address handling
+
+Rows whose interpolated `email_address` fails `InternetAddress` parsing are skipped silently rather than producing a `FAILED` outbound row.
+
+## `EXECUTE_EMAIL`
+
+Source: `fineract-provider/.../campaigns/jobs/executeemail/ExecuteEmailTasklet.java`.
+
+### Step logic
+
+```java
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    if (IPv4Helper.applicationIsNotRunningOnLocalMachine()) {  // skip on local dev IPs
+        final List<EmailMessage> emailMessages =
+            emailMessageRepository.findByStatusType(EmailMessageStatusType.PENDING.getValue());
+        for (final EmailMessage msg : emailMessages) {
+            if (isValidEmail(msg.getEmailAddress())) {
+                final EmailCampaign campaign = emailCampaignRepository.findById(msg.getEmailCampaign().getId()).orElse(null);
+                // Resolve attachment file format (XLS/PDF/CSV)
+                ScheduledEmailAttachmentFileFormat fmt = ...;
+                // Build EmailMessageWithAttachmentData and hand to the JavaMail service
+                emailMessageJobEmailService.sendEmailWithAttachment(payload);
+                // flip status to SENT(200), or FAILED(400) on exception
+            }
+        }
+    }
+    return RepeatStatus.FINISHED;
+}
+```
+
+Notable behaviours:
+
+- **Local-machine guard.** `IPv4Helper.applicationIsNotRunningOnLocalMachine()` short-circuits the job when the host reports a loopback IP — this is a long-standing safety net to prevent developer machines from accidentally emailing real recipients while running with production-like configuration. To force-enable for testing, configure the host's primary interface or override the check via test-only helpers.
+- **Per-message validation.** `isValidEmail(...)` uses `InternetAddress` parsing to reject malformed addresses before SMTP submission.
+- **Attachment resolution.** If the originating campaign carries a `stretchyReport`, the tasklet renders it as XLS/PDF/CSV (according to `ScheduledEmailAttachmentFileFormat`) via `ReadReportingService` and attaches the resulting file.
+- **Send path.** `EmailMessageJobEmailService.sendEmailWithAttachment(...)` is the same JavaMail wrapper used by `EXECUTE_REPORT_MAILING_JOBS` — see [Email configuration](/campaigns/email-configuration).
+
+## `UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE`
+
+Source: `fineract-provider/.../campaigns/jobs/updatesmsoutboundwithcampaignmessage/UpdateSmsOutboundWithCampaignMessageTasklet.java`.
+
+### Step logic
+
+```java
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    final Collection<SmsCampaign> campaigns = smsCampaignRepository
+        .findByTriggerTypeAndStatus(SmsCampaignTriggerType.SCHEDULE.getValue(),
+                                    SmsCampaignStatus.ACTIVE.getValue());
+    for (SmsCampaign c : campaigns) {
+        LocalDateTime tenantNow   = DateUtils.getLocalDateTimeOfTenant();
+        LocalDateTime nextTrigger = c.getNextTriggerDate();
+        if (DateUtils.isBefore(nextTrigger, tenantNow)) {
+            smsCampaignWritePlatformService.insertDirectCampaignIntoSmsOutboundTable(c);
+            updateTriggerDates(c.getId());
+        }
+    }
+    return RepeatStatus.FINISHED;
+}
+
+private void updateTriggerDates(Long campaignId) {
+    SmsCampaign c = smsCampaignRepository.findById(campaignId).orElseThrow(() -> new SmsCampaignNotFound(campaignId));
+    LocalDateTime nextTrigger = c.getNextTriggerDate();
+    c.setLastTriggerDate(nextTrigger);
+    LocalDateTime nextRuntime = CalendarUtils.getNextRecurringDate(c.getRecurrence(), nextTrigger, nextTrigger);
+    if (DateUtils.isBefore(nextRuntime, DateUtils.getLocalDateTimeOfTenant())) {
+        nextRuntime = CalendarUtils.getNextRecurringDate(c.getRecurrence(), nextTrigger, DateUtils.getLocalDateTimeOfTenant());
+    }
+    c.setNextTriggerDate(nextRuntime);
+    smsCampaignRepository.saveAndFlush(c);
+}
+```
+
+The materialisation reuses `SmsCampaignWritePlatformService.insertDirectCampaignIntoSmsOutboundTable(SmsCampaign)`, the same method invoked when an operator activates a `DIRECT` campaign — so scheduled and direct paths produce identical rows.
+
+## `SEND_MESSAGES_TO_SMS_GATEWAY`
+
+Source: `fineract-provider/.../campaigns/jobs/sendmessagetosmsgateway/SendMessageToSmsGatewayTasklet.java`. Full prose is in [SMS gateway](/campaigns/sms-gateway#send_messages_to_sms_gateway--sendmessagetosmsgatewaytasklet); summary here:
+
+- Pages `SmsMessage` rows in `PENDING(100)` 200 at a time.
+- For each row, builds a `SmsMessageApiQueueResourceData` and flips the row to `WAITING_FOR_DELIVERY_REPORT(150)`.
+- Persists the status flip, then dispatches the batch on `taskExecutor` (`SmsTask`) which calls `SmsConfigUtils.getMessageGateWayRequestURI("sms", body)` and `POST`s.
+- Notification rows are handed to `NotificationSenderService.sendNotification(...)` instead of the gateway.
+- The gateway must respond `202 Accepted`; anything else throws `ConnectionFailureException` and aborts the step.
+
+## `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY`
+
+Source: `fineract-provider/.../campaigns/jobs/getdeliveryreportsfromsmsgateway/GetDeliveryReportsFromSmsGatewayTasklet.java`. Full prose is in [SMS gateway](/campaigns/sms-gateway#get_delivery_reports_from_sms_gateway--getdeliveryreportsfromsmsgatewaytasklet); summary:
+
+- Pages ids in `WAITING_FOR_DELIVERY_REPORT(150)` 200 at a time.
+- `POST`s the id list to `/sms/report`, expects `Collection<SmsMessageDeliveryReportData>`.
+- Maps gateway delivery codes (`0`/`150`/`200`/`300`/`400`) to `SmsMessageStatusType` and persists with the gateway's external id.
+- Ignores code `100` (still in flight) — the row stays in `WAITING_FOR_DELIVERY_REPORT` for the next pass.
+- Exceptions are logged per-page; the job continues paginating.
+
+## Scheduler cron defaults
+
+The default cron triggers (`job` table seed rows) are conservative — operators typically tune these per tenant:
+
+| Job | Default cron (seed) |
+|---|---|
+| `EXECUTE_REPORT_MAILING_JOBS` | `0 0 8 * * ?` (daily 08:00 UTC) |
+| `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | `0 */15 * * * ?` (every 15 min) |
+| `EXECUTE_EMAIL` | `0 */5 * * * ?` (every 5 min) |
+| `UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE` | `0 */15 * * * ?` (every 15 min) |
+| `SEND_MESSAGES_TO_SMS_GATEWAY` | `0 */5 * * * ?` (every 5 min) |
+| `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` | `0 */5 * * * ?` (every 5 min) |
+
+(Exact seeded values may vary by Liquibase changeset; verify against your environment's `job` rows.)
+
+## Common operational tasks
+
+### Force-run a job
+
+```http
+POST /v1/jobs/{jobId}?command=executeJob
+```
+
+Where `{jobId}` is the `m_scheduled_email` job's id from `GET /v1/jobs`. The scheduler launches the job out-of-band and the status appears in `job_run_history` shortly afterwards. See [Jobs overview](/jobs/overview) for the launcher contract.
+
+### Pause a job
+
+Update the `is_active` column on the matching `job` row (REST: `PUT /v1/jobs/{jobId}` with `{"active": false}`). The scheduler stops firing the cron without dropping the configuration.
+
+### Reset a stranded SMS
+
+If `SEND_MESSAGES_TO_SMS_GATEWAY` threw before the gateway received the row, the `SmsMessage` will be stuck in `WAITING_FOR_DELIVERY_REPORT` forever (the gateway has no record so the delivery-report poll never sees it). Operators reset the row manually:
+
+```sql
+UPDATE sms_messages_outbound SET status_enum = 100 WHERE id = ? AND status_enum = 150;
+```
+
+then wait for the next `SEND_MESSAGES_TO_SMS_GATEWAY` cycle.
+
+## Common failure modes
+
+| Symptom | Likely cause |
+|---|---|
+| Scheduled email never materialises | Campaign status is not `ACTIVE`, or `triggerType` ≠ `SCHEDULE`, or `next_trigger_date` not in the past |
+| `EmailMessage` rows pile up in `PENDING` | `EXECUTE_EMAIL` short-circuited by `IPv4Helper.applicationIsNotRunningOnLocalMachine()` returning false; check host networking |
+| `SmsMessage` rows pile up in `PENDING` | `SEND_MESSAGES_TO_SMS_GATEWAY` failing — check application log for `ConnectionFailureException` and gateway reachability |
+| `SmsMessage` rows pile up in `WAITING_FOR_DELIVERY_REPORT` | `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` not running, or gateway returning code `100` for too long |
+| Report mailing produces empty attachment | The stretchy SQL returned no rows; `errorLog.append("Report processing failed, empty output stream created")` is written to `m_report_mailing_job_run_history` |
+| Template body has literal `${...}` left | The business-rule report did not return a column with that name; check the SQL against the template |
+
+## Related references
+
+- The `JobName` enum and scheduler runtime: [Jobs overview](/jobs/overview).
+- The `EmailCampaign` aggregate the email jobs operate on: [Email campaigns](/campaigns/email-campaigns).
+- The `SmsCampaign` aggregate and outbound entity: [SMS campaigns](/campaigns/sms-campaigns).
+- The gateway HTTP contract and `SmsConfigUtils`: [SMS gateway](/campaigns/sms-gateway).
+- The SMTP send used by both email jobs: [Email configuration](/campaigns/email-configuration).
+- The full report mailing job entity / REST: [Report mailing job](/report/report-mailing-job).
+- The reporting plug-in surface every send leans on: [Report provider](/report/report-provider).
+- All campaign REST endpoints: [Hooks and messaging APIs](/api/hooks-and-messaging-apis).

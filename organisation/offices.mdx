@@ -1,0 +1,374 @@
+---
+title: "Offices — Branch Hierarchy and Inter-Office Transactions"
+sidebarTitle: "Offices"
+description: "Apache Fineract Office entity reference: parent hierarchy, external id, head office bootstrap, OfficesApiResource endpoints and OfficeTransactionsApiResource."
+---
+
+In Apache Fineract every accounting unit — client, group, loan, savings account, GL journal entry, staff record, even `AppUser` — is anchored to exactly one **`Office`**. Offices form a tree rooted at the *head office*; the materialised `hierarchy` string is used by row-level access checks so a branch user can only see records whose office sits at or below their own branch. This page documents the `Office` JPA entity, the inter-office money-transfer entity `OfficeTransaction`, and every endpoint exposed by `OfficesApiResource` and `OfficeTransactionsApiResource`.
+
+<Note>
+The `Office` entity itself lives in `fineract-core` (`org.apache.fineract.organisation.office.domain`) and is shared by every module that needs branch isolation. Write services, the JAX-RS resources and the command handlers are in `fineract-provider`. For the broader package map see [organisation shared domain](/core/organisation-shared-domain).
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `Office` | `fineract-core` |
+| Entity | `OfficeTransaction` | `fineract-provider` |
+| Repository | `OfficeRepository`, `OfficeRepositoryWrapper` | `fineract-core` |
+| Repository | `OfficeTransactionRepository` | `fineract-provider` |
+| Read service | `OfficeReadPlatformService` (interface) / `OfficeReadPlatformServiceImpl` | core / provider |
+| Write service | `OfficeWritePlatformService` / `…JpaRepositoryImpl` | provider |
+| Validator | `OfficeCommandFromApiJsonDeserializer`, `OfficeTransactionCommandFromApiJsonDeserializer` | provider |
+| Command handlers | `CreateOfficeCommandHandler`, `UpdateOfficeCommandHandler`, `CreateOfficeTransactionCommandHandler`, `DeleteOfficeTransactionCommandHandler` | provider |
+| JAX-RS | `OfficesApiResource` (`/v1/offices`), `OfficeTransactionsApiResource` (`/v1/officetransactions`) | provider |
+| Exceptions | `OfficeNotFoundException`, `RootOfficeParentCannotBeUpdated`, `CannotUpdateOfficeWithParentOfficeSameAsSelf`, `InvalidOfficeException`, `OfficeTransactionNotFoundException` | core / provider |
+
+## `Office` entity
+
+The JPA mapping is intentionally minimal — every business attribute (currency, opening balances, account number formats, etc.) hangs off **other** entities that hold an `office_id` FK. What `Office` itself stores is the parent pointer, the canonical `hierarchy` string, an opening date, and an optional `ExternalId`.
+
+```java
+// fineract-core/.../office/domain/Office.java
+@Entity
+@Table(name = "m_office", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"name"},        name = "name_org"),
+    @UniqueConstraint(columnNames = {"external_id"}, name = "externalid_org")
+})
+@Getter @Setter
+public class Office extends AbstractPersistableCustom<Long> implements Serializable {
+
+    @OneToMany(fetch = FetchType.LAZY)
+    @JoinColumn(name = "parent_id")
+    private List<Office> children = new ArrayList<>();
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "parent_id")
+    private Office parent;
+
+    @Column(name = "name", nullable = false, length = 100)
+    private String name;
+
+    @Column(name = "hierarchy", length = 50)
+    private String hierarchy;
+
+    @Column(name = "opening_date", nullable = false)
+    private LocalDate openingDate;
+
+    @Column(name = "external_id", length = 100, unique = true)
+    private ExternalId externalId;
+}
+```
+
+### Column inventory
+
+| Column | Java field | Constraints | Purpose |
+| --- | --- | --- | --- |
+| `id` | inherited `Long` | PK, identity | Surrogate id |
+| `name` | `name` | unique (`name_org`), `NOT NULL`, 100 chars | Display name, also unique within tenant |
+| `parent_id` | `parent` / `children` | FK to self | Single self-join used for both directions |
+| `hierarchy` | `hierarchy` | up to 50 chars | Materialised path — `".1.2.5."` style, used for permission filters |
+| `opening_date` | `openingDate` | `NOT NULL` | Earliest valid business date for the branch |
+| `external_id` | `externalId` (`ExternalId` value object) | unique (`externalid_org`), optional | Cross-system stable identifier — see [external ids](/core/external-id-and-identifiers) |
+
+### Construction patterns
+
+Three static factories are exposed:
+
+```java
+public static Office headOffice(final String name, final LocalDate openingDate, final ExternalId externalId) {
+    return new Office(null, name, openingDate, externalId);
+}
+
+public static Office fromJson(final Office parentOffice, final JsonCommand command) {
+    final String name = command.stringValueOfParameterNamed("name");
+    final LocalDate openingDate = command.localDateValueOfParameterNamed("openingDate");
+    final String externalId = command.stringValueOfParameterNamed("externalId");
+    return new Office(parentOffice, name, openingDate, ExternalIdFactory.produce(externalId));
+}
+```
+
+- `headOffice(...)` — used only by the tenant bootstrap to insert the root office. `parent` is `null`, `hierarchy` becomes `"."`.
+- `fromJson(...)` — used by `CreateOfficeCommandHandler` for every non-root office. The parent **must** be supplied (validated by `OfficeCommandFromApiJsonDeserializer`).
+- The constructor is private — `parent.addChild(this)` is called inside so the in-memory parent list stays consistent.
+
+### Hierarchy generation
+
+`generateHierarchy()` is called after persist; it walks one step to the parent and produces `parent.hierarchy + id + "."`:
+
+```java
+public void generateHierarchy() {
+    if (this.parent != null) {
+        this.hierarchy = this.parent.hierarchyOf(getId());
+    } else {
+        this.hierarchy = ".";
+    }
+}
+
+private String hierarchyOf(final Long id) {
+    return this.hierarchy + id.toString() + ".";
+}
+```
+
+So a head office with id `1` gets hierarchy `.1.`, a branch with id `5` under it gets `.1.5.`, a sub-branch with id `12` under that gets `.1.5.12.`. The `like '.1.%'` SQL pattern is then used as a read filter — see how `AppUser.validateHasReadPermission()` and most `*ReadPlatformServiceImpl` classes scope JDBC queries.
+
+### Re-parenting rules
+
+`update(JsonCommand)` performs **field-level diffing** and rejects two cases:
+
+- Trying to set a `parentId` on the head office:
+  ```java
+  if (command.parameterExists("parentId") && this.parent == null) {
+      throw new RootOfficeParentCannotBeUpdated();
+  }
+  ```
+- Trying to set the new parent to the office itself (caught by the second overload of `update(Office)`):
+  ```java
+  if (identifiedBy(newParent.getId())) {
+      throw new CannotUpdateOfficeWithParentOfficeSameAsSelf(getId(), newParent.getId());
+  }
+  this.parent = newParent;
+  generateHierarchy();
+  ```
+
+The actual write service additionally checks that the new parent is **not** in the sub-tree of the office being moved (so you can't make a child the parent of its ancestor). That walk uses `hasAnOfficeInHierarchyWithId(...)`:
+
+```java
+public boolean doesNotHaveAnOfficeInHierarchyWithId(final Long officeId) {
+    return !hasAnOfficeInHierarchyWithId(officeId);
+}
+```
+
+### Date helpers
+
+```java
+public boolean isOpeningDateBefore(final LocalDate baseDate) { return DateUtils.isBefore(getOpeningLocalDate(), baseDate); }
+public boolean isOpeningDateAfter (final LocalDate baseDate) { return DateUtils.isAfter (getOpeningLocalDate(), baseDate); }
+```
+
+Every command that books a transaction on an office (loan disbursal, savings deposit, journal entry…) consults `isOpeningDateBefore(transactionDate)` to reject back-dating before the branch was opened.
+
+## `OfficeTransaction` — inter-office cash movement
+
+`OfficeTransaction` is a lightweight ledger row that records cash being moved **between two offices**. It is not a GL journal; it is a simple per-office balance tracker used by `OfficeOpeningBalances` reports and `OfficeTransactionsApiResource`.
+
+```java
+// fineract-provider/.../office/domain/OfficeTransaction.java
+@Entity
+@Table(name = "m_office_transaction")
+public class OfficeTransaction extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "from_office_id")
+    private Office from;
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "to_office_id")
+    private Office to;
+
+    @Column(name = "transaction_date", nullable = false)
+    private LocalDate transactionDate;
+
+    @Embedded
+    private MonetaryCurrency currency;
+
+    @Column(name = "transaction_amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal transactionAmount;
+
+    @Column(name = "description", nullable = true, length = 100)
+    private String description;
+
+    public static OfficeTransaction fromJson(final Office fromOffice, final Office toOffice,
+                                             final Money amount, final JsonCommand command) {
+        final LocalDate transactionLocalDate = command.localDateValueOfParameterNamed("transactionDate");
+        final String description           = command.stringValueOfParameterNamed("description");
+        return new OfficeTransaction(fromOffice, toOffice, transactionLocalDate, amount, description);
+    }
+}
+```
+
+Notice that `MonetaryCurrency` is `@Embedded` so the row directly stores `currency_code` / `currency_digits` / `currency_multiplesof` alongside the amount. See [currencies and monetary](/organisation/currencies-and-monetary) for the embeddable structure.
+
+## Office opening balances
+
+The notion of an "office opening balance" is **not** a dedicated entity. It is computed from:
+
+- the office's `openingDate`,
+- the GL accounts marked as opening-balance accounts on `m_office` (via the `accounting` module), and
+- the sum of `OfficeTransaction` rows where the office is on the `from` or `to` side as of the as-of date.
+
+The read service surface that exposes the resulting figure is `OfficeReadPlatformService.retrieveOfficesOpeningBalances(...)`. The journal-entry write paths in the `accounting` package also consume `Office.openingDate` to reject back-dated entries.
+
+## `OfficesApiResource` — `/v1/offices`
+
+```java
+// fineract-provider/.../office/api/OfficesApiResource.java
+@Path("/v1/offices")
+@Component
+@Tag(name = "Offices", description = "Offices are used to model an MFIs structure. A hierarchical representation …")
+@RequiredArgsConstructor
+public class OfficesApiResource {
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "OFFICE";
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = Set.of(
+        "id", "name", "nameDecorated", "externalId", "openingDate",
+        "hierarchy", "parentId", "parentName", "allowedParents");
+    // …
+}
+```
+
+Every read endpoint calls `context.authenticatedUser().validateHasReadPermission("OFFICE")` before hitting the read service. Writes go through `PortfolioCommandSourceWritePlatformService.logCommandSource(...)` and therefore participate in [maker–checker](/core/commands-framework) and audit.
+
+### Endpoint reference
+
+| Method | Path | Handler | Command (write) | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/offices` | `retrieveOffices` | — | List offices; `?includeAllOffices=`, `?orderBy=`, `?sortOrder=` |
+| GET | `/v1/offices/template` | `retrieveOfficeTemplate` | — | Defaults + allowed parents for the create form |
+| GET | `/v1/offices/{officeId}` | `retrieveOffice` | — | One office; `?template=true` appends `allowedParents` |
+| GET | `/v1/offices/external-id/{externalId}` | `retrieveOfficeByExternalId` | — | Same as above by `ExternalId` |
+| POST | `/v1/offices` | `createOffice` | `CREATE_OFFICE` | Create branch; mandatory: `name`, `openingDate`, `parentId` |
+| PUT | `/v1/offices/{officeId}` | `updateOffice` | `UPDATE_OFFICE` | Field-level diff update |
+| PUT | `/v1/offices/external-id/{externalId}` | `updateOfficeWithExternalId` | `UPDATE_OFFICE` | Lookup then update by external id |
+| GET | `/v1/offices/downloadtemplate` | `getOfficeTemplate` | — | Bulk-import XLSX template (`application/vnd.ms-excel`) |
+| POST | `/v1/offices/uploadtemplate` | `postOfficeTemplate` | (bulk import job) | Multipart upload to ingest the filled template |
+
+### `GET /v1/offices`
+
+```java
+@GET
+public String retrieveOffices(@Context final UriInfo uriInfo,
+        @DefaultValue("false") @QueryParam("includeAllOffices") final boolean onlyManualEntries,
+        @QueryParam("orderBy") final String orderBy,
+        @QueryParam("sortOrder") final String sortOrder) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    sqlValidator.validate(orderBy);
+    sqlValidator.validate(sortOrder);
+    final SearchParameters searchParameters = SearchParameters.builder()
+        .orphansOnly(false).orderBy(orderBy).sortOrder(sortOrder).build();
+    final Collection<OfficeData> offices = readPlatformService.retrieveAllOffices(onlyManualEntries, searchParameters);
+    final ApiRequestJsonSerializationSettings settings = apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, offices, RESPONSE_DATA_PARAMETERS);
+}
+```
+
+`sqlValidator.validate(...)` rejects any non-allow-listed token in `orderBy` / `sortOrder` — this is the standard [SQL injection prevention](/security/sql-injection-prevention) hook applied to all sortable lists.
+
+### `POST /v1/offices`
+
+```java
+@POST
+public String createOffice(@Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .createOffice().withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+`commandsSourceWritePlatformService.logCommandSource(...)` records the source row in `m_portfolio_command_source` *before* dispatching to `CreateOfficeCommandHandler`, which:
+
+1. Validates the body via `OfficeCommandFromApiJsonDeserializer.validateForCreate(...)`.
+2. Loads the parent with `OfficeRepositoryWrapper.findOneWithNotFoundDetection(parentId)`.
+3. Builds the entity with `Office.fromJson(parent, command)` and saves it.
+4. Calls `generateHierarchy()` on the freshly assigned id and re-saves.
+
+### `PUT /v1/offices/{officeId}` and external-id variant
+
+The body is field-diffed by `Office.update(JsonCommand)` (see above). The external-id variant first does the lookup, then routes through the standard handler so the audit trail (`m_portfolio_command_source.resource_id`) is always the numeric office id.
+
+### Bulk import
+
+`getOfficeTemplate` / `postOfficeTemplate` use the shared [bulk import](/core/bulkimport) framework with `GlobalEntityType.OFFICES`. The downloaded XLSX includes a sheet of allowed parents; the upload returns a `Long importDocumentId` you can later poll via the import status APIs.
+
+## `OfficeTransactionsApiResource` — `/v1/officetransactions`
+
+```java
+@Path("/v1/officetransactions")
+@Component
+@RequiredArgsConstructor
+public class OfficeTransactionsApiResource {
+    private static final String RESOURCE_NAME_FOR_READ_PERMISSIONS = "OFFICE";
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = Set.of(
+        "id", "transactionDate", "fromOfficeId", "fromOfficeName", "toOfficeId", "toOfficeIdName",
+        "currencyCode", "digitsAfterDecimal", "inMultiplesOf", "transactionAmount", "description",
+        "allowedOffices", "currencyOptions");
+    // …
+}
+```
+
+| Method | Path | Handler | Command | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/officetransactions` | `retrieveOfficeTransactions` | — | List all inter-office transactions |
+| GET | `/v1/officetransactions/template` | `newOfficeTransactionDetails` | — | Allowed offices + currency options |
+| POST | `/v1/officetransactions` | `transferMoneyFrom` | `CREATE_OFFICETRANSACTION` | Book a transfer |
+| DELETE | `/v1/officetransactions/{transactionId}` | `delete` | `DELETE_OFFICETRANSACTION` | Soft-delete a transfer |
+
+Read permissions reuse `OFFICE`; the writes use the `OFFICETRANSACTION` resource code (`CREATE_OFFICETRANSACTION`, `DELETE_OFFICETRANSACTION`) — these are emitted as `taskPermissionName` on the wrapped command and matched against `m_permission` rows.
+
+The create body shape (from `OfficeTransactionCommandFromApiJsonDeserializer`):
+
+```json
+{
+  "fromOfficeId": 1,
+  "toOfficeId":   3,
+  "transactionDate": "12 May 2024",
+  "transactionAmount": 1000.00,
+  "currencyCode": "USD",
+  "description": "Cash top-up to branch",
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Either `fromOfficeId` or `toOfficeId` may be null (one-sided cash injection / drawdown), but **not both**. The validator additionally rejects equal `fromOfficeId` and `toOfficeId`.
+
+## Repository wrappers and error contract
+
+`OfficeRepositoryWrapper` is the universally injected accessor; it raises a typed `OfficeNotFoundException` instead of returning empty:
+
+```java
+public Office findOneWithNotFoundDetection(final Long id) {
+    return this.repository.findById(id).orElseThrow(() -> new OfficeNotFoundException(id));
+}
+```
+
+Mapped through `ExceptionMappers` to `404 office.not.found`. Other relevant errors:
+
+| Exception | HTTP | Message key |
+| --- | --- | --- |
+| `OfficeNotFoundException` | 404 | `error.msg.office.id.invalid` |
+| `RootOfficeParentCannotBeUpdated` | 403 | `error.msg.office.root.cannot.update.parent` |
+| `CannotUpdateOfficeWithParentOfficeSameAsSelf` | 403 | `error.msg.office.parent.cannot.be.same.as.self` |
+| `InvalidOfficeException` | 400 | `error.msg.office.invalid` (e.g. circular parent) |
+| `OfficeTransactionNotFoundException` | 404 | `error.msg.officetransaction.id.invalid` |
+
+## Permission codes
+
+The bootstrap seed (`m_permission`) installs:
+
+| Grouping | Code |
+| --- | --- |
+| `organisation` | `READ_OFFICE` |
+| `organisation` | `CREATE_OFFICE`, `CREATE_OFFICE_CHECKER` |
+| `organisation` | `UPDATE_OFFICE`, `UPDATE_OFFICE_CHECKER` |
+| `organisation` | `CREATE_OFFICETRANSACTION`, `CREATE_OFFICETRANSACTION_CHECKER` |
+| `organisation` | `DELETE_OFFICETRANSACTION`, `DELETE_OFFICETRANSACTION_CHECKER` |
+
+The `*_CHECKER` variants are the [maker–checker](/core/commands-framework) approval permissions. They appear in the matrix returned by `GET /v1/permissions?makerCheckerable=true`.
+
+## How `Office` plumbs into other modules
+
+- **Clients / Groups / Loans / Savings**: every aggregate carries an `office_id` FK and additionally a denormalised `office_joining_date` on clients. Loan disbursal rejects dates before `office.openingDate`.
+- **AppUser**: `m_appuser.office_id` is mandatory; the user's `office.hierarchy` is what filters their reads ("staff in office hierarchy", "loans in office hierarchy", …). See [users domain](/users/users-domain).
+- **GL journal entries**: `m_journal_entry.office_id` is mandatory and the office's chart-of-accounts links live in `m_office_charge` / `m_org_running_balance`.
+- **Holiday**: `Holiday` ↔ `Office` is many-to-many via `m_holiday_office`; the resolver in `HolidayRepositoryWrapper.findByOfficeAndGreaterThanDate(...)` is what `loan` rescheduling consults — see [holidays](/organisation/holidays).
+- **Staff**: `Staff.office` is the home branch and `StaffReadServiceImpl` exposes the optional "staff in office hierarchy" join. See [staff](/organisation/staff).
+
+## See also
+
+- [Organisation shared domain](/core/organisation-shared-domain) — full package map.
+- [Staff](/organisation/staff) — employees that own loans and clients within an office.
+- [Holidays](/organisation/holidays) — per-office calendars and repayment rescheduling.
+- [Currencies and monetary](/organisation/currencies-and-monetary) — `ApplicationCurrency`, `MonetaryCurrency`, `Money`.
+- [Organisation APIs](/api/organisation-apis) — Swagger DTOs and example payloads for `/v1/offices` and `/v1/officetransactions`.
+- [User administration domain](/core/useradministration-domain) — how `AppUser.office.hierarchy` drives row-level filters.
+- [Security overview](/security/overview) — `OFFICE` permission resource and hierarchy scoping.

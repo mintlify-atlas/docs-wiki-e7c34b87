@@ -1,0 +1,351 @@
+---
+title: "OkHttp Client Configuration for Outbound HTTP Calls"
+sidebarTitle: "OkHttp Config"
+description: "OkHttp3Config builds the shared OkHttpClient bean with connect/read/write timeouts and an optional insecure TLS mode used by hooks and credit bureaus."
+---
+
+Apache Fineract makes outbound HTTP calls for hook notifications,
+credit-bureau lookups, SMS gateways, and image / document fetches from external
+URLs. All of these go through a **single shared `OkHttpClient` bean** built by
+`OkHttp3Config`. Centralizing the client means timeouts, TLS posture and
+connection pooling are consistent and tunable from one place.
+
+This page describes the configuration and enumerates the call sites that
+inject it.
+
+## Source
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/OkHttp3Config.java`
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class OkHttp3Config {
+
+    private final FineractProperties fineractProperties;
+
+    @Bean
+    public OkHttpClient okHttpClient() throws Exception {
+        var okBuilder = new OkHttpClient.Builder()
+                .connectTimeout(Duration.ofSeconds(fineractProperties.getClientConnectTimeout()))
+                .readTimeout(Duration.ofSeconds(fineractProperties.getClientReadTimeout()))
+                .writeTimeout(Duration.ofSeconds(fineractProperties.getClientWriteTimeout()));
+
+        if (Boolean.TRUE.equals(fineractProperties.getInsecureHttpClient())) {
+            final X509TrustManager insecureX509TrustManager = new X509TrustManager() {
+                @Override
+                public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
+                @Override
+                public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
+                @Override
+                public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[] {}; }
+            };
+
+            SSLContext insecureSSLContext = SSLContext.getInstance("TLS");
+            insecureSSLContext.init(null, new TrustManager[] { insecureX509TrustManager }, new SecureRandom());
+
+            okBuilder.sslSocketFactory(insecureSSLContext.getSocketFactory(), insecureX509TrustManager);
+            HostnameVerifier insecureHostnameVerifier = (hostname, session) -> true;
+            okBuilder.hostnameVerifier(insecureHostnameVerifier);
+        }
+
+        return okBuilder.build();
+    }
+}
+```
+
+## Configuration knobs
+
+All three timeouts and the insecure switch are read directly from
+`FineractProperties`, which means they are bound from `application.properties`
+keys:
+
+| Property | Maps to |
+| --- | --- |
+| `fineract.clientConnectTimeout` | `OkHttpClient.Builder.connectTimeout(Duration.ofSeconds(...))` |
+| `fineract.clientReadTimeout` | `OkHttpClient.Builder.readTimeout(...)` |
+| `fineract.clientWriteTimeout` | `OkHttpClient.Builder.writeTimeout(...)` |
+| `fineract.insecureHttpClient` | Enables the trust-all `X509TrustManager` and `HostnameVerifier` |
+
+The three timeout properties accept seconds (not millis, not `Duration` strings)
+because the code does `Duration.ofSeconds(int)`. Defaults are defined inside
+`FineractProperties`.
+
+## Insecure mode — what it actually does
+
+When `fineract.insecureHttpClient=true`:
+
+1. A custom `X509TrustManager` is installed that no-ops both
+   `checkClientTrusted` and `checkServerTrusted` and returns an empty
+   `getAcceptedIssuers` array. The two `// NOSONAR` comments are deliberate —
+   SonarQube would otherwise flag this as a high-severity finding.
+2. The `SSLContext` is initialized in `TLS` mode with that single trust manager.
+3. A `HostnameVerifier` that returns `true` for every host/session pair is
+   installed.
+4. Both are attached to the builder via `sslSocketFactory(...)` and
+   `hostnameVerifier(...)`.
+
+The end result: the client will negotiate TLS with **any** server certificate,
+including self-signed and expired ones, and accept **any** hostname mismatch.
+**Never enable this in production.** It exists so QA environments can talk to
+mock servers using ad-hoc certs.
+
+The class is annotated `@Slf4j` even though the configuration code never logs
+anything itself — leaving a logger in place makes it trivial to add a warning
+if the insecure mode is ever flipped on in production.
+
+## Single shared client
+
+The bean is registered without any qualifier. Spring will inject the same
+`OkHttpClient` singleton wherever it is `@Autowired`. OkHttp is designed for
+this — `OkHttpClient` instances are thread-safe, share a connection pool, and
+are intended to be long-lived.
+
+If a call site needs a one-off configuration (e.g. an extra interceptor),
+the OkHttp idiom is:
+
+```java
+OkHttpClient specialized = sharedClient.newBuilder()
+    .addInterceptor(new MyInterceptor())
+    .build();
+```
+
+`newBuilder()` shares the underlying connection pool with `sharedClient`, so no
+resources are duplicated.
+
+## Call sites
+
+Inside `fineract-provider`, two production call sites inject the bean:
+
+### 1. Hook processor
+
+File:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/hooks/processor/ProcessorHelper.java`
+
+Hooks dispatch HTTP notifications when entities change (loan disbursed,
+client created, etc.). `ProcessorHelper` wraps the shared `OkHttpClient` and
+makes the POST call to the configured webhook URL. It also handles SSL
+context when a tenant supplies its own trust store via the
+`m_external_service_properties` table.
+
+### 2. Credit bureau integration (ThitsaWorks)
+
+File:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/creditbureau/service/ThitsaWorksCreditBureauIntegrationWritePlatformServiceImpl.java`
+
+This integration calls the ThitsaWorks credit-bureau REST API to fetch credit
+reports. The shared client handles the HTTPS handshake and the timeouts.
+
+Inside other Gradle modules, additional call sites use the same bean (SMS
+gateways like Twilio, the Mojaloop interoperation client, image fetchers).
+Because OkHttp is the chosen HTTP client across the codebase, anything that
+needs to make an outbound request injects this bean.
+
+## Why OkHttp (and not RestTemplate / WebClient)?
+
+- **OkHttp is the de-facto standard** for Java HTTP clients in 2020s code.
+  Spring Boot's auto-configuration even has an `OkHttpClientHttpRequestFactory`.
+- **Predictable connection pooling.** OkHttp's pool is keyed by host+port and
+  evicts idle connections aggressively, which is good for the long-lived
+  Fineract process.
+- **Cleaner timeout semantics.** OkHttp distinguishes connect vs read vs write
+  vs call timeouts; `RestTemplate` historically conflates them.
+- **Interceptor model.** Easier to plug in logging / retries / OAuth2 token
+  injection.
+
+`WebClient` (the reactive option) is intentionally not used — Fineract is a
+thread-per-request servlet application; introducing reactive plumbing for one
+client would not pay back.
+
+## What this class does NOT do
+
+- It does **not** set up a `ConnectionPool` explicitly. OkHttp's default
+  (5 idle connections per host, 5-minute keep-alive) is used.
+- It does **not** add any interceptors — call sites add their own
+  (auth, logging, retry).
+- It does **not** wire a `Call.Factory` or `Authenticator`. Each integration
+  authenticates per-request as needed.
+- It does **not** enable HTTP/2. OkHttp uses HTTP/2 automatically when the
+  server supports it via ALPN; no opt-in is required.
+- It does **not** register an `EventListener.Factory` for metrics. Outbound
+  HTTP calls are not currently surfaced as Micrometer metrics — only
+  application-level `@Timed` annotations on the calling method are. See
+  [Metrics Config](/provider/metrics-config).
+
+## Production checklist
+
+Before exposing a hook URL or credit-bureau endpoint over the public internet:
+
+- Confirm `fineract.insecureHttpClient` is unset or `false`.
+- Set conservative timeouts. The defaults are short for a reason — a hook
+  that hangs on a slow server will tie up a Tomcat thread otherwise. Hooks
+  also run on a dedicated `ThreadPoolTaskExecutor` (see
+  [Task Executor Config](/provider/task-executor-config)) so the impact is
+  bounded but still real.
+- Verify the JVM trust store contains the upstream CA certs. If you must
+  pin a custom CA, do it system-wide via `-Djavax.net.ssl.trustStore=...`
+  rather than re-enabling the insecure switch.
+
+## Adding interceptors to a per-call site
+
+If you need request/response logging for a specific integration, derive a
+specialized client without dropping the shared connection pool:
+
+```java
+@Service
+public class CreditBureauHttpClient {
+
+    private final OkHttpClient client;
+
+    public CreditBureauHttpClient(OkHttpClient sharedClient) {
+        HttpLoggingInterceptor logging = new HttpLoggingInterceptor(log::debug);
+        logging.setLevel(HttpLoggingInterceptor.Level.BASIC);
+
+        this.client = sharedClient.newBuilder()
+            .addInterceptor(logging)
+            .build();
+    }
+
+    public Response lookup(Request request) throws IOException {
+        return client.newCall(request).execute();
+    }
+}
+```
+
+`HttpLoggingInterceptor` belongs to `okhttp3-logging-interceptor`, which is
+already on the classpath via `fineract-provider/dependencies.gradle`.
+`Level.BASIC` logs just the request line and response status. `Level.HEADERS`
+adds headers. `Level.BODY` adds bodies — **never** enable that in production
+for sensitive integrations.
+
+## Adding retries
+
+OkHttp does not retry application-level errors (HTTP 5xx) by default — only
+connection failures and idempotent-method retries. For business-logic retries
+(429 throttling, transient 503), add an `Interceptor`:
+
+```java
+class RetryOn5xxInterceptor implements Interceptor {
+    private final int maxRetries = 3;
+
+    @Override
+    public Response intercept(Chain chain) throws IOException {
+        Request request = chain.request();
+        Response response = chain.proceed(request);
+        int attempts = 0;
+        while (response.code() >= 500 && attempts < maxRetries) {
+            response.close();
+            attempts++;
+            try { Thread.sleep(100L * (1L << attempts)); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+            response = chain.proceed(request);
+        }
+        return response;
+    }
+}
+```
+
+Attach it to a per-integration client via `newBuilder().addInterceptor(...)`.
+
+## TLS pinning (optional hardening)
+
+For integrations against a stable upstream that publishes its certificate
+fingerprint, pin the cert to defeat MITM attacks even when the system trust
+store is compromised:
+
+```java
+OkHttpClient pinned = sharedClient.newBuilder()
+    .certificatePinner(new CertificatePinner.Builder()
+        .add("api.upstream.example.com",
+             "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        .build())
+    .build();
+```
+
+This is *not* configured by the base `OkHttp3Config` — adding it is a per-
+integration decision. The Fineract project does not currently pin any upstream.
+
+## Sizing for high-throughput hook deployments
+
+If a tenant configures hundreds of hooks that fire on every loan repayment,
+the shared client can become a bottleneck. Considerations:
+
+- **Default dispatcher limits.** OkHttp's `Dispatcher` has a max concurrent
+  request count of 64 and a per-host max of 5. For a single high-volume
+  webhook destination, the per-host limit dominates.
+- **Tuning.** Increase via:
+  ```java
+  Dispatcher dispatcher = client.dispatcher();
+  dispatcher.setMaxRequests(256);
+  dispatcher.setMaxRequestsPerHost(64);
+  ```
+  But note that more concurrent connections also stress the upstream — be
+  considerate.
+- **Per-tenant clients.** Not currently supported. All tenants share the same
+  client, which means a noisy tenant can starve a quiet one. If multi-tenant
+  isolation becomes a requirement, the bean would need to be made tenant-aware.
+
+## Why timeouts are seconds, not ISO durations
+
+The choice of `Duration.ofSeconds(int)` rather than the more flexible
+`Duration` property type means you cannot express sub-second timeouts in the
+properties file. For most outbound integrations 1 second is a sensible minimum
+anyway, and integer seconds are unambiguous across operators who may not be
+fluent in `PT0.5S` ISO-8601 duration syntax.
+
+If you need sub-second precision for a particular integration, derive a
+specialized client via `newBuilder().connectTimeout(Duration.ofMillis(750)).build()`
+in the consuming code.
+
+## Lifecycle
+
+`OkHttpClient` does not implement Spring's `DisposableBean` interface. When the
+application shuts down, the JVM-wide thread pools OkHttp uses
+(`Dispatcher.executorService()` and the connection pool's eviction thread) will
+terminate when the JVM exits. There is no need to explicitly close the bean.
+
+For a long-running unit test that creates and discards many clients, however,
+you should call `client.dispatcher().executorService().shutdown()` and
+`client.connectionPool().evictAll()` to avoid file-descriptor leaks. The
+`OkHttp3Config` bean itself is created once and reused — this matters only if
+test code instantiates its own `OkHttpClient` instances.
+
+## What the `RequiredArgsConstructor` annotation does
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class OkHttp3Config {
+    private final FineractProperties fineractProperties;
+    ...
+}
+```
+
+`@RequiredArgsConstructor` is Lombok — it generates a constructor with one
+parameter for each `final` field. Spring then uses constructor-injection to
+supply `FineractProperties`. The equivalent Spring-idiomatic code without
+Lombok would be:
+
+```java
+public OkHttp3Config(FineractProperties fineractProperties) {
+    this.fineractProperties = fineractProperties;
+}
+```
+
+This pattern is repeated across the provider's configuration classes — see
+[OkHttp3Config](#source), `JPAConfig` (constructor injection without Lombok),
+`FineractStartupValidationConfig` (constructor injection with Lombok).
+
+## Related pages
+
+- [Provider Overview](/provider/overview) — module map.
+- [Task Executor Config](/provider/task-executor-config) — the executor that
+  runs hook dispatch off the request thread.
+- [Spring Config](/provider/spring-config) — sibling configuration for the
+  event multicaster (where hook fire-and-forget originates).
+- [Metrics Config](/provider/metrics-config) — for instrumenting the calls.
+- [Provider Security Config](/provider/security-config) — the
+  `IdempotencyStoreFilter` cooperates with OkHttp by ensuring upstream
+  retries do not double-execute side effects.

@@ -1,0 +1,455 @@
+---
+title: "LoanReadPlatformService JDBC Queries and RowMappers"
+sidebarTitle: "Read Service"
+description: "Apache Fineract LoanReadPlatformServiceImpl projects m_loan rows into LoanAccountData: SQL builders, RowMappers, pagination, template queries."
+---
+
+`LoanReadPlatformService` is the JDBC-backed query layer of Apache Fineract's loan module. Unlike the write services, which work with the `Loan` JPA entity, the read side is hand-written SQL projected straight into immutable DTOs (`LoanAccountData`, `LoanTransactionData`, `LoanScheduleData`, …). The interface is in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanReadPlatformService.java`; the implementation is `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanReadPlatformServiceImpl.java` — 2,309 lines.
+
+This page documents the key entry points, the `LoanMapper` row-mapper, the SQL schema assembled at runtime, and the pagination contract.
+
+## Entry-point catalogue
+
+The interface declares 40+ methods. Grouped:
+
+### Loan retrieval
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `retrieveOne(Long loanId)` | `LoanAccountData` | Single loan by id |
+| `retrieveLoanByLoanAccount(String accountNo)` | `LoanAccountData` | By human account number |
+| `retrieveAll(SearchParameters)` | `Page<LoanAccountData>` | Hierarchy-scoped, filtered, paged |
+| `retrieveGLIMChildLoansByGLIMParentAccount(String)` | `List<LoanAccountData>` | GLIM children |
+| `getLoanIdByLoanExternalId(String externalId)` | `Long` | Externals → internal id |
+| `retrieveLoanIdByAccountNumber(String)` | `Long` | Account no → id |
+| `getResolvedLoanId(ExternalId)` | `Long` | Helper used by every resource |
+| `fetchRepaymentScheduleData(LoanAccountData)` | `LoanAccountData` (mutated) | Lazy-load repayment schedule into the DTO |
+
+### Template (form defaults)
+
+| Method | Returns |
+| --- | --- |
+| `retrieveTemplateWithClientAndProductDetails(Long clientId, Long productId)` | `LoanAccountData` |
+| `retrieveTemplateWithGroupAndProductDetails(Long groupId, Long productId)` | `LoanAccountData` |
+| `retrieveTemplateWithCompleteGroupAndProductDetails(Long groupId, Long productId)` | `LoanAccountData` |
+| `retrieveLoanProductDetailsTemplate(Long productId, Long clientId, Long groupId)` | `LoanAccountData` |
+| `retrieveApprovalTemplate(Long loanId)` | `LoanApprovalData` |
+| `retrieveDisbursalTemplate(Long loanId, boolean paymentDetailsRequired)` | `LoanTransactionData` |
+| `retrieveRecoveryPaymentTemplate(Long loanId)` | `LoanTransactionData` |
+| `retrieveLoanWriteoffTemplate(Long loanId)` | `LoanTransactionData` |
+| `retrieveLoanReAgeTemplate(Long loanId)` / `retrieveLoanReAmortizationTemplate(Long loanId)` | `LoanTransactionData` |
+| `retrieveLoanChargeOffTemplate(Long loanId)` | `LoanTransactionData` |
+| `retrieveLoanForeclosureTemplate(Long loanId, LocalDate transactionDate)` | `LoanTransactionData` |
+| `retrieveRefundByCashTemplate(Long loanId)` / `retrieveCreditBalanceRefundTemplate(Long loanId)` | `LoanTransactionData` |
+| `retrieveWaiveInterestDetails(Long loanId)` | `LoanTransactionData` |
+| `retrieveNewClosureDetails()` | `LoanTransactionData` |
+| `retrieveLoanPrePaymentTemplate(LoanTransactionType, Long loanId, LocalDate)` | `LoanTransactionData` |
+| `retrieveLoanTransactionTemplate(Long loanId)` / `(Long loanId, LoanTransactionType, ...)` | `LoanTransactionData` |
+
+### Transactions
+
+| Method | Returns | Notes |
+| --- | --- | --- |
+| `retrieveLoanTransactions(Long loanId)` | `Collection<LoanTransactionData>` | All (legacy) |
+| `retrieveLoanTransactions(Long loanId, Set<LoanTransactionType> excluded, Pageable)` | `Page<LoanTransactionData>` | JPA Criteria + filter |
+| `retrieveLoanTransaction(Long loanId, Long transactionId)` | `LoanTransactionData` | Single |
+| `retrieveMinimumDateOfRepaymentTransaction(Long loanId)` | `LocalDate` | For UI date pickers |
+| `retrieveTotalPaidInAdvance(Long loanId)` | `PaidInAdvanceData` | Sum of advance-paid amounts |
+
+### Schedule and disbursement
+
+| Method | Returns |
+| --- | --- |
+| `retrieveRepaymentSchedule(Long loanId, RepaymentScheduleRelatedLoanData, Collection<DisbursementData>, Collection<LoanTransactionRepaymentPeriodData>, boolean, LoanScheduleType)` | `LoanScheduleData` |
+| `retrieveNumberOfRepayments(Long loanId)` | `Integer` |
+| `retrieveLoanDisbursementDetails(Long loanId)` | `Collection<DisbursementData>` |
+| `retrieveLoanDisbursementDetails(List<Long>)` | `Map<Long, List<DisbursementData>>` |
+| `retrieveLoanDisbursementDetail(Long loanId, Long disbursementId)` | `DisbursementData` |
+
+### Overdue / arrears
+
+| Method | Returns |
+| --- | --- |
+| `retrieveAllLoansWithOverdueInstallments(Long penaltyWaitPeriod, ...)` | `Collection<OverdueLoanScheduleData>` |
+| `retrieveAllOverdueInstallmentsForLoan(Loan loan)` | `Collection<OverdueLoanScheduleData>` |
+| `retrieveLoanIdsWithPendingIncomePostingTransactions()` | `Collection<Long>` |
+
+### Misc
+
+| Method | Returns |
+| --- | --- |
+| `retrieveCalendars(Long groupId)` | `Collection<CalendarData>` |
+| `retrieveAllowedLoanOfficers(Long officeId, boolean staffInSelectedOfficeOnly)` | `Collection<StaffData>` |
+| `retrieveLoanInterestRatePeriodData(LoanAccountData)` | `Collection<InterestRatePeriodData>` |
+
+## `retrieveOne` step-by-step
+
+The simplest non-trivial entry point:
+
+```java
+@Override
+public LoanAccountData retrieveOne(final Long loanId) {
+    try {
+        final String hierarchy = getHierarchyString();
+        final String hierarchySearchString = hierarchy + "%";
+
+        final LoanMapper rm = new LoanMapper(sqlGenerator, delinquencyReadPlatformService);
+
+        final StringBuilder sqlBuilder = new StringBuilder();
+        sqlBuilder.append("select ");
+        sqlBuilder.append(rm.loanSchema());
+        sqlBuilder.append(" join m_office o on (o.id = c.office_id or o.id = g.office_id) ");
+        sqlBuilder.append(" left join m_office transferToOffice on transferToOffice.id = c.transfer_to_office_id ");
+        sqlBuilder.append(" where l.id=? and ( o.hierarchy like ? or transferToOffice.hierarchy like ?)");
+
+        return this.jdbcTemplate.queryForObject(sqlBuilder.toString(), rm, loanId,
+                                                hierarchySearchString, hierarchySearchString);
+    } catch (final EmptyResultDataAccessException e) {
+        throw new LoanNotFoundException(loanId, e);
+    }
+}
+```
+
+Three things to notice:
+
+1. **Hierarchy scoping**: the user's office hierarchy is appended with `%` and matched against `m_office.hierarchy` — Fineract's standard data-scoping pattern. A loan owned by an office outside the caller's hierarchy is not returned (404).
+2. **`LoanMapper.loanSchema()`** assembles the SELECT clause. The mapper knows every column it needs by name.
+3. **Throw, not return null**: `EmptyResultDataAccessException` becomes `LoanNotFoundException` (HTTP 404). The pattern is consistent across all single-row methods.
+
+## `retrieveAll` and pagination
+
+```java
+@Override
+public Page<LoanAccountData> retrieveAll(final SearchParameters searchParameters) {
+
+    final AppUser currentUser = this.context.authenticatedUser();
+    final String hierarchy = currentUser.getOffice().getHierarchy();
+    final String hierarchySearchString = hierarchy + "%";
+    final LoanMapper loanMapper = new LoanMapper(sqlGenerator, delinquencyReadPlatformService);
+
+    final StringBuilder sqlBuilder = new StringBuilder(200);
+    sqlBuilder.append("select " + sqlGenerator.calcFoundRows() + " ");
+    sqlBuilder.append(loanMapper.loanSchema());
+    sqlBuilder.append(" join m_office o on (o.id = c.office_id or o.id = g.office_id) ");
+    sqlBuilder.append(" left join m_office transferToOffice on transferToOffice.id = c.transfer_to_office_id ");
+    sqlBuilder.append(" where ( o.hierarchy like ? or transferToOffice.hierarchy like ?)");
+
+    int arrayPos = 2;
+    List<Object> extraCriterias = new ArrayList<>();
+    extraCriterias.add(hierarchySearchString);
+    extraCriterias.add(hierarchySearchString);
+
+    if (searchParameters != null) {
+        if (StringUtils.isNotBlank(searchParameters.getStatus())) {
+            sqlBuilder.append(" and l.loan_status_id = ?");
+            extraCriterias.add(Integer.parseInt(searchParameters.getStatus()));
+            arrayPos = arrayPos + 1;
+        }
+        if (StringUtils.isNotBlank(searchParameters.getExternalId())) {
+            sqlBuilder.append(" and l.external_id = ?");
+            extraCriterias.add(searchParameters.getExternalId());
+            arrayPos = arrayPos + 1;
+        }
+        if (searchParameters.getOfficeId() != null) {
+            sqlBuilder.append("and c.office_id =?");
+            extraCriterias.add(searchParameters.getOfficeId());
+            arrayPos = arrayPos + 1;
+        }
+        if (StringUtils.isNotBlank(searchParameters.getAccountNo())) {
+            sqlBuilder.append(" and l.account_no = ?");
+            extraCriterias.add(searchParameters.getAccountNo());
+            arrayPos = arrayPos + 1;
+        }
+        if (searchParameters.getClientId() != null) {
+            sqlBuilder.append(" and l.client_id = ?");
+            extraCriterias.add(searchParameters.getClientId());
+            arrayPos = arrayPos + 1;
+        }
+        if (searchParameters.hasOrderBy()) {
+            sqlBuilder.append(" order by ").append(searchParameters.getOrderBy());
+            this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getOrderBy());
+            if (searchParameters.hasSortOrder()) {
+                sqlBuilder.append(' ').append(searchParameters.getSortOrder());
+                this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getSortOrder());
+            }
+        }
+        if (searchParameters.hasLimit()) {
+            sqlBuilder.append(" ");
+            if (searchParameters.hasOffset()) {
+                sqlBuilder.append(sqlGenerator.limit(searchParameters.getLimit(), searchParameters.getOffset()));
+            } else {
+                sqlBuilder.append(sqlGenerator.limit(searchParameters.getLimit()));
+            }
+        }
+    }
+    final Object[] objectArray = extraCriterias.toArray();
+    final Object[] finalObjectArray = Arrays.copyOf(objectArray, arrayPos);
+    return this.paginationHelper.fetchPage(this.jdbcTemplate, sqlBuilder.toString(),
+                                           finalObjectArray, loanMapper);
+}
+```
+
+The pieces:
+
+- **`DatabaseSpecificSQLGenerator sqlGenerator`** — abstracts MySQL vs PostgreSQL differences. `calcFoundRows()` emits `SQL_CALC_FOUND_ROWS` (MySQL) or `count(*) over()` (Postgres).
+- **`SqlValidator columnValidator`** — every dynamic-injection vector (`orderBy`, `sortOrder`) is screened by `validateSqlInjection`.
+- **`PaginationHelper`** — runs the page query, runs the count query, builds `Page<LoanAccountData>` with `totalFilteredRecords` and `pageItems`. The total count is extracted using the platform-specific mechanism.
+- **`SearchParameters`** is the bundled filter (`status`, `externalId`, `officeId`, `accountNo`, `clientId`, `orderBy`, `sortOrder`, `limit`, `offset`). Built from `UriInfo.getQueryParameters()` in `LoansApiResource.retrieveAll(...)`.
+
+## `LoanMapper` — the workhorse RowMapper
+
+`LoanMapper` is the private static inner class that knows the giant SELECT clause. The schema starts:
+
+```java
+public String loanSchema() {
+    return "l.id as id, l.account_no as accountNo, l.external_id as externalId, "
+         + "l.fund_id as fundId, f.name as fundName, "
+         + "l.loan_type_enum as loanType, l.loanpurpose_cv_id as loanPurposeId, "
+         + "cv.code_value as loanPurposeName, "
+         + "lp.id as loanProductId, lp.name as loanProductName, "
+         + "lp.description as loanProductDescription, "
+         + "lp.is_linked_to_floating_interest_rates as isLoanProductLinkedToFloatingRate, "
+         + "lp.allow_variabe_installments as isvariableInstallmentsAllowed, "
+         + "lp.allow_multiple_disbursals as multiDisburseLoan, "
+         + "lp.disallow_expected_disbursements as disallowExpectedDisbursements, "
+         /* … hundreds of columns continue … */
+         + " from m_loan l "
+         + " join m_product_loan lp on lp.id = l.product_id "
+         + " left join m_currency rc on rc.code = l.currency_code "
+         + " left join m_client c on c.id = l.client_id "
+         + " left join m_group g on g.id = l.group_id "
+         + " left join m_appuser as approvedby on approvedby.id = l.approvedon_userid "
+         + " left join m_appuser as disbursedby on disbursedby.id = l.disbursedon_userid "
+         + " left join m_appuser as closedby on closedby.id = l.closedon_userid "
+         + " left join m_appuser as rejectedby on rejectedby.id = l.rejectedon_userid "
+         + " left join m_appuser as withdrawnby on withdrawnby.id = l.withdrawnon_userid "
+         + " left join m_appuser as submittedby on submittedby.id = l.submittedon_userid "
+         + " left join m_fund f on f.id = l.fund_id "
+         + " left join m_staff s on s.id = l.loan_officer_id "
+         + " left join m_code_value cv on cv.id = l.loanpurpose_cv_id ";
+}
+```
+
+The mapper materialises:
+
+- The `LoanStatus`, `LoanSubStatus`, `AccountType` enums (via `LoanEnumerations`).
+- The `Timeline` (`submittedOnDate`, `approvedOnDate`, `actualDisbursementDate`, `closedOnDate`, etc.) with `*By` user names.
+- The `CurrencyData`.
+- The `LoanProductData` lookup info.
+- The complete denormalised `LoanSummary` (`totalPrincipalDisbursed`, `totalPrincipalRepaid`, …).
+- The delinquency tag set (via `DelinquencyReadPlatformService.retrieveCurrentTags(loanId)`).
+
+The output is `LoanAccountData` — an immutable builder-style DTO with ~120 fields. The API response is filtered against the caller's `?fields=...` parameter at the `DefaultToApiJsonSerializer` layer.
+
+## `retrieveRepaymentSchedule`
+
+```java
+@Override
+public LoanScheduleData retrieveRepaymentSchedule(Long loanId,
+        RepaymentScheduleRelatedLoanData repaymentScheduleRelatedLoanData,
+        Collection<DisbursementData> disbursementData,
+        Collection<LoanTransactionRepaymentPeriodData> capitalizedIncomeData,
+        boolean isInterestRecalculationEnabled,
+        LoanScheduleType loanScheduleType) { … }
+```
+
+Internally a `LoanScheduleResultSetExtractor` is used (custom `ResultSetExtractor`, not a `RowMapper`, because periods must be aggregated across rows). The SQL pulls `m_loan_repayment_schedule` joined with `m_loan_repayment_schedule` history for archived periods, and merges `disbursementData` from `m_loan_disbursement_detail`.
+
+## `retrieveLoanTransactions(Long, Set<LoanTransactionType>, Pageable)`
+
+This is the JPA-Criteria path (most read methods are pure JDBC, but transaction filtering is easier with JPA):
+
+```java
+@Override
+public org.springframework.data.domain.Page<LoanTransactionData> retrieveLoanTransactions(
+        @NotNull Long loanId, Set<LoanTransactionType> excludedTransactionTypes, Pageable pageable) {
+    final org.springframework.data.domain.Page<LoanTransaction> transactionPage =
+        loanTransactionRepository.findAll((root, query, builder) -> {
+            List<Predicate> predicates = new ArrayList<>();
+            final Join<Object, Object> loanjoin = root.join("loan");
+            predicates.add(builder.equal(loanjoin.get("id"), loanId));
+            if (excludedTransactionTypes != null && !excludedTransactionTypes.isEmpty()) {
+                predicates.add(builder.not(root.get("typeOf").in(excludedTransactionTypes.stream().toList())));
+            }
+            return builder.and(predicates.toArray(new Predicate[] {}));
+        }, pageable);
+
+    return transactionPage.map(loanTransactionMapper::mapLoanTransaction);
+}
+```
+
+`loanTransactionMapper` is a MapStruct mapper (`LoanTransactionMapper` in `fineract-loan/.../mapper/`) that projects `LoanTransaction → LoanTransactionData`.
+
+## `retrieveLoanTransaction(Long, Long)`
+
+Single transaction by id:
+
+```java
+@Override
+public LoanTransactionData retrieveLoanTransaction(final Long loanId, final Long transactionId) {
+    try {
+        // Hand-written SQL via LoanTransactionMapper.schema()
+        LoanTransactionData loanTransactionData = this.jdbcTemplate.queryForObject(sql, ..., transactionMapper);
+        // Hydrate the LoanChargePaidBy trail
+        loanTransactionData.setLoanChargePaidByList(
+            loanChargePaidByReadService.fetchLoanChargesPaidByDataTransactionId(transactionId));
+        // Hydrate LoanTransactionRelation chain (chargeback/replay/adjustment links)
+        loanTransactionData.setTransactionRelations(
+            loanTransactionRelationReadService.fetchLoanTransactionRelationDataFrom(loanTransactionData.getId()));
+        return loanTransactionData;
+    } catch (EmptyResultDataAccessException e) {
+        throw new LoanTransactionNotFoundException(transactionId, e);
+    }
+}
+```
+
+## Template queries
+
+Every `?command=...` POST has a corresponding `GET /template?command=...` that returns the form defaults. Examples:
+
+- `retrieveLoanTransactionTemplate(Long loanId, LoanTransactionType, LocalDate transactionDate, BigDecimal calculatedAmount)` → builds a `LoanTransactionData` with `amount` defaulted to "smallest sensible value" for that type and the `paymentTypeOptions` array.
+- `retrieveLoanForeclosureTemplate(Long loanId, LocalDate)` → projects expected outstanding as of a future date by running the schedule generator and summing.
+- `retrieveLoanReAgeTemplate(Long loanId)` / `retrieveLoanReAmortizationTemplate(Long loanId)` → bundle the existing re-age / re-amortization parameters from the last applicable `LoanTransaction`.
+
+The `LoansApiResource.template(...)` endpoint dispatches by query-param to pick which of the template methods to call. The `template=true` flag adds option lists (officer dropdown, charge dropdown, etc.).
+
+## Overdue queries
+
+```java
+@Override
+public Collection<OverdueLoanScheduleData> retrieveAllLoansWithOverdueInstallments(
+        final Long penaltyWaitPeriod, final boolean backdatePenalties) {
+
+    final OverdueLoanScheduleMapper rm = new OverdueLoanScheduleMapper();
+    final StringBuilder sqlBuilder = new StringBuilder(400);
+    sqlBuilder.append("select ").append(rm.schema()).append(" where ls.completed_derived <> true ");
+    // PostgreSQL/MySQL day arithmetic, parameterised:
+    sqlBuilder.append(" and ls.duedate >= "
+        + sqlGenerator.subDate(sqlGenerator.currentBusinessDate(), "(? + 1)", "day"));
+    return this.jdbcTemplate.query(sqlBuilder.toString(), rm, penaltyWaitPeriod);
+}
+```
+
+Driven by the COB step `APPLY_CHARGE_TO_OVERDUE_LOANS` — see [Loan COB business steps](/cob/loan-cob-business-steps).
+
+## Hierarchy scoping helper
+
+```java
+private String getHierarchyString() {
+    AppUser currentUser = null;
+    if (this.context != null) {
+        currentUser = this.context.getAuthenticatedUserIfPresent();
+    }
+    return Optional.ofNullable(currentUser)
+        .map(appUser -> appUser.getOffice().getHierarchy())
+        .orElse(".");
+}
+```
+
+The fallback `"."` returns no rows (sentinel hierarchy that never matches), so an unauthenticated context can't read data accidentally. Most public entry points eagerly call `this.context.authenticatedUser()` to force authentication first.
+
+## Schema highlights
+
+The `m_loan` row is wide but the read service usually fetches **two** rows for a single `GET /loans/{id}`:
+
+1. The main `loanSchema()` join.
+2. The currency join via `LoanCurrencyDataMapper.schema()` if the loan's currency needs hydrating.
+
+Additional joins are made lazily for `?associations=`:
+
+| Association param | Triggered SQL |
+| --- | --- |
+| `multiDisburseDetails` | `retrieveLoanDisbursementDetails(loanId)` against `m_loan_disbursement_detail` |
+| `repaymentSchedule` | `retrieveRepaymentSchedule(...)` against `m_loan_repayment_schedule` |
+| `transactions` | `retrieveLoanTransactions(loanId)` against `m_loan_transaction` |
+| `charges` | `LoanChargeReadPlatformService.retrieveLoanCharges(loanId)` |
+| `collateral` | `LoanCollateralManagementReadPlatformService.getLoanCollateralResponseDataList(loanId)` |
+| `meeting` | `CalendarReadPlatformService.retrieveLoanCalendar(loanId)` |
+| `notes` | `NoteReadPlatformService.retrieveNotesByResource(loanId, NoteType.LOAN.getValue())` |
+| `linkedAccount` | `AccountAssociationsReadPlatformService.retriveLoanLinkedAssociation(loanId)` |
+| `loanTermVariations` | `LoanTermVariationsRepository.findLoanTermVariationsByLoanId(loanId)` |
+| `originalSchedule` | `LoanScheduleHistoryReadPlatformService.retrieveRepaymentArchiveSchedule(...)` |
+| `futureSchedule` | `LoanScheduleCalculationPlatformService.updateFutureSchedule(...)` |
+| `originators` | `LoanOriginatorReadPlatformService.retrieveByLoanId(...)` (optional bean) |
+
+The dispatching logic is in `LoansApiResource.retrieveLoan(...)` — see [Loans API](/loan/loans-api).
+
+## Collaborators
+
+The implementation's `@RequiredArgsConstructor` fields include:
+
+```java
+private final PlatformSecurityContext       context;
+private final JdbcTemplate                  jdbcTemplate;
+private final DatabaseSpecificSQLGenerator  sqlGenerator;
+private final SqlValidator                  columnValidator;
+private final PaginationHelper              paginationHelper;
+private final LoanRepositoryWrapper         loanRepositoryWrapper;
+private final LoanTransactionRepository     loanTransactionRepository;
+private final LoanTermVariationsRepository  loanTermVariationsRepository;
+private final LoanScheduleHistoryReadPlatformService loanScheduleHistoryReadPlatformService;
+private final LoanScheduleCalculationPlatformService calculationPlatformService;
+private final LoanChargeReadPlatformService loanChargeReadPlatformService;
+private final LoanChargePaidByReadService   loanChargePaidByReadService;
+private final LoanTransactionRelationReadService loanTransactionRelationReadService;
+private final DelinquencyReadPlatformService delinquencyReadPlatformService;
+private final ClientReadPlatformService     clientReadPlatformService;
+private final GroupReadPlatformService      groupReadPlatformService;
+private final LoanProductReadPlatformService loanProductReadPlatformService;
+private final LoanDropdownReadPlatformService dropdownReadPlatformService;
+private final FundReadPlatformService       fundReadPlatformService;
+private final ChargeReadPlatformService     chargeReadPlatformService;
+private final StaffReadPlatformService      staffReadPlatformService;
+private final ConfigurationDomainService    configurationDomainService;
+private final CalendarReadPlatformService   calendarReadPlatformService;
+private final AccountAssociationsReadPlatformService accountAssociationsReadPlatformService;
+private final NoteReadPlatformService       noteReadPlatformService;
+private final LoanTransactionMapper         loanTransactionMapper;
+private final LoanMaximumAmountCalculator   loanMaximumAmountCalculator;
+private final LoanRepaymentScheduleService  loanRepaymentScheduleService;
+// … plus a handful of optional / Spring-Optional beans for progressive features
+```
+
+The `JdbcTemplate` is the standard Spring-injected one; the `PaginationHelper` handles the dialect-specific count query.
+
+## Error handling
+
+- `LoanNotFoundException` (HTTP 404) — from `retrieveOne` and `retrieveLoanByLoanAccount`.
+- `LoanTransactionNotFoundException` (HTTP 404) — from `retrieveLoanTransaction`.
+- `PlatformDataIntegrityException` (HTTP 500) — caught for unexpected JDBC failures.
+
+The exception classes live in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/exception/`.
+
+## Calling the read service from a resource
+
+The pattern in any `LoansApiResource` GET:
+
+```java
+this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+LoanAccountData loanBasicDetails = this.loanReadPlatformService.retrieveOne(resolvedLoanId);
+// Selectively hydrate associations based on query params
+if (associationParameters.contains(DataTableApiConstant.repaymentScheduleAssociateParamName)) {
+    LoanScheduleData repaymentSchedule = this.loanReadPlatformService.retrieveRepaymentSchedule(...);
+    // …
+}
+return this.toApiJsonSerializer.serialize(settings, loanBasicDetails, mandatoryResponseParameters);
+```
+
+The `?fields=` and `?associations=` query parameters control which DTO subset and which lazy associations are serialised. See [Loans API](/loan/loans-api).
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Loan domain model" icon="database" href="/loan/loan-domain-model">
+    The `Loan` entity that the SQL ultimately reads from.
+  </Card>
+  <Card title="Loans API" icon="globe" href="/loan/loans-api">
+    `LoansApiResource` — the controller that calls this service.
+  </Card>
+  <Card title="Loan transactions" icon="arrow-right-arrow-left" href="/loan/loan-transactions">
+    The `LoanTransaction` entity and `LoanTransactionData` DTO returned by `retrieveLoanTransactions`.
+  </Card>
+  <Card title="Repayment schedule" icon="calendar-days" href="/loan/loan-repayment-schedule-domain">
+    `LoanRepaymentScheduleInstallment` and the `LoanScheduleData` DTO produced by `retrieveRepaymentSchedule`.
+  </Card>
+</CardGroup>

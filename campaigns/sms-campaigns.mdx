@@ -1,0 +1,268 @@
+---
+title: "SMS Campaigns — SmsCampaign Aggregate and REST Surface"
+sidebarTitle: "SMS Campaigns"
+description: "Apache Fineract SMS campaigns: SmsCampaign entity, SmsCampaignApiResource, DIRECT/SCHEDULE/TRIGGERED types and the outbound sms_messages pipeline."
+---
+
+The Apache Fineract **SMS campaigns** feature mirrors the email pipeline: a `SmsCampaign` (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/sms/domain/SmsCampaign.java`, table `sms_campaign`) couples a stretchy-report business rule with an SMS template and trigger metadata, and the matching write service expands matching rows into `SmsMessage` records (`sms_messages_outbound`). The campaign is driven from `/v1/smscampaigns` (`SmsCampaignApiResource`) and the outbound messages are shipped to an HTTP **message gateway** by `SEND_MESSAGES_TO_SMS_GATEWAY` — see [SMS gateway](/campaigns/sms-gateway). Delivery status is reconciled by `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY`.
+
+For the broader subsystem and the parallel email path see [Campaigns overview](/campaigns/overview) and [Email campaigns](/campaigns/email-campaigns).
+
+## Aggregate — `SmsCampaign`
+
+```java
+@Entity
+@Table(name = "sms_campaign",
+       uniqueConstraints = @UniqueConstraint(columnNames = "campaign_name", name = "campaign_name_UNIQUE"))
+public class SmsCampaign extends AbstractPersistableCustom<Long> {
+    @Column(name = "campaign_name", nullable = false)         private String campaignName;
+    @Column(name = "campaign_type", nullable = false)         private Integer campaignType;   // CampaignType: SMS(1) / NOTIFICATION(2)
+    @Column(name = "campaign_trigger_type", nullable = false) private Integer triggerType;    // DIRECT / SCHEDULE / TRIGGERED
+    @Column(name = "provider_id")                             private Long providerId;        // null for notifications
+    @ManyToOne @JoinColumn(name = "report_id", nullable = false) private Report businessRuleId; // stretchy report -> recipients
+    @Column(name = "param_value")                             private String paramValue;      // JSON of report params
+    @Column(name = "status_enum", nullable = false)           private Integer status;         // SmsCampaignStatus
+    @Column(name = "message", nullable = false)               private String message;         // template body
+    @Column(name = "recurrence")                              private String recurrence;
+    @Column(name = "next_trigger_date")                       private LocalDateTime nextTriggerDate;
+    @Column(name = "last_trigger_date")                       private LocalDateTime lastTriggerDate;
+    @Column(name = "recurrence_start_date")                   private LocalDateTime recurrenceStartDate;
+    @Column(name = "is_visible")                              private boolean isVisible;
+    @Column(name = "is_notification")                         private boolean isNotification;
+    // audit columns: submittedBy/submittedOnDate/approvedBy/approvedOnDate/closedBy/closureDate
+}
+```
+
+Key facts:
+
+- `campaign_name` carries a unique constraint per tenant — `SmsCampaignNameAlreadyExistsException` is thrown on a collision.
+- `campaignType` references `org.apache.fineract.infrastructure.campaigns.constants.CampaignType` (`INVALID(0)`, `SMS(1)`, `NOTIFICATION(2)`). Notifications skip the gateway; they are pushed through `NotificationSenderService` instead (FCM / GCM).
+- `providerId` resolves to an `SmsProviderData` row (`SmsCampaignDropdownReadPlatformService.retrieveSmsProviders()`). Required when `isNotification == false`; null otherwise.
+- `paramValue` is the JSON fragment passed to the business-rule report at expansion time, e.g. `{"officeId":"1","status":"300","frequency":"daily"}`.
+- `is_notification` separates "send SMS via external gateway" from "send Firebase / GCM push notification" — both share the same `sms_messages_outbound` table but take different dispatch paths.
+
+### `instance(...)` — creation invariants
+
+```java
+public static SmsCampaign instance(AppUser submittedBy, Report report, JsonCommand command) {
+    final String campaignName  = command.stringValueOfParameterNamed(SmsCampaignValidator.campaignName);
+    final Long   campaignType  = command.longValueOfParameterNamed(SmsCampaignValidator.campaignType);
+    final Long   triggerType   = command.longValueOfParameterNamed(SmsCampaignValidator.triggerType);
+
+    boolean isNotification = command.parameterExists(SmsCampaignValidator.isNotificationParamName)
+        && command.booleanPrimitiveValueOfParameterNamed(SmsCampaignValidator.isNotificationParamName);
+
+    Long providerId = isNotification
+        ? null
+        : command.longValueOfParameterNamed(SmsCampaignValidator.providerId);
+
+    final String paramValue = command.jsonFragment(SmsCampaignValidator.paramValue);
+    final String message    = command.stringValueOfParameterNamed(SmsCampaignValidator.message);
+
+    LocalDate submittedOnDate = command.hasParameter(SmsCampaignValidator.submittedOnDateParamName)
+        ? command.localDateValueOfParameterNamed(SmsCampaignValidator.submittedOnDateParamName)
+        : DateUtils.getBusinessLocalDate();
+
+    String recurrence = null;
+    LocalDateTime recurrenceStartDate = null;
+    if (SCHEDULE.getValue().equals(triggerType.intValue())) {
+        // parse dateTimeFormat / recurrenceStartDate and build recurrence string
+        recurrence = constructRecurrence(command);
+        ...
+    }
+
+    return new SmsCampaign(campaignName, campaignType.intValue(), triggerType.intValue(),
+                           report, providerId, paramValue, message, submittedOnDate, submittedBy,
+                           recurrence, recurrenceStartDate, isNotification);
+}
+```
+
+The campaign always starts in `SmsCampaignStatus.PENDING` (status `100`). Recurrence is built only when the trigger type is `SCHEDULE` — `constructRecurrence(command)` formats it as an iCal `RRULE` consumed later by `CalendarUtils.getNextRecurringDate(...)`.
+
+## Trigger types — `SmsCampaignTriggerType`
+
+```java
+public enum SmsCampaignTriggerType {
+    INVALID(-1, "triggerType.invalid"),
+    DIRECT(1,   "triggerType.direct"),
+    SCHEDULE(2, "triggerType.schedule"),
+    TRIGGERED(3,"triggerType.triggered");
+}
+```
+
+| Type | Materialisation | Recurrence | Driven by |
+|---|---|---|---|
+| `DIRECT(1)` | `SmsCampaignWritePlatformServiceJpaImpl.activate(...)` expands the business-rule report into `sms_messages_outbound` immediately | none | Operator activate command |
+| `SCHEDULE(2)` | `UPDATE_SMS_OUTBOUND_WITH_CAMPAIGN_MESSAGE` Spring Batch job polls every active scheduled campaign; expands when `next_trigger_date <= tenantNow` | required, iCal `RRULE` | Scheduler |
+| `TRIGGERED(3)` | `SmsCampaignDomainServiceImpl` subscribes to business events (loan approval, savings activation, etc.) and produces messages on event fire | none | Business events |
+
+`SmsCampaignTriggerType.fromInt(...)` is forgiving — a null or unknown value maps to `INVALID`, which fails validation and surfaces as an API error rather than silently writing a broken row.
+
+## Status — `SmsCampaignStatus`
+
+```java
+public enum SmsCampaignStatus {
+    INVALID(-1, "smsCampaignStatus.invalid"),
+    PENDING(100,"smsCampaignStatus.pending"),
+    ACTIVE(300, "smsCampaignStatus.active"),
+    CLOSED(600, "smsCampaignStatus.closed");
+}
+```
+
+The transitions are gated on the aggregate (`activate`, `close`, `reactivate`) with the same `error.msg.campaign.*` parameter errors as `EmailCampaign`. `delete` requires `CLOSED` via `SmsCampaignMustBeClosedToBeDeletedException`; editing while active is blocked by `SmsCampaignMustBeClosedToEditException`.
+
+```
+   POST /v1/smscampaigns
+            │
+            ▼
+       ┌─────────┐   command=activate    ┌─────────┐
+       │ PENDING │ ───────────────────▶ │ ACTIVE  │
+       └─────────┘                       └────┬────┘
+            ▲                                 │ command=close
+            │ command=reactivate              ▼
+       ┌─────────┐  ◀── command=reactivate ─── ┐
+       │ CLOSED  │                              │
+       └────┬────┘                              ▼
+            │ DELETE                       ┌─────────┐
+            ▼                              │ CLOSED  │
+        (removed)                          └─────────┘
+```
+
+## REST surface — `SmsCampaignApiResource`
+
+`@Path("/v1/smscampaigns")`:
+
+| Method | Path | Operation | Permission |
+|---|---|---|---|
+| `GET` | `/v1/smscampaigns/template` | UI template (providers, business rules, dropdowns) | `READ_SMS_CAMPAIGN` |
+| `POST` | `/v1/smscampaigns` | Create campaign | `CREATE_SMS_CAMPAIGN` |
+| `GET` | `/v1/smscampaigns/{resourceId}` | Retrieve one | `READ_SMS_CAMPAIGN` |
+| `GET` | `/v1/smscampaigns` (paged via `offset`/`limit`/`sqlSearch`/`status`) | List | `READ_SMS_CAMPAIGN` |
+| `PUT` | `/v1/smscampaigns/{campaignId}` | Update | `UPDATE_SMS_CAMPAIGN` |
+| `POST` | `/v1/smscampaigns/{campaignId}?command=activate\|close\|reactivate` | State transition | corresponding permission |
+| `POST` | `/v1/smscampaigns/preview` | Preview interpolation | `READ_SMS_CAMPAIGN` |
+| `DELETE` | `/v1/smscampaigns/{campaignId}` | Delete (must be `CLOSED`) | `DELETE_SMS_CAMPAIGN` |
+
+Unlike `EmailCampaignApiResource`, the SMS resource accepts and returns strongly-typed DTOs from `org.apache.fineract.infrastructure.campaigns.sms.data.dto.*` (e.g. `SmsCampaignCreationDto`, `SmsCampaignUpdateDto`, `SmsCampaignPreviewDto`) rather than raw JSON strings — DTOs map to JSON commands via the `SmsCampaignMapper` (a MapStruct mapper) and `SmsCampaignValidator` runs before persistence.
+
+### Required JSON for create
+
+`SmsCampaignValidator` (`fineract-provider/.../campaigns/sms/serialization/SmsCampaignValidator.java`) declares the supported parameter set. Minimum required:
+
+| Field | Type | Notes |
+|---|---|---|
+| `campaignName` | string | Unique per tenant |
+| `campaignType` | int | `1` SMS, `2` NOTIFICATION |
+| `triggerType` | int | `1` DIRECT, `2` SCHEDULE, `3` TRIGGERED |
+| `businessRuleId` | long | `stretchy_report.id` returning recipients |
+| `message` | string | Template body; `${columnName}` placeholders interpolated per recipient row |
+| `paramValue` | object | Business-rule report parameters as JSON object |
+| `providerId` | long | Required when `isNotification=false`; the SMS provider row |
+| `isNotification` | boolean, optional | Defaults to `false`; set true to push via FCM/GCM |
+| `recurrence`, `recurrenceStartDate`, `dateTimeFormat`, `locale` | mixed | Required when `triggerType=2 (SCHEDULE)` |
+| `submittedOnDate`, `dateFormat`, `locale` | meta | Date parsing |
+
+### Preview
+
+`POST /v1/smscampaigns/preview` accepts a `SmsCampaignPreviewDto` (business-rule id + param map + template body) and returns a `CampaignPreviewData` containing the first batch of interpolated `mobile_no`/`message` pairs — operators use this from the UI before activating to check that the report columns line up with the template placeholders.
+
+## Write service — `SmsCampaignWritePlatformServiceJpaImpl`
+
+Six command paths land here:
+
+1. **`create(JsonCommand)`** — resolves `businessRuleId` via `ReportRepository.findById(...)`, validates against `SmsCampaignValidator`, builds via `SmsCampaign.instance(...)`, persists. `SmsCampaignNameAlreadyExistsException` on uniqueness violation.
+2. **`update(Long, JsonCommand)`** — applies `SmsCampaign.update(JsonCommand)`. Throws `SmsCampaignMustBeClosedToEditException` if status is `ACTIVE`.
+3. **`activate(Long, JsonCommand)`** — `campaign.activate(...)`. For `DIRECT` campaigns it then calls `insertDirectCampaignIntoSmsOutboundTable(SmsCampaign)`, which:
+   - Runs the business-rule report via `ReadReportingService.retrieveGenericResultset(...)`.
+   - Iterates `ResultsetRowData` rows, building a `Map<String, String>` of column-name → value for each.
+   - Interpolates `campaign.message` (replacing `${columnName}` per row).
+   - Inserts one `SmsMessage` per row via `SmsMessage.pendingSms(...)`, in `SmsMessageStatusType.PENDING`.
+4. **`reactivate(Long, JsonCommand)`** — `campaign.reactivate(...)`; for `SCHEDULE` campaigns recomputes `next_trigger_date` from `recurrenceStartDate` and the recurrence rule.
+5. **`close(Long, JsonCommand)`** — `campaign.close(...)`. Outbound messages already in the table are unchanged; `PENDING` rows are still picked up by `SEND_MESSAGES_TO_SMS_GATEWAY`.
+6. **`delete(Long)`** — `campaign.delete()` requires `CLOSED`; cascading delete of the `SmsCampaign` row.
+
+The same `insertDirectCampaignIntoSmsOutboundTable` is invoked by `UpdateSmsOutboundWithCampaignMessageTasklet` (see [Campaign jobs](/campaigns/campaign-jobs)) whenever a scheduled campaign's `next_trigger_date` passes.
+
+## Outbound — `SmsMessage`
+
+```java
+@Entity
+@Table(name = "sms_messages_outbound")
+public class SmsMessage extends AbstractPersistableCustom<Long> {
+    @Column(name = "external_id")                 private String externalId;
+    @ManyToOne @JoinColumn(name = "group_id")     private Group group;
+    @ManyToOne @JoinColumn(name = "client_id")    private Client client;
+    @ManyToOne @JoinColumn(name = "staff_id")     private Staff staff;
+    @ManyToOne @JoinColumn(name = "campaign_id")  private SmsCampaign smsCampaign;
+    @Column(name = "status_enum", nullable = false) private Integer statusType;
+    @Column(name = "mobile_no", length = 50)        private String mobileNo;
+    @Column(name = "message", nullable = false)     private String message;
+    @Column(name = "submittedon_date")              private LocalDate submittedOnDate;
+    @Column(name = "delivered_on_date")             private LocalDateTime deliveredOnDate;
+    @Column(name = "is_notification")               private boolean isNotification;
+}
+```
+
+`SmsMessageStatusType`:
+
+| Value | Constant | Meaning |
+|---|---|---|
+| `0` | `INVALID` | Validation failed; not picked up by gateway tasklet |
+| `100` | `PENDING` | Waiting for `SEND_MESSAGES_TO_SMS_GATEWAY` |
+| `150` | `WAITING_FOR_DELIVERY_REPORT` | Successfully accepted by the gateway; awaiting `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` |
+| `200` | `SENT` | Gateway returned status `200` for this id |
+| `300` | `DELIVERED` | Gateway returned status `300` (delivered to handset) |
+| `400` | `FAILED` | Gateway returned status `400` or invalid (`0`) |
+
+The two-stage `PENDING → WAITING_FOR_DELIVERY_REPORT → SENT/DELIVERED/FAILED` flow lets the gateway return delivery confirmations asynchronously — see [SMS gateway](/campaigns/sms-gateway) for the gateway protocol.
+
+## Template interpolation rules
+
+When the write service expands the campaign into outbound rows it:
+
+1. Runs the business-rule SQL with `paramValue` substituted. The report **must** return a `mobile_no` column for SMS (and optionally `id`, `client_id`, `group_id`, `staff_id` for foreign keys).
+2. Iterates the result rows, building a `Map<String,String>` of column-name → string value.
+3. Replaces every `${columnName}` token in `campaign.message` with the matching value. Missing columns become empty strings; rows where `mobile_no` is null or blank are skipped.
+4. Persists one `SmsMessage` per surviving row with `statusType = PENDING(100)`.
+
+Notification campaigns (`isNotification = true`) skip the gateway entirely — `SmsMessageScheduledJobService.sendTriggeredMessages(...)` flips matching messages straight to `WAITING_FOR_DELIVERY_REPORT` and dispatches via `NotificationSenderService`.
+
+## TRIGGERED campaigns — `SmsCampaignDomainServiceImpl`
+
+For `triggerType = TRIGGERED`, materialisation is event-driven. `SmsCampaignDomainServiceImpl` registers business-event listeners (via `BusinessEventNotifierService`) for portfolio events such as:
+
+- `LoanApprovedBusinessEvent`
+- `LoanDisbursalBusinessEvent`
+- `LoanRepaymentBusinessEvent`
+- `ClientActivateBusinessEvent`
+- `SavingsActivateBusinessEvent`
+
+When a matching event fires:
+
+1. The service looks up `ACTIVE` campaigns whose `paramValue` declares interest in this event type.
+2. Runs the business-rule report scoped to the event's entity (e.g. `loanId`) — most triggered reports take a `${loanId}` parameter directly.
+3. Interpolates the campaign body and synchronously calls `SmsMessageScheduledJobService.sendTriggeredMessages(Map<SmsCampaign, Collection<SmsMessage>>)`, which posts straight to the gateway and flips status to `WAITING_FOR_DELIVERY_REPORT`.
+
+See [Business events](/runtime/business-events) for the event catalogue.
+
+## Errors
+
+| Exception | Trigger |
+|---|---|
+| `SmsCampaignNotFound` | Unknown id on read/update/delete |
+| `SmsCampaignNameAlreadyExistsException` | `campaign_name` unique constraint violation |
+| `SmsCampaignMustBeClosedToEditException` | `PUT` while not `PENDING` |
+| `SmsCampaignMustBeClosedToBeDeletedException` | `DELETE` while not `CLOSED` |
+| `GatewayConnectionConfigurationNotFound` | `MESSAGE_GATEWAY` rows missing/blank at dispatch time |
+| `ConnectionFailureException` | Gateway returned non-2xx during send |
+| `SmsRuntimeException` | Wraps unexpected runtime errors during materialisation |
+| `PlatformApiDataValidationException` | `SmsCampaignValidator` rejected the payload, or state transition rejected |
+
+## Related references
+
+- The outbound dispatch loop (`SEND_MESSAGES_TO_SMS_GATEWAY`, `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY`, `SmsConfigUtils`): [SMS gateway](/campaigns/sms-gateway).
+- The Spring Batch jobs that drive materialisation and dispatch: [Campaign jobs](/campaigns/campaign-jobs).
+- The parallel email pipeline: [Email campaigns](/campaigns/email-campaigns).
+- The `Report` aggregate behind `businessRuleId`: [Reports](/dataqueries/reports).
+- The `${columnName}` substitution semantics also used by reports: [Run reports](/dataqueries/run-reports).
+- All campaign REST endpoints in one place: [Hooks and messaging APIs](/api/hooks-and-messaging-apis).

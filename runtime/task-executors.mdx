@@ -1,0 +1,388 @@
+---
+title: "Task Executors, ThreadPools and @Async Configuration"
+sidebarTitle: "Task Executors"
+description: "Every ThreadPoolTaskExecutor in Fineract: TaskExecutorConfig, SpringConfig, SpringAsyncConfig and the COB and JMS executors plus how @Async hooks them up."
+---
+
+Fineract registers five distinct `ThreadPoolTaskExecutor` beans, each
+with a specific role and ownership:
+
+| Bean name (constant) | Class declaring `@Bean` | Lifecycle |
+| --- | --- | --- |
+| `fineractDefaultThreadPoolTaskExecutor` (`DEFAULT_TASK_EXECUTOR_BEAN_NAME`) | `TaskExecutorConfig` | singleton |
+| `fineractConfigurableThreadPoolTaskExecutor` (`CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME`) | `TaskExecutorConfig` | **prototype** |
+| `fineractEventExecutor` | `SpringConfig` | singleton |
+| `loanCOBCatchUpThreadPoolTaskExecutor` (`LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME`) | `SpringAsyncConfig` | singleton |
+| `workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor` (`WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME`) | `SpringAsyncConfig` | singleton |
+| `externalEventJmsProducerExecutor` (`EVENT_TASK_EXECUTOR_BEAN_NAME`) | `ExternalEventJMSConfiguration` | singleton (only when external events JMS is enabled) |
+
+All bean names are exported as constants on `TaskExecutorConstant` so
+consumers can reference them at the call site via `@Qualifier(...)` or
+`@Async(...)`.
+
+`@EnableAsync` itself is declared on `SpringAsyncConfig`.
+
+See [`/runtime/spring-boot-configuration`](/runtime/spring-boot-configuration) for the loading order and
+[`/runtime/logging-and-correlation`](/runtime/logging-and-correlation) for MDC propagation caveats.
+
+## `TaskExecutorConstant`
+
+```java TaskExecutorConstant.java
+public final class TaskExecutorConstant {
+
+    private TaskExecutorConstant() {}
+
+    public static final String DEFAULT_TASK_EXECUTOR_BEAN_NAME = "fineractDefaultThreadPoolTaskExecutor";
+    public static final String CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME = "fineractConfigurableThreadPoolTaskExecutor";
+    public static final String EVENT_TASK_EXECUTOR_BEAN_NAME = "externalEventJmsProducerExecutor";
+    public static final String LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME = "loanCOBCatchUpThreadPoolTaskExecutor";
+    public static final String WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME = "workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor";
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/TaskExecutorConstant.java`.
+
+A private‑constructor utility class holding string constants. Importing
+this class everywhere — instead of duplicating the string literal — is the
+platform's convention. Refactor‑safe and grep‑friendly.
+
+## `TaskExecutorConfig` — the two general‑purpose executors
+
+```java TaskExecutorConfig.java
+@Configuration
+public class TaskExecutorConfig {
+
+    @Autowired
+    private FineractProperties fineractProperties;
+
+    @Bean(TaskExecutorConstant.DEFAULT_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor fineractDefaultThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor threadPoolTaskExecutor = new ThreadPoolTaskExecutor();
+        threadPoolTaskExecutor.setCorePoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorCorePoolSize());
+        threadPoolTaskExecutor.setMaxPoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorMaxPoolSize());
+        return threadPoolTaskExecutor;
+    }
+
+    @Bean(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+    @Scope(scopeName = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+    public ThreadPoolTaskExecutor fineractConfigurableThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor threadPoolTaskExecutor = new ThreadPoolTaskExecutor();
+        threadPoolTaskExecutor.setCorePoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorCorePoolSize());
+        threadPoolTaskExecutor.setMaxPoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorMaxPoolSize());
+        return threadPoolTaskExecutor;
+    }
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/TaskExecutorConfig.java`.
+
+Both pools share the same default sizing from `FineractProperties`:
+
+```properties application.properties
+fineract.task-executor.default-task-executor-core-pool-size=${FINERACT_DEFAULT_TASK_EXECUTOR_CORE_POOL_SIZE:10}
+fineract.task-executor.default-task-executor-max-pool-size=${FINERACT_DEFAULT_TASK_EXECUTOR_MAX_POOL_SIZE:100}
+```
+
+Lines 155‑156. Bound to `FineractProperties.FineractTaskExecutor` (in
+`fineract-core/.../infrastructure/core/config/FineractProperties.java`):
+
+```java FineractProperties.java (excerpt)
+public static class FineractTaskExecutor {
+    private int defaultTaskExecutorCorePoolSize;
+    private int defaultTaskExecutorMaxPoolSize;
+    private int tenantUpgradeTaskExecutorCorePoolSize;
+    private int tenantUpgradeTaskExecutorMaxPoolSize;
+    private int tenantUpgradeTaskExecutorQueueCapacity;
+}
+```
+
+### Why a prototype‑scoped executor exists
+
+`fineractConfigurableThreadPoolTaskExecutor` is **prototype‑scoped**:
+each injection point gets its **own** `ThreadPoolTaskExecutor` instance,
+created fresh from the bean factory on every `@Autowired` resolution. This
+matters because Spring Batch tasklet configurations frequently override
+core/max pool size **on the executor itself** before submitting work — if
+they all shared one executor, the last writer would win.
+
+Consumers like `RecalculateInterestForLoanTasklet`,
+`PostInterestForSavingTasklet`, and `LoanAccrualsProcessingServiceImpl`
+inject this bean via `@Qualifier(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)`,
+mutate `corePoolSize`/`maxPoolSize`/`queueCapacity`, call `initialize()`,
+submit work, and let the executor be GC'd when the tasklet ends.
+
+| Aspect | `fineractDefaultThreadPoolTaskExecutor` | `fineractConfigurableThreadPoolTaskExecutor` |
+| --- | --- | --- |
+| Scope | singleton | prototype |
+| Default core size | `fineract.task-executor.default-task-executor-core-pool-size` = `10` | same |
+| Default max size | `fineract.task-executor.default-task-executor-max-pool-size` = `100` | same |
+| Queue capacity | default (`Integer.MAX_VALUE` — unbounded `LinkedBlockingQueue`) | default |
+| Rejection policy | default `AbortPolicy` | default |
+| Initialised | by Spring | NOT — caller must call `initialize()` after configuring |
+| Typical caller | `SmsMessageScheduledJobServiceImpl`, `SendMessageToSmsGatewayConfig`, `RecalculateInterestForLoanConfig` | `RecalculateInterestForLoanTasklet`, `PostInterestForSavingTasklet`, `LoanAccrualsProcessingServiceImpl` |
+
+<Warning>
+`fineractDefaultThreadPoolTaskExecutor` is **not** initialised by Spring
+via a lifecycle callback — `ThreadPoolTaskExecutor` extends
+`ExecutorConfigurationSupport`, which implements `InitializingBean` and
+will call `initialize()` automatically. However, the *prototype* bean
+goes through the same `InitializingBean.afterPropertiesSet()` path, so
+both pools are usable as soon as injection completes. The reason consumers
+sometimes call `initialize()` again on the prototype is to apply
+post‑injection mutation; this is a no‑op for the singleton.
+</Warning>
+
+## `SpringConfig.fineractEventExecutor`
+
+```java SpringConfig.java (excerpt)
+@Bean(name = "fineractEventExecutor")
+public ThreadPoolTaskExecutor fineractEventExecutor(ThreadPoolTaskExecutorBuilder builder,
+        @Value("${spring.task.execution.pool.core-size:-1}") int configuredCore,
+        @Value("${spring.task.execution.pool.max-size:-1}") int configuredMax,
+        @Value("${spring.task.execution.pool.queue-capacity:-1}") int configuredQueueCapacity) {
+
+    int cpus = Runtime.getRuntime().availableProcessors();
+    int smartCore = cpus * 2;
+    int smartMax = cpus * 5;
+
+    int coreSize = configuredCore > 0 ? configuredCore : smartCore;
+    int rawMaxSize = configuredMax > 0 ? configuredMax : smartMax;
+    int queueCapacity = configuredQueueCapacity >= 0 ? configuredQueueCapacity : DEFAULT_QUEUE_CAPACITY;
+
+    int finalMaxSize = Math.max(rawMaxSize, coreSize);
+
+    ThreadPoolTaskExecutor executor = builder
+            .threadNamePrefix("FineractEvent-")
+            .corePoolSize(coreSize)
+            .maxPoolSize(finalMaxSize)
+            .queueCapacity(queueCapacity)
+            .build();
+
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(AWAIT_TERMINATION_SECONDS);  // 60
+
+    return executor;
+}
+
+@Bean
+@DependsOn("overrideSecurityContextHolderStrategy")
+public SimpleApplicationEventMulticaster applicationEventMulticaster(
+        @Qualifier("fineractEventExecutor") ThreadPoolTaskExecutor taskExecutor) {
+    SimpleApplicationEventMulticaster multicaster = new SimpleApplicationEventMulticaster();
+    multicaster.setTaskExecutor(new DelegatingSecurityContextAsyncTaskExecutor(taskExecutor));
+    return multicaster;
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/SpringConfig.java`.
+
+| Property | Behaviour |
+| --- | --- |
+| `spring.task.execution.pool.core-size` | `-1` → `cpus * 2` |
+| `spring.task.execution.pool.max-size` | `-1` → `cpus * 5` |
+| `spring.task.execution.pool.queue-capacity` | `-1` → `100` (`DEFAULT_QUEUE_CAPACITY`) |
+| `RejectedExecutionHandler` | `CallerRunsPolicy` — back‑pressure: the caller thread runs the task itself when the pool is saturated. |
+| Shutdown | `setWaitForTasksToCompleteOnShutdown(true)` + `setAwaitTerminationSeconds(60)` — drains up to 60s during graceful shutdown. |
+| Thread naming | `FineractEvent-` prefix. |
+
+The executor is the backing store for Spring's
+`ApplicationEventMulticaster` — meaning every `@EventListener` dispatched
+via `applicationContext.publishEvent(...)` runs **asynchronously** on
+this pool. It is wrapped in `DelegatingSecurityContextAsyncTaskExecutor`
+so the Spring Security `SecurityContext` propagates to event‑handler
+threads (made possible by `SecurityContextHolder.MODE_INHERITABLETHREADLOCAL`
+installed by `overrideSecurityContextHolderStrategy()` in the same
+configuration).
+
+| Implication | Detail |
+| --- | --- |
+| Async events | All Spring application events are async by default (a deliberate departure from Spring's default sync behaviour). |
+| Principal propagation | Yes — security context flows. |
+| MDC propagation | **No** — the `DelegatingSecurityContextAsyncTaskExecutor` only carries the security context, not MDC. Use `MDC.getCopyOfContextMap()` and restore inside the listener if needed (see [`/runtime/logging-and-correlation`](/runtime/logging-and-correlation)). |
+| Tenant propagation | The `ThreadLocalContextUtil` slot is **inherited** via `InheritableThreadLocal` on the security context strategy, but Fineract has historically passed `FineractContext` snapshots explicitly into async submissions to avoid accidental leakage. |
+
+## `SpringAsyncConfig` — `@EnableAsync` and COB catch‑up
+
+```java SpringAsyncConfig.java
+@Configuration
+@EnableAsync
+public class SpringAsyncConfig implements AsyncConfigurer {
+
+    @Bean(name = TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor loanCOBCatchUpThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor t = new ThreadPoolTaskExecutor();
+        t.setMaxPoolSize(1);
+        return t;
+    }
+
+    @Bean(name = TaskExecutorConstant.WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor t = new ThreadPoolTaskExecutor();
+        t.setMaxPoolSize(1);
+        return t;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return new CustomAsyncExceptionHandler();
+    }
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/configuration/async/SpringAsyncConfig.java`.
+
+| Bean | Max pool size | Used by |
+| --- | --- | --- |
+| `loanCOBCatchUpThreadPoolTaskExecutor` | **1** | `AsyncLoanCOBExecutorServiceImpl#executeLoanCOBCatchUpAsync(FineractContext)` |
+| `workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor` | **1** | `AsyncWorkingCapitalLoanCOBExecutorServiceImpl#executeLoanCOBCatchUpAsync(FineractContext)` |
+| Async uncaught exception handler | `CustomAsyncExceptionHandler` (logs the error and continues) | every `@Async` invocation |
+
+```java AsyncLoanCOBExecutorServiceImpl.java
+@Service
+@Conditional(LoanCOBEnabledCondition.class)
+public class AsyncLoanCOBExecutorServiceImpl extends AsyncCommonCOBExecutorService implements AsyncLoanCOBExecutorService {
+
+    @Override
+    @Async(TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public void executeLoanCOBCatchUpAsync(FineractContext context) {
+        super.executeLoanCOBCatchUpAsync(context);
+    }
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/cob/service/AsyncLoanCOBExecutorServiceImpl.java`.
+
+| Aspect | Detail |
+| --- | --- |
+| Annotation | `@Async("loanCOBCatchUpThreadPoolTaskExecutor")` — the qualifier is the bean name string from `TaskExecutorConstant`. |
+| Why max pool = 1 | Each tenant's Close‑Of‑Business catch‑up job is serial. Running two simultaneously against the same tenant DB would corrupt the COB cursor. |
+| `FineractContext` | Snapshot of the calling thread's tenant + business date + auth — explicitly passed to avoid relying on threadlocal propagation. |
+| `@Conditional(LoanCOBEnabledCondition.class)` | The whole service vanishes when `fineract.job.loan-cob-enabled=false`. |
+
+The same pattern applies to `AsyncWorkingCapitalLoanCOBExecutorServiceImpl`:
+
+```java AsyncWorkingCapitalLoanCOBExecutorServiceImpl.java
+@Async(TaskExecutorConstant.WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+public void executeLoanCOBCatchUpAsync(FineractContext context) { ... }
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/cob/service/AsyncWorkingCapitalLoanCOBExecutorServiceImpl.java`.
+
+### `@EnableAsync` semantics
+
+`@EnableAsync` on `SpringAsyncConfig` activates Spring's AOP machinery for
+`@Async`. Two important consequences:
+
+1. **`@Async` methods must be public.** Spring's CGLIB proxy cannot intercept package‑private or `private` calls.
+2. **Calls from the same class are NOT proxied.** `this.executeLoanCOBCatchUpAsync(...)` from within `AsyncLoanCOBExecutorServiceImpl` would run synchronously. The convention is to invoke via the Spring‑injected interface (`AsyncLoanCOBExecutorService`) so the proxy is exercised.
+3. The `AsyncUncaughtExceptionHandler` (a `CustomAsyncExceptionHandler` in `fineract-provider/.../configuration/async/CustomAsyncExceptionHandler.java`) gets every uncaught exception from a `void` `@Async` method.
+
+### Other `@Async` usages in the codebase
+
+```bash
+$ grep -rn "@Async\b" fineract-provider/src/main/java | grep -v test
+fineract-provider/.../cob/service/AsyncCommonCOBExecutorService.java:62:    @Async(TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+fineract-provider/.../cob/service/AsyncLoanCOBExecutorServiceImpl.java:44:    @Async(TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+fineract-provider/.../cob/service/AsyncWorkingCapitalLoanCOBExecutorServiceImpl.java:47: @Async(TaskExecutorConstant.WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+```
+
+There are **only three** `@Async`‑annotated methods in the entire
+production codebase (a fourth, in `fineract-command/src/test`, is a test
+fixture). All three target the single‑threaded COB executors. The rest of
+the platform uses explicit `ThreadPoolTaskExecutor.submit(...)` or
+`applicationEventPublisher.publishEvent(...)` for async work.
+
+## `ExternalEventJMSConfiguration.externalEventJmsProducerExecutor`
+
+```java ExternalEventJMSConfiguration.java (excerpt)
+@Bean(TaskExecutorConstant.EVENT_TASK_EXECUTOR_BEAN_NAME)
+public ThreadPoolTaskExecutor externalEventJmsProducerExecutor() {
+    ThreadPoolTaskExecutor threadPoolTaskExecutor = new ThreadPoolTaskExecutor();
+    threadPoolTaskExecutor.setCorePoolSize(
+            fineractProperties.getEvents().getExternal().getProducer().getJms().getThreadPoolTaskExecutorCorePoolSize());
+    threadPoolTaskExecutor.setMaxPoolSize(
+            fineractProperties.getEvents().getExternal().getProducer().getJms().getThreadPoolTaskExecutorMaxPoolSize());
+    threadPoolTaskExecutor.setThreadNamePrefix("externalEventJms");
+    return threadPoolTaskExecutor;
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/event/external/config/ExternalEventJMSConfiguration.java`.
+
+Properties:
+
+```properties application.properties
+fineract.events.external.producer.jms.thread-pool-task-executor-core-pool-size=${FINERACT_EVENT_TASK_EXECUTOR_CORE_POOL_SIZE:10}
+fineract.events.external.producer.jms.thread-pool-task-executor-max-pool-size=${FINERACT_EVENT_TASK_EXECUTOR_MAX_POOL_SIZE:100}
+```
+
+Lines 137‑138. The bean is consumed by `JMSMultiExternalEventProducer` via:
+
+```java JMSMultiExternalEventProducer.java (excerpt)
+@Qualifier(TaskExecutorConstant.EVENT_TASK_EXECUTOR_BEAN_NAME)
+private final ThreadPoolTaskExecutor jmsExecutor;
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/event/external/producer/jms/JMSMultiExternalEventProducer.java`.
+
+Used to dispatch external events to ActiveMQ. Only present when
+`fineract.events.external.producer.jms.enabled=true`.
+
+## Spring's own scheduler
+
+```properties application.properties
+spring.task.scheduling.pool.size=4
+```
+
+Line 463. Spring Boot creates a `ThreadPoolTaskScheduler` of 4 threads to
+back every `@Scheduled` method (Fineract has a small handful: instance‑mode
+broadcasts, cache eviction, the COB poll loop). This is *separate* from
+all five Fineract pools above.
+
+## Summary table
+
+| Bean name | Default core | Default max | Queue | Use case |
+| --- | --- | --- | --- | --- |
+| `fineractDefaultThreadPoolTaskExecutor` | 10 | 100 | unbounded | General single executor for SMS sender, job configurations |
+| `fineractConfigurableThreadPoolTaskExecutor` | 10 | 100 | unbounded | Tasklet‑owned, prototype, sizing tuned at injection |
+| `fineractEventExecutor` | `cpus*2` | `cpus*5` | 100 | Spring `ApplicationEventMulticaster` backing pool |
+| `loanCOBCatchUpThreadPoolTaskExecutor` | 1 | 1 | unbounded | Strictly serial loan COB catch‑up |
+| `workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor` | 1 | 1 | unbounded | Strictly serial working‑capital loan COB catch‑up |
+| `externalEventJmsProducerExecutor` | 10 | 100 | unbounded | JMS producer dispatch (only when JMS events enabled) |
+| Spring `taskScheduler` | 4 | 4 | unbounded | `@Scheduled` methods |
+
+## Picking the right executor
+
+```mermaid
+flowchart TD
+    Q[Need async execution?] --> S{What kind?}
+    S -->|Spring application event| EVT["@EventListener via<br/>applicationEventPublisher<br/>uses fineractEventExecutor"]
+    S -->|Loan COB catch-up| COB["@Async LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME<br/>or WORKING_CAPITAL... constant"]
+    S -->|JMS external event| JMS["@Qualifier EVENT_TASK_EXECUTOR_BEAN_NAME<br/>in JMS producer"]
+    S -->|Job step / SMS dispatch / batch read| DEF["@Qualifier DEFAULT_TASK_EXECUTOR_BEAN_NAME"]
+    S -->|Tasklet needing per-step sizing| CFG["@Qualifier CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME<br/>(prototype - mutate, init, submit)"]
+    S -->|@Scheduled task| SCH[Spring built-in taskScheduler]
+```
+
+## Caveats
+
+| Caveat | Detail |
+| --- | --- |
+| MDC does not auto‑propagate | None of the executors install an MDC decorator. Use `MDC.getCopyOfContextMap()` and restore inside the submitted task if log correlation matters. |
+| `ThreadLocalContextUtil` not auto‑propagated | Fineract's tenant threadlocal must be captured into a `FineractContext` and re‑hydrated inside the async task. The COB services do this with the explicit `FineractContext context` parameter. |
+| Prototype executor is **not auto‑destroyed** | Spring does not call `destroy()` on prototype beans. The owning tasklet must `executor.shutdown()` after submitting/joining. |
+| `@Async` self‑invocation | Same‑class `this.foo()` skips the proxy. Inject the interface and call via the bean reference. |
+| Unbounded queue + `AbortPolicy` | The default executors have an unbounded `LinkedBlockingQueue`, so the rejection handler effectively never fires unless `maxPoolSize` is reached and the queue is bounded by another tasklet. |
+| `fineractEventExecutor` `CallerRunsPolicy` | Under load, your business thread *will* execute the listener inline. Long‑running listeners can stall API requests. |
+
+## Cross‑references
+
+- [`/runtime/spring-boot-configuration`](/runtime/spring-boot-configuration) — list of every `@Configuration` including `TaskExecutorConfig`, `SpringConfig`, `SpringAsyncConfig`.
+- [`/runtime/server-application`](/runtime/server-application) — boot sequence; `@EnableAsync` activates here.
+- [`/runtime/logging-and-correlation`](/runtime/logging-and-correlation) — MDC propagation gotchas across executor boundaries.
+- [`/runtime/metrics-and-actuator`](/runtime/metrics-and-actuator) — `executor.*` Micrometer meters are exposed for each `ThreadPoolTaskExecutor`.
+- [`/runtime/transaction-management`](/runtime/transaction-management) — `@Async` methods open their own transaction; nested `@Transactional` does not propagate across thread boundaries.
+- [`/security/overview`](/security/overview) — `SecurityContextHolder.MODE_INHERITABLETHREADLOCAL` strategy installed by `SpringConfig` lets the security context flow into pool threads.
+- [`/tenancy/overview`](/tenancy/overview) — explicit `FineractContext` propagation pattern for async tenant work.
+- [`/core/overview`](/core/overview) — `FineractProperties` typed binding (`FineractTaskExecutor` inner class) lives in `fineract-core`.

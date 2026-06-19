@@ -1,0 +1,436 @@
+---
+title: "E2E Cucumber Runner: Glue, Suite, Hooks, and Tag Filtering"
+sidebarTitle: "E2E Cucumber Runner"
+description: "How fineract-e2e-tests-core glues step definitions and fineract-e2e-tests-runner exposes the JUnit Platform Suite plus the Gradle cucumber task for tag-filtered runs."
+---
+
+Fineract's end-to-end Cucumber harness is split across two Gradle subprojects:
+
+| Subproject | Owns |
+| --- | --- |
+| `fineract-e2e-tests-core` | Spring-managed step definitions, data factories, Avro/JMS messaging plumbing, hooks, initializers, test data enums |
+| `fineract-e2e-tests-runner` | The executable `TestRunner` suite, the `.feature` files, `cucumber.properties` / `junit-platform.properties`, and the global-initializer step beans that get picked up at runtime |
+
+This page covers the runner mechanics: how Cucumber is wired through the JUnit Platform Suite, how the Gradle `cucumber` task is parameterised, what the lifecycle hooks do, and how `DataTable` arguments and `Background:` sections are consumed inside step definitions.
+
+## Module shape
+
+```text
+fineract-e2e-tests-core/
+└── src/test/java/org/apache/fineract/test/
+    ├── api/                        # API clients/helpers
+    ├── config/                     # TestApplicationConfiguration, TestDatabaseConfiguration, CacheConfiguration
+    ├── data/                       # Enums + builders (loan products, payment types, etc.)
+    ├── factory/                    # *RequestFactory builders for OpenAPI client DTOs
+    ├── helper/                     # numeric helpers, date helpers, etc.
+    ├── initializer/
+    │   ├── base/                   # FineractInitializer, BaseFineractInitializerConfiguration
+    │   ├── global/                 # FineractGlobalInitializerStep interface
+    │   ├── scenario/               # FineractScenarioInitializerStep interface
+    │   └── suite/                  # FineractSuiteInitializerStep interface
+    ├── messaging/                  # EventStore, MessageConsumer, MessagingConfiguration, event DTOs
+    ├── service/                    # business-event verification services
+    ├── stepdef/                    # @Given/@When/@Then implementations grouped by domain
+    ├── support/                    # PropertiesFactory, TestContext, loaders
+    └── testrail/                   # TestRail-id integration plug-ins
+
+fineract-e2e-tests-runner/
+└── src/test/
+    ├── java/org/apache/fineract/test/
+    │   ├── TestRunner.java
+    │   ├── config/TestCucumberConfiguration.java
+    │   └── initializer/global/*.java        # 17 concrete global initializers
+    │   └── initializer/scenario/*.java
+    │   └── initializer/suite/*.java
+    └── resources/
+        ├── features/                        # 84 .feature files
+        ├── META-INF/fineract-test.config    # loader configuration
+        ├── allure.properties
+        ├── cucumber.properties
+        ├── junit-platform.properties
+        └── logback.xml
+```
+
+## The `TestRunner` suite
+
+`org.apache.fineract.test.TestRunner` is the JUnit Platform Suite annotation that Gradle / IntelliJ discover and run:
+
+```java
+@Suite
+@IncludeEngines("cucumber")
+@SelectPackages("org.apache.fineract.test")
+@SelectDirectories("src/test/resources/features")
+@ExcludeTags("Skip")
+@ConfigurationParameter(key = PLUGIN_PROPERTY_NAME, value = "pretty")
+@ConfigurationParameter(key = GLUE_PROPERTY_NAME,
+    value = "org.apache.fineract.test.stepdef, " +
+            "org.apache.fineract.test.stepdef.common, " +
+            "org.apache.fineract.test.stepdef.hook, " +
+            "org.apache.fineract.test.stepdef.loan, " +
+            "org.apache.fineract.test.stepdef.saving, " +
+            "org.apache.fineract.test.config")
+public class TestRunner {}
+```
+
+The packages listed in `GLUE_PROPERTY_NAME` cover everything Cucumber should scan for step definitions and lifecycle hooks. Two important details:
+
+- `@ExcludeTags("Skip")` — scenarios tagged `@Skip` never run via the suite even when other tag filters are applied.
+- `org.apache.fineract.test.config` is included as glue so that `TestCucumberConfiguration` (the Cucumber-Spring bridge configuration) is picked up automatically.
+
+Other relevant packages (`org.apache.fineract.test.stepdef.assetexternalization`, `org.apache.fineract.test.stepdef.datatable`, `org.apache.fineract.test.stepdef.reporting`) are subpackages of the listed roots, so they are scanned transitively.
+
+## Cucumber-Spring integration
+
+`fineract-e2e-tests-runner/src/test/resources/cucumber.properties`:
+
+```properties
+cucumber.publish.quiet=true
+```
+
+`fineract-e2e-tests-runner/src/test/resources/junit-platform.properties`:
+
+```properties
+cucumber.execution.parallel.enabled=false
+cucumber.execution.parallel.config.strategy=fixed
+cucumber.execution.parallel.config.fixed.parallelism=3
+cucumber.execution.parallel.config.fixed.max-pool-size=3
+junit.jupiter.execution.parallel.config.fixed.parallelism=3
+junit.jupiter.execution.parallel.enabled=false
+junit.jupiter.execution.parallel.config.strategy=fixed
+cucumber.plugin=pretty
+cucumber.filter.tags=not @Skip
+cucumber.execution.exclusive-resources.isolated.read-write=org.junit.platform.engine.support.hierarchical.ExclusiveResource.GLOBAL_KEY
+cucumber.execution.execution-mode.feature=same_thread
+```
+
+Two things to internalize:
+
+- **Parallelism is wired but disabled.** Both Cucumber-level and JUnit Jupiter parallel execution are switched off (`enabled=false`). The fixed strategy with parallelism=3 is there for the day the suite is ready to fan out.
+- **Same-thread per feature.** `cucumber.execution.execution-mode.feature=same_thread` and the global isolated resource ensure scenarios inside one feature never interleave on the same Fineract server.
+
+## The Spring `TestApplicationConfiguration`
+
+The core's main Spring configuration is intentionally narrow:
+
+```java
+@Configuration
+@ComponentScan(
+    value = "org.apache.fineract.test",
+    excludeFilters = @ComponentScan.Filter(
+        type = FilterType.REGEX,
+        pattern = "org\\.apache\\.fineract\\.test\\.initializer.*"))
+@PropertySource("classpath:fineract-test-application.properties")
+public class TestApplicationConfiguration {}
+```
+
+It scans every Spring component under `org.apache.fineract.test`, *except* the `initializer.**` sub-packages. The initializers are wired separately through `BaseFineractInitializerConfiguration` so they only get instantiated when `FineractInitializerFactory` boots its dedicated `AnnotationConfigApplicationContext`.
+
+`BaseFineractInitializerConfiguration` lives in `fineract-e2e-tests-core`:
+
+```java
+@Configuration
+@ComponentScan({ "org.apache.fineract.test.api", "org.apache.fineract.test.helper" })
+@PropertySource("classpath:fineract-test-application.properties")
+@Import({ CacheConfiguration.class, TestDatabaseConfiguration.class })
+public class BaseFineractInitializerConfiguration {
+    @Bean
+    public FineractInitializer fineractInitializer(
+            List<FineractGlobalInitializerStep>   globalInitializerSteps,
+            List<FineractSuiteInitializerStep>    suiteInitializerSteps,
+            List<FineractScenarioInitializerStep> scenarioInitializerSteps) {
+        return new FineractInitializer(globalInitializerSteps, suiteInitializerSteps, scenarioInitializerSteps);
+    }
+}
+```
+
+The actual `*InitializerStep` beans (one per domain) live in the **runner** module so they can choose whether to extend the platform with extra setup. See `BusinessDateInitializerStep`, `CurrencyGlobalInitializerStep`, `LoanProductGlobalInitializerStep`, `CobBusinessStepInitializerStep`, `JobSuiteInitializerStep`, etc.
+
+## The `InitializingHook`
+
+`org.apache.fineract.test.stepdef.hook.InitializingHook` is the single Cucumber `@BeforeAll` / `@Before` / `@After` / `@AfterAll` hook:
+
+```java
+@Slf4j
+public class InitializingHook {
+
+    @BeforeAll
+    public static void beforeAll() throws Exception {
+        StandardEnvironment environment = new StandardEnvironment();
+        environment.getPropertySources()
+            .addFirst(new ResourcePropertySource("classpath:fineract-test-application.properties"));
+        InitializerProperties initializerProperties =
+            PropertiesFactory.get(environment, InitializerProperties.class);
+        if (initializerProperties.isEnabled()) {
+            log.info("Setting up global defaults for Fineract");
+            FineractInitializerFactory.get().setupGlobalDefaults();
+        } else {
+            log.info("Skipping global defaults for Fineract");
+        }
+        FineractInitializerFactory.get().setupDefaultsForSuite();
+    }
+
+    @Before
+    public static void before() throws Exception {
+        FineractInitializerFactory.get().setupDefaultsForScenario();
+    }
+
+    @After
+    public static void after() throws Exception {
+        FineractInitializerFactory.get().resetDefaultsAfterScenario();
+    }
+
+    @AfterAll
+    public static void afterAll() throws Exception {
+        FineractInitializerFactory.get().resetDefaultsAfterSuite();
+    }
+}
+```
+
+`FineractInitializerFactory` is a holder-pattern singleton that lazily builds an `AnnotationConfigApplicationContext` from the classes declared in `META-INF/fineract-test.config`:
+
+```
+org.apache.fineract.test.initializer.Configuration=org.apache.fineract.test.initializer.FineractInitializerConfiguration,\
+                                                   org.apache.fineract.test.initializer.base.BaseFineractInitializerConfiguration
+```
+
+Once built, the bean container is reused for the rest of the JVM lifetime.
+
+The lifecycle layering is therefore:
+
+| Hook | Triggered by | Calls |
+| --- | --- | --- |
+| `@BeforeAll` | Cucumber suite startup | `setupGlobalDefaults()` (currencies, codes, charges, loan products, …) + `setupDefaultsForSuite()` (e.g. external-event subscription primer) |
+| `@Before` | Each scenario | `setupDefaultsForScenario()` (e.g. business-date reset, global configuration reset) |
+| `@After` | Each scenario | `resetDefaultsAfterScenario()` |
+| `@AfterAll` | Cucumber suite shutdown | `resetDefaultsAfterSuite()` |
+
+## The three initializer SPI tiers
+
+| Interface | Implementations live in | Called from |
+| --- | --- | --- |
+| `FineractGlobalInitializerStep` | `fineract-e2e-tests-runner/.../initializer/global/*` | `setupGlobalDefaults()` |
+| `FineractSuiteInitializerStep`  | `fineract-e2e-tests-runner/.../initializer/suite/*`  | `setupDefaultsForSuite()` / `resetDefaultsAfterSuite()` |
+| `FineractScenarioInitializerStep` | `fineract-e2e-tests-runner/.../initializer/scenario/*` | `setupDefaultsForScenario()` / `resetDefaultsAfterScenario()` |
+
+Concrete global initializers in `fineract-e2e-tests-runner`:
+
+| Class | Purpose |
+| --- | --- |
+| `BusinessDateInitializerStep` | enables the business-date facility |
+| `ChargeGlobalInitializerStep` | seeds standard charges |
+| `CobBusinessStepInitializerStep` | wires the default COB pipeline |
+| `CodeGlobalInitializerStep` | seeds enumerated codes |
+| `CurrencyGlobalInitializerStep` | activates `EUR` and `USD` |
+| `DatatablesGlobalInitializerStep` | (re)creates datatables used by feature files |
+| `DelinquencyGlobalInitializerStep` | configures delinquency ranges/buckets |
+| `FinancialActivityMappingGlobalInitializerStep` | seeds FA mappings |
+| `FundGlobalInitializerStep` | creates funds |
+| `GLGlobalInitializerStep` | seeds GL accounts |
+| `GlobalConfigurationGlobalInitializerStep` | adjusts global configuration toggles |
+| `LoanProductGlobalInitializerStep` | creates the loan-product catalog the features use |
+| `PaymentTypeGlobalInitializerStep` | seeds payment types |
+| `SavingsProductGlobalInitializer` | creates savings products |
+| `SchedulerGlobalInitializerStep` | pauses/configures the scheduler |
+| `WcpCobBusinessStepInitializerStep` | working-capital COB pipeline |
+| `WorkingCapitalInitializerStep` | working-capital seed data |
+
+Suite initializers:
+
+| Class | Purpose |
+| --- | --- |
+| `ExternalEventSuiteInitializerStep` | activates external-event configurations the feature suite asserts against |
+| `JobSuiteInitializerStep` | pre-creates / pauses jobs used by scenarios |
+
+Scenario initializer:
+
+| Class | Purpose |
+| --- | --- |
+| `GlobalConfigurationScenarioInitializerStep` | resets global configuration mutated by the previous scenario |
+
+## Example global initializer
+
+```java
+@RequiredArgsConstructor
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class CurrencyGlobalInitializerStep implements FineractGlobalInitializerStep {
+
+    public static final List<String> CURRENCIES = Arrays.asList("EUR", "USD");
+
+    private final FineractFeignClient fineractClient;
+
+    @Override
+    public void initialize() {
+        var request  = new CurrencyUpdateRequest();
+        var response = ok(() -> fineractClient.currency().updateCurrencies(request.currencies(CURRENCIES), Map.of()));
+        TestContext.INSTANCE.set(TestContextKey.PUT_CURRENCIES_RESPONSE, response);
+    }
+}
+```
+
+Two patterns worth absorbing:
+
+- **Feign client + `FeignCalls.ok()`** wrapper. The shared helper unwraps `feign.Response`, asserts HTTP 2xx, and decodes the JSON. The `ok(() -> …)` idiom is the standard way step definitions and initializers call Fineract.
+- **`TestContext.INSTANCE.set(...)`** to thread results between hooks/steps that don't share a Spring scope. This is the cross-step "scenario-scoped" bag.
+
+## Step-definition examples
+
+### Plain step
+
+```java
+@When("Admin sets the business date to {string}")
+public void setBusinessDate(String businessDate) {
+    businessDateHelper.setBusinessDate(businessDate);
+}
+```
+
+### `DataTable` argument
+
+Cucumber `DataTable` arguments are passed directly into the step method. The repository's convention is to consume the data via `.asLists()` and pull the row(s) by index — the first row is the header, subsequent rows are the values:
+
+```java
+@When("Admin creates a fully customized loan with the following data:")
+public void createFullyCustomizedLoan(final DataTable table) {
+    final List<List<String>> data = table.asLists();
+    createCustomizedLoan(data.get(1), false);
+}
+```
+
+The `LoanStepDef` class has at least a dozen variants of this pattern (`createFullyCustomizedLoanWithEmi`, `createFullyCustomizedLoanWithInterestRateFrequencyType`, `createFullyCustomizedLoanWithGraceOnArrearsAgeing`, etc.) — each accepting a `DataTable` because every customisation tweak adds another column to the header row in the feature.
+
+The corresponding feature row shape (from `Loan-Part1.feature` and friends):
+
+```gherkin
+And Admin creates a fully customized loan with the following data:
+  | LoanProduct      | submitted on date | with Principal | numberOfRepayments | interestRatePerPeriod | repaymentFrequency | repaymentFrequencyType |
+  | LP1              | 1 July 2022       | 5000           | 24                 | 0                     | 1                  | MONTHS                 |
+```
+
+### `Background:` section
+
+`WorkingCapital_COB.feature` is the only feature that uses a `Background:` block:
+
+```gherkin
+Background:
+  Given Global configuration "enable-business-date" is enabled
+```
+
+Cucumber executes the `Background:` steps before every scenario in the file — useful when many scenarios share a single precondition. The general convention in Fineract is to keep preconditions explicit per scenario, which is why `Background:` is rare.
+
+## Tagging conventions
+
+Every `.feature` file starts with a feature-level tag and most scenarios carry a `@TestRailId:Cxxxx` tag for tracking. The most prevalent tags discovered across the runner's feature directory:
+
+| Tag | Approx scenarios | Meaning |
+| --- | --- | --- |
+| `@AdvancedPaymentAllocation` | ~612 | scenario exercises the advanced payment allocation engine |
+| `@AdvancedPaymentAllocationChargeback` | ~37 | chargeback variants of the above |
+| `@ProgressiveLoanSchedule` | ~27 | progressive (interest-decreasing) loan scheduling |
+| `@PaymentStrategyDueInAdvance` | ~23 | due-in-advance payment strategy |
+| `@creditAllocation` | ~22 | credit allocation handling |
+| `@PaymentStrategyDueInAdvancePenaltyInterestPrincipalFee` | ~13 | composite strategy |
+| `@AssetExternalizationJournalEntry` | ~13 | asset externalization with journal-entry checks |
+| `@chargeoffOnLoanWithInterest` | ~12 | charge-off scenarios |
+| `@Specific` | ~10 | one-off niche scenarios |
+| `@idempotency` | ~9 | idempotency-key behaviour |
+| `@fraud` | ~5 | fraud-flag handling |
+| `@iterate` | ~4 | iterator-based bulk scenarios |
+| `@Skip` | ~13 | excluded from the default run |
+| `@TestRailId:Cxxxxx` | thousands | TestRail link IDs |
+
+Feature-level tags follow `@<Domain>Feature` (e.g. `@LoanFeature`, `@COBFeature`, `@SavingsAccount`, `@ClientFeature`, `@ConfigurationFeature`, …). See [Cucumber Features](/testing/cucumber-features) for the full breakdown.
+
+## Running the suite
+
+### Via the Gradle `cucumber` task
+
+`fineract-e2e-tests-runner/build.gradle` applies the `se.thinkcode.cucumber-runner` plugin and configures it to accept `-Pcucumber.features`, `-Pcucumber.tags`, and `-Pcucumber.name`:
+
+```groovy
+cucumber {
+    if (project.hasProperty("cucumber.features")) {
+        featurePath = project.getProperty("cucumber.features")
+    } else {
+        featurePath = "src/test/resources/features"
+    }
+    tags = 'not @Skip'
+    if (project.hasProperty("cucumber.tags")) {
+        tags = [project.getProperty("cucumber.tags")]
+    }
+    if (project.hasProperty("cucumber.name")) {
+        name = project.getProperty("cucumber.name")
+    }
+    plugin = ['pretty', 'io.qameta.allure.cucumber7jvm.AllureCucumber7Jvm']
+}
+
+tasks.named('cucumber').get().finalizedBy 'allureReport'
+tasks.named('cucumber').get().dependsOn 'spotlessCheck'
+```
+
+Usage:
+
+```bash
+# Run everything (except @Skip)
+./gradlew :fineract-e2e-tests-runner:cucumber
+
+# Run a single feature directory
+./gradlew :fineract-e2e-tests-runner:cucumber -Pcucumber.features=src/test/resources/features/Loan-Part1.feature
+
+# Run a single tag
+./gradlew :fineract-e2e-tests-runner:cucumber -Pcucumber.tags='@COBFeature'
+
+# Run a single scenario by name
+./gradlew :fineract-e2e-tests-runner:cucumber -Pcucumber.name='Loan creation functionality in Fineract'
+
+# Combine tag with explicit exclusion
+./gradlew :fineract-e2e-tests-runner:cucumber -Pcucumber.tags='@LoanFeature and not @Skip'
+```
+
+After every run an Allure report is generated (`tasks.named('cucumber').get().finalizedBy 'allureReport'`).
+
+### Via the JUnit Platform Suite
+
+```bash
+./gradlew :fineract-e2e-tests-runner:test
+```
+
+This launches `TestRunner` through the JUnit Jupiter engine. It honours the same tag filter through `cucumber.filter.tags=not @Skip` in `junit-platform.properties`. The cucumber Gradle task is preferred because it surfaces the `-Pcucumber.tags` / `-Pcucumber.features` overrides; the JUnit-driven path is useful inside IntelliJ where the suite class is directly runnable.
+
+## Dependencies pulled in by the runner
+
+```groovy
+testImplementation(project(':fineract-avro-schemas'))
+testImplementation(project(':fineract-client'))
+testImplementation(project(':fineract-client-feign'))
+testImplementation(project(':fineract-e2e-tests-core').sourceSets.test.output)
+testImplementation 'io.cucumber:cucumber-java:7.20.1'
+testImplementation 'io.cucumber:cucumber-junit:7.20.1'
+testImplementation 'io.cucumber:cucumber-spring:7.20.1'
+testImplementation 'io.cucumber:cucumber-junit-platform-engine:7.20.1'
+testImplementation 'org.junit.platform:junit-platform-suite:1.11.4'
+testImplementation 'io.qameta.allure:allure-cucumber7-jvm:2.29.1'
+testImplementation 'org.apache.activemq:activemq-client:6.1.6'
+testImplementation 'org.apache.avro:avro:1.12.0'
+testImplementation 'org.springframework:spring-context'
+implementation     'org.springframework:spring-test'
+testImplementation 'org.springframework:spring-jms'
+```
+
+Note the `.sourceSets.test.output` trick: the runner depends on the **test** output of `fineract-e2e-tests-core` rather than its main output, because all the step definitions and Spring configuration live under `src/test/java`.
+
+## Conventions and gotchas
+
+- **Initializers live in the runner, not the core.** Adding a new global step seed means dropping a Spring `@Component` into `fineract-e2e-tests-runner/src/test/java/.../initializer/global/`, *not* the core. The base configuration scans the runner's test classpath at boot.
+- **One Spring context per JVM.** `FineractInitializerFactory.Holder` is a static singleton — restarting the suite means restarting the JVM.
+- **`TestContext` is your scratchpad.** Stash IDs, response objects, and event references in `TestContext.INSTANCE.set(...)` rather than instance fields on step definitions — Cucumber will spin up fresh step-def instances per scenario.
+- **`@Skip` is the trapdoor.** Adding `@Skip` to a scenario removes it from both the Gradle task and the IDE suite.
+- **Parallelism is off.** Don't enable Cucumber parallelism without coordinating Fineract-side isolation; many scenarios still rely on shared global state (business date, scheduler, currencies).
+
+## Related pages
+
+- [Testing Overview](/testing/overview)
+- [E2E Test Data](/testing/e2e-test-data) — what the initializer steps actually seed.
+- [Cucumber Features](/testing/cucumber-features) — full catalogue of features and tags.
+- [External Events Overview](/events/overview) — the subsystem `EventStore` / `MessageConsumer` listen on.
+- [Avro Schemas](/events/avro-schemas) — the wire format `EventStore` decodes.
+- [Fineract Client](/clients/fineract-client) and [Fineract Client Feign](/clients/fineract-client-feign) — the SDKs the step definitions consume.

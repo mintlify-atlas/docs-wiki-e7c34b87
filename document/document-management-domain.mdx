@@ -1,0 +1,321 @@
+---
+title: "Document and Image Domain Entities Reference"
+sidebarTitle: "Domain Model"
+description: "Apache Fineract Document and Image entities, DocumentRepository, the legacy DocumentCommand POJO, and the entity_type + entity_id linking pattern."
+---
+
+The Apache Fineract document subsystem persists two aggregates: `Document` (one per attached file) and `Image` (one per entity avatar). Both are simple **Spring Data JDBC** classes — not JPA `@Entity` types — which makes them lighter to load and keeps the document module independent of the platform's Hibernate session. Each row carries the bytes' storage location and a `storage_type_enum` discriminator pointing at the active `ContentStoreType`. This page covers the entity columns, the `DocumentRepository` and `ImageRepository` Spring Data interfaces, the legacy `DocumentCommand` POJO that several older callers still construct, and the `entity_type` + `entity_id` linking pattern that lets a single document table attach a PDF to a client, a loan, or a savings account interchangeably.
+
+<Info>
+Both entities use Spring Data JDBC mappings — `@Table("m_document")` / `@Table("m_image")` from `org.springframework.data.relational.core.mapping`, and `@Id` from `org.springframework.data.annotation`. Lombok `@FieldNameConstants` generates a nested `Fields` class so call sites can reference column names without string literals.
+</Info>
+
+## Document
+
+```java
+@Table("m_document")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor
+@Accessors(chain = true)
+@FieldNameConstants
+public final class Document implements Serializable {
+
+    @Serial private static final long serialVersionUID = 1L;
+
+    @Id
+    @Column("id")                  private Long   id;
+    @Column("parent_entity_type")  private String parentEntityType;
+    @Column("parent_entity_id")    private Long   parentEntityId;
+    @Column("name")                private String name;
+    @Column("file_name")           private String fileName;
+    @Column("size")                private Long   size;
+    @Column("type")                private String type;
+    @Column("description")         private String description;
+    @Column("location")            private String location;
+    @Column("storage_type_enum")   private Integer storageType;
+}
+```
+
+### Column-by-column
+
+| Column | Java field | Purpose |
+| --- | --- | --- |
+| `id` | `id` | Auto-generated primary key. |
+| `parent_entity_type` | `parentEntityType` | URL slug for the owning entity — one of `clients`, `loans`, `savings`, `groups`, `staff`, `client_identifiers`. Set from the JAX-RS path variable. |
+| `parent_entity_id` | `parentEntityId` | The numeric id of the owning entity in its own table (`m_client.id`, `m_loan.id`, …). |
+| `name` | `name` | User-supplied display name. Falls back to `fileName` when the caller omits it. |
+| `file_name` | `fileName` | Original filename from the multipart `FormDataContentDisposition`. |
+| `size` | `size` | File size in bytes, taken from the `Content-Length` HTTP header. |
+| `type` | `type` | MIME type. Comes from the multipart `MediaType` if present, otherwise from Tika via `ContentDetectorManager.detect(...)`, otherwise `application/octet-stream`. |
+| `description` | `description` | User-supplied free text. |
+| `location` | `location` | Storage-relative path returned by `ContentStoreService.upload(...)`. For filesystem, a tenant-namespaced relative path; for S3, the key. |
+| `storage_type_enum` | `storageType` | `ContentStoreType.value` (1 = `FILE_SYSTEM`, 2 = `S3`). Captured at write time so a later download can pick the right store even if the global default changed. |
+
+### No audit columns?
+
+Unlike most Fineract entities, `Document` does not extend `AbstractPersistableCustom` and does not track created / modified user or timestamp. The audit trail is provided by the business event bus instead — `DocumentCreatedBusinessEvent` and `DocumentDeletedBusinessEvent` are published on each successful write.
+
+## Image
+
+```java
+@Table("m_image")
+@Getter @Setter @NoArgsConstructor @AllArgsConstructor
+@Accessors(chain = true)
+@FieldNameConstants
+public final class Image implements Serializable {
+
+    @Serial private static final long serialVersionUID = 1L;
+
+    @Id
+    @Column("id")                private Long    id;
+    @Column("location")          private String  location;
+    @Column("storage_type_enum") private Integer storageType;
+}
+```
+
+Notice what is **missing**: no `parent_entity_type`, no `parent_entity_id`, no filename, no size. The image avatar is owned by the foreign table — `m_client.image_id`, `m_staff.image_id`, etc. — and `Image` itself only carries the storage handle. The link in the other direction is mediated by the [`EntityImageIdAdapter`](#entityimageidadapter) abstraction.
+
+## EntityImageIdAdapter
+
+Because `fineract-document` cannot depend on `fineract-core`'s portfolio packages, the image service does not know how to read or write `m_client.image_id`, `m_staff.image_id`, and so on. Instead it discovers one `EntityImageIdAdapter` per entity type and dispatches to it:
+
+```java
+@Deprecated
+public interface EntityImageIdAdapter {
+    boolean accept(String entityType);
+
+    Optional<ImageIdResult> get(Long entityId);
+    Optional<ImageIdResult> set(Long entityId, Long imageId);
+
+    @Builder @Data @NoArgsConstructor @AllArgsConstructor
+    class ImageIdResult implements Serializable {
+        private Long   id;
+        private String displayName;
+    }
+}
+```
+
+`ClientImageIdAdapter`, `StaffImageIdAdapter`, etc. live in `fineract-core` under each portfolio package and are picked up as a `List<EntityImageIdAdapter>` by `ImageWritePlatformServiceImpl` / `ImageReadPlatformServiceImpl`. The interface is `@Deprecated` — the long-term plan is to fold images into the same generic `m_document` table.
+
+A typical implementation:
+
+```java
+@Component
+class ClientImageIdAdapter implements EntityImageIdAdapter {
+
+    private static final String ENTITY_TYPE = "clients";
+    private final ClientRepository repository;
+
+    @Override public boolean accept(String entityType) {
+        return ENTITY_TYPE.equalsIgnoreCase(entityType);
+    }
+
+    @Override @Transactional(readOnly = true)
+    public Optional<ImageIdResult> get(Long entityId) {
+        return repository.findById(entityId)
+                .filter(client -> nonNull(client.getImageId()))
+                .map(client -> ImageIdResult.builder()
+                        .id(client.getImageId())
+                        .displayName(client.getDisplayName())
+                        .build());
+    }
+
+    @Override @Transactional
+    public Optional<ImageIdResult> set(Long entityId, Long imageId) {
+        final var result = get(entityId);
+        if (imageId == null) {
+            repository.removeImageId(entityId);
+        } else {
+            repository.updateByIdAndImageId(entityId, imageId);
+        }
+        return result;
+    }
+}
+```
+
+`accept(...)` is the dispatch predicate; `get(...)` fetches the current image id and a display name (used for the image's `displayName` field); `set(...)` writes back the link.
+
+## DocumentRepository
+
+```java
+public interface DocumentRepository
+        extends ListCrudRepository<Document, Long>, QueryByExampleExecutor<Document> {
+
+    List<Document> findAllByParentEntityTypeAndParentEntityId(
+            String parentEntityType, Long parentEntityId);
+
+    Optional<Document> findByIdAndParentEntityTypeAndParentEntityId(
+            Long id, String entityType, Long entityId);
+}
+```
+
+| Method | Purpose | Used by |
+| --- | --- | --- |
+| `findAllByParentEntityTypeAndParentEntityId` | List every document attached to one entity. | `DocumentReadPlatformService.retrieveAllDocuments` → `GET /v1/{entityType}/{entityId}/documents`. |
+| `findByIdAndParentEntityTypeAndParentEntityId` | Defensive single-document lookup that enforces the URL's entityType/entityId pair. | `DocumentReadPlatformService.retrieveDocument` / `retrieveDocumentContent`. |
+| `findById` (inherited) | Used by write services that already know the id. | `DocumentWritePlatformServiceImpl.updateDocument`, `deleteDocument`. |
+| `save`, `deleteById`, `findAll` (inherited) | Standard CRUD. | Write services. |
+
+`ListCrudRepository` returns `java.util.List` for collection methods (rather than `Iterable`), which keeps the read services free of conversion boilerplate. `QueryByExampleExecutor` is inherited but not currently used by callers; it stays in case ad-hoc filtering is needed in the future.
+
+## ImageRepository
+
+```java
+public interface ImageRepository extends ListCrudRepository<Image, Long> { }
+```
+
+Vanilla — the image is only ever found via the foreign-key id stored on the parent table.
+
+## DocumentCommand (legacy)
+
+```java
+@Deprecated(forRemoval = true)
+public class DocumentCommand {
+    private final Long   id;
+    private final String parentEntityType;
+    private final Long   parentEntityId;
+    private final String name;
+    private final String description;
+    private       String fileName;
+    private       Long   size;
+    private       String type;
+    private       String location;
+
+    public DocumentCommand(final Set<String> modifiedParameters,
+            final Long id, final String parentEntityType, final Long parentEntityId,
+            final String name, final String fileName, final Long size, final String type,
+            final String description, final String location) { ... }
+}
+```
+
+This POJO predates the modern `DocumentCreateCommand` / `DocumentUpdateCommand` pipeline classes. It is **`@Deprecated(forRemoval = true)`** but still constructed by a handful of legacy integration points that have not migrated to the new request DTOs. New code should use `DocumentCreateRequest` and `DocumentUpdateRequest` (under `data/`) instead, which Lombok-generate proper `@Builder` factories:
+
+```java
+DocumentCreateRequest.builder()
+    .entityType("clients")
+    .entityId(42L)
+    .name("KYC scan")
+    .description("Scanned passport")
+    .fileName("passport.pdf")
+    .size(248_103L)
+    .type("application/pdf")
+    .stream(inputStream)
+    .build();
+```
+
+The new request classes carry the binary `InputStream` directly, which `DocumentWritePlatformServiceImpl` then forwards to `ContentStoreService.upload(...)`.
+
+## EntityType linking pattern
+
+The same `m_document` table stores documents for **every** entity type. The linkage is a string discriminator plus a foreign id:
+
+```text
+m_document
++---------------------+-------------------+
+| parent_entity_type  | parent_entity_id  |
++---------------------+-------------------+
+| 'clients'           | 42                |
+| 'loans'             | 1001              |
+| 'savings'           | 778               |
+| 'staff'             | 5                 |
+| 'groups'            | 12                |
+| 'client_identifiers'| 91                |
++---------------------+-------------------+
+```
+
+The string values are exactly the URL slug used in the JAX-RS template `/v1/{entityType}/{entityId}/documents`. The constant `DOCUMENT_API_PARAM_ENTITY_TYPE = "entityType"` (in `DocumentApiConstants`) names the path parameter. There is **no** SQL foreign-key constraint — referential integrity is purely a convention. This is by design: it lets the documents subsystem stay agnostic about the portfolio module set.
+
+### Allowed entity types
+
+The `@Tag` description on `DocumentApiResource` enumerates the supported values:
+
+> Note: the currently allowed entities are
+> - `clients` — URL pattern as clients
+> - `staff` — URL pattern as staff
+> - `loans` — URL pattern as loans
+> - `savings` — URL pattern as savings
+> - `client_identifiers` — URL pattern as client_identifiers
+> - `groups` — URL pattern as groups
+
+Sending any other string at the URL level is accepted by the resource and persisted verbatim, but it will be inaccessible through the rest of the platform (no `findOneWithNotFoundDetection`-style validation runs against the parent table).
+
+## Storage location convention
+
+`DocumentWritePlatformServiceImpl.getPath(...)` builds the location key as:
+
+```java
+private String getPath(final String prefix, final String entityType,
+                       final Long entityId, final String fileName,
+                       String delimiter) {
+    return String.join(delimiter, prefix, entityType, String.valueOf(entityId), fileName);
+}
+```
+
+with `prefix = "documents"` and `delimiter = "/"` (from `ContentStoreService.getDelimiter()`). For a passport scan attached to client 42 the path is:
+
+```
+documents/clients/42/passport.pdf
+```
+
+`ImageWritePlatformServiceImpl` uses the same scheme but with `prefix = "images"`:
+
+```
+images/clients/42/<uuid>.jpg
+```
+
+The filesystem store further injects a random sub-folder per upload (`DefaultContentPathRandomizer.randomize()` returns 16 alphabetic characters) so two clients with the same filename never collide. S3 does not need that randomisation because object versioning handles collisions natively.
+
+## DocumentData (read DTO)
+
+```java
+@Builder @Data @NoArgsConstructor @AllArgsConstructor
+public class DocumentData implements Serializable {
+    private Long    id;
+    private String  parentEntityType;
+    private Long    parentEntityId;
+    private String  name;
+    private String  fileName;
+    private Long    size;
+    private String  type;
+    private String  location;
+    private String  description;
+    private Integer storageType;
+}
+```
+
+`DocumentMapper` (MapStruct) projects the `Document` entity onto `DocumentData` and back. The DTO is the JSON shape returned by `GET /v1/{entityType}/{entityId}/documents` and `GET …/{documentId}`.
+
+## DocumentContent
+
+A small holder for streamed downloads:
+
+```java
+public class DocumentContent {
+    InputStream stream;
+    String      contentType;
+    String      fileName;
+    Long        size;
+}
+```
+
+Returned by `DocumentReadPlatformService.retrieveDocumentContent(entityType, entityId, documentId)` and consumed by `DocumentApiResource.downloadFile(...)`, which wraps it in a `StreamResponseUtil.StreamResponseData` to set `Content-Disposition: attachment; filename="…"`.
+
+## Business events
+
+`DocumentBusinessEvent` is the abstract base, with two concrete subclasses:
+
+| Event | Published when |
+| --- | --- |
+| `DocumentCreatedBusinessEvent` | `DocumentWritePlatformServiceImpl.createDocument(...)` completes successfully. Payload: `DocumentData`. |
+| `DocumentDeletedBusinessEvent` | `DocumentWritePlatformServiceImpl.deleteDocument(...)` completes successfully. Payload: `DocumentData`. |
+
+There is no `DocumentUpdatedBusinessEvent` — the existing update path notes a `TODO` and does not currently publish. Subscribers can listen via the standard `BusinessEventListener<T>` mechanism from `fineract-core`.
+
+## Cross-references
+
+- [Document overview](overview) — module file map.
+- [Document API](document-api) — REST surface that creates and reads these entities.
+- [Images API](images-api) — Image-specific operations and the data-URL pipeline.
+- [Content store](content-store) — the byte-store SPI consumed by the write services.
+- [Detector and policies](detector-and-policies) — Tika, traversal, and whitelist gates.
+- [Portfolio / Clients](/portfolio/clients) — primary owner of documents and avatar images.
+- [API / Document APIs](/api/document-apis) — published OpenAPI reference.

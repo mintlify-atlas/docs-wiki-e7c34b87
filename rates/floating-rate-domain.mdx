@@ -1,0 +1,326 @@
+---
+title: "FloatingRate and FloatingRatePeriod Entities Reference"
+sidebarTitle: "Floating Rate Domain"
+description: "Deep reference for Apache Fineract FloatingRate and FloatingRatePeriod JPA entities: persisted fields, base vs differential periods, applicable-rate algorithm and update semantics."
+---
+
+The Apache Fineract `FloatingRate` entity (`fineract-rates/.../portfolio/floatingrates/domain/FloatingRate.java`) is the catalog row for a named floating interest rate timeline. Its periods, persisted in `m_floating_rates_periods`, carry the actual `(fromDate, interestRate, isDifferentialToBaseLendingRate)` triples. The pair models two regimes — **base lending rates** (absolute) and **differential rates** (added on top of the active base).
+
+For the REST endpoints see [Floating rates API](/rates/floating-rates-api); for the module map see [Rates overview](/rates/overview).
+
+## `FloatingRate` declaration
+
+```java
+@Entity
+@Table(name = "m_floating_rates",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "name" }, name = "unq_name") })
+public class FloatingRate extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Column(name = "name", length = 200, unique = true, nullable = false)
+    private String name;
+
+    @Column(name = "is_base_lending_rate", nullable = false)
+    private boolean isBaseLendingRate;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean isActive;
+
+    @OrderBy(value = "fromDate,id")
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "floatingRate", orphanRemoval = true, fetch = FetchType.EAGER)
+    private List<FloatingRatePeriod> floatingRatePeriods;
+    // ...
+}
+```
+
+Highlights:
+
+- `AbstractAuditableWithUTCDateTimeCustom<Long>` provides `id`, `createdBy`, `createdDate`, `lastModifiedBy`, `lastModifiedDate`, all in UTC.
+- `name` has a unique index — `FloatingRateDataValidator` checks for collisions before persist.
+- `is_base_lending_rate` flags whether this rate is the base curve (true) or quotes deltas against the base (false). The validator allows **only one** base rate to exist at a time.
+- The period list is loaded eagerly and ordered by `(fromDate, id)`. The `id` tie-breaker is important when multiple periods share a `fromDate`: the most recently inserted wins.
+
+### Persisted fields
+
+| Column (`m_floating_rates`) | Java field | Notes |
+| --- | --- | --- |
+| `name` (length 200, unique) | `name` | Display name, e.g. "Auto loan reference rate". |
+| `is_base_lending_rate` | `isBaseLendingRate` | True ⇒ absolute curve; false ⇒ differential or absolute periods on top of an external base. |
+| `is_active` | `isActive` | When false, products/loans should not pick up new rates from it. |
+| (audit columns from `AbstractAuditableWithUTCDateTimeCustom`) | — | Created/modified user + UTC timestamp. |
+
+There are two **legacy** columns `created_date` and `lastmodified_date` that the source still mentions in a deprecated comment block — they are no longer mapped, but Liquibase left them in the schema to support online migrations.
+
+## Factory and update
+
+### `FloatingRate.createNew(JsonCommand command)`
+
+```java
+public static FloatingRate createNew(JsonCommand command) {
+    final String  name              = command.stringValueOfParameterNamed("name");
+    final boolean isBaseLendingRate = command.parameterExists("isBaseLendingRate")
+        && command.booleanPrimitiveValueOfParameterNamed("isBaseLendingRate");
+    final boolean isActive          = !command.parameterExists("isActive")
+        || command.booleanPrimitiveValueOfParameterNamed("isActive");
+    final List<FloatingRatePeriod> floatingRatePeriods = getRatePeriods(command);
+    return new FloatingRate(name, isBaseLendingRate, isActive, floatingRatePeriods);
+}
+```
+
+Defaults: `isBaseLendingRate` defaults to false; `isActive` defaults to true.
+
+The constructor links each period back to the parent rate:
+
+```java
+public FloatingRate(String name, boolean isBaseLendingRate, boolean isActive, List<FloatingRatePeriod> floatingRatePeriods) {
+    this.name = name;
+    this.isBaseLendingRate = isBaseLendingRate;
+    this.isActive = isActive;
+    this.floatingRatePeriods = floatingRatePeriods;
+    if (floatingRatePeriods != null) {
+        for (FloatingRatePeriod ratePeriod : floatingRatePeriods) {
+            ratePeriod.updateFloatingRate(this);
+        }
+    }
+}
+```
+
+### `getRatePeriods(JsonCommand command)`
+
+```java
+private static List<FloatingRatePeriod> getRatePeriods(final JsonCommand command) {
+    if (!command.parameterExists("ratePeriods")) {
+        return null;
+    }
+    List<FloatingRatePeriod> ratePeriods = new ArrayList<>();
+    JsonArray arrayOfParameterNamed = command.arrayOfParameterNamed("ratePeriods");
+    for (final JsonElement ratePeriod : arrayOfParameterNamed) {
+        final JsonObject ratePeriodObject = ratePeriod.getAsJsonObject();
+        final JsonParserHelper helper = new JsonParserHelper();
+        final LocalDate fromDate = helper.extractLocalDateNamed("fromDate", ratePeriod, new HashSet<String>());
+        final BigDecimal interestRate = ratePeriodObject.get("interestRate").getAsBigDecimal();
+        final boolean isDifferentialToBaseLendingRate = helper.parameterExists("isDifferentialToBaseLendingRate", ratePeriod)
+                && ratePeriodObject.get("isDifferentialToBaseLendingRate").getAsBoolean();
+        final boolean isActive = true;
+        ratePeriods.add(new FloatingRatePeriod(fromDate, interestRate, isDifferentialToBaseLendingRate, isActive));
+    }
+    return ratePeriods;
+}
+```
+
+Notes:
+
+- `isActive` is **hard-coded true** for new periods coming through the create/update path. Deactivation happens only via the update flow (see below).
+- `interestRate` is read straight from the `JsonObject` (no locale parsing); the validator has already gated for a valid number.
+- The set helper is a literal `new HashSet<String>()` because `extractLocalDateNamed` mutates it with the parameter name as a side effect — `FloatingRate` does not need that information.
+
+### `FloatingRate.update(JsonCommand command)`
+
+```java
+public Map<String, Object> update(final JsonCommand command) {
+    final Map<String, Object> actualChanges = new LinkedHashMap<>(9);
+
+    if (command.isChangeInStringParameterNamed("name", this.name))                { /* update + actualChanges */ }
+    if (command.isChangeInBooleanParameterNamed("isBaseLendingRate", this.isBaseLendingRate)) { /* update */ }
+    if (command.isChangeInBooleanParameterNamed("isActive", this.isActive))       { /* update */ }
+
+    final List<FloatingRatePeriod> newRatePeriods = getRatePeriods(command);
+    if (newRatePeriods != null && !newRatePeriods.isEmpty()) {
+        updateRatePeriods(newRatePeriods);
+        actualChanges.put("ratePeriods", command.jsonFragment("ratePeriods"));
+    }
+
+    return actualChanges;
+}
+
+private void updateRatePeriods(final List<FloatingRatePeriod> newRatePeriods) {
+    final LocalDate today = DateUtils.getBusinessLocalDate();
+    if (this.floatingRatePeriods != null) {
+        for (FloatingRatePeriod ratePeriod : this.floatingRatePeriods) {
+            LocalDate fromDate = ratePeriod.getFromDate();
+            if (DateUtils.isAfter(fromDate, today)) {
+                ratePeriod.setActive(false);
+            }
+        }
+    }
+    for (FloatingRatePeriod newRatePeriod : newRatePeriods) {
+        newRatePeriod.updateFloatingRate(this);
+        this.floatingRatePeriods.add(newRatePeriod);
+    }
+}
+```
+
+Critical update behaviour:
+
+- **Rate periods in the past are immutable**. Only periods with `fromDate` strictly after today's business date are deactivated by setting `isActive=false`.
+- **All inbound periods are appended**. The new payload is **not** treated as a replacement set — existing past periods remain.
+- The Swagger description of `PUT /v1/floatingrates/{id}` is literal: "Rate Periods in the past cannot be modified. All the future rate periods would be replaced with the new ratePeriods data sent."
+
+So if the new payload contains a `fromDate` matching an existing future period, the ordering `(fromDate, id)` means the **newest insert** wins because the higher `id` sorts later. The deactivated rows are still queried by `fetchInterestRates(...)` filtering on `isActive`.
+
+## `fetchInterestRates(FloatingRateDTO)`
+
+The core query method. Given a `FloatingRateDTO` (the loan/product asks "what rates apply starting on `startDate`?") this returns the applicable `FloatingRatePeriodData` slices, **including a fold of base + differential** when the loan uses differential rates:
+
+```java
+public Collection<FloatingRatePeriodData> fetchInterestRates(final FloatingRateDTO floatingRateDTO) {
+    Collection<FloatingRatePeriodData> applicableRates = new ArrayList<>();
+    FloatingRatePeriod previousPeriod = null;
+    boolean addPeriodData = false;
+    for (FloatingRatePeriod floatingRatePeriod : this.floatingRatePeriods) {
+        if (floatingRatePeriod.isActive()) {
+            // capture the rate active at startDate
+            if (applicableRates.isEmpty() && DateUtils.isBefore(floatingRateDTO.getStartDate(), floatingRatePeriod.fetchFromDate())) {
+                if (floatingRateDTO.isFloatingInterestRate()) {
+                    addPeriodData = true;
+                }
+                if (previousPeriod != null) {
+                    applicableRates.add(previousPeriod.toData(floatingRateDTO));
+                } else if (!addPeriodData) {
+                    applicableRates.add(floatingRatePeriod.toData(floatingRateDTO));
+                }
+            }
+            if (addPeriodData) {
+                applicableRates.add(floatingRatePeriod.toData(floatingRateDTO));
+            }
+            previousPeriod = floatingRatePeriod;
+        }
+    }
+    if (applicableRates.isEmpty() && previousPeriod != null) {
+        applicableRates.add(previousPeriod.toData(floatingRateDTO));
+    }
+    return applicableRates;
+}
+```
+
+Behaviour:
+
+- **Floating loan** (`floatingRateDTO.isFloatingInterestRate() == true`): every active future period from `startDate` onwards is added (rates reprice each period).
+- **Fixed at disbursement** (`isFloatingInterestRate() == false`): only the **single** rate active **on** `startDate` is returned (the loan locks in that rate for the life of the loan).
+- If the loan's `startDate` is **after** every period (so the loop falls through without populating `applicableRates`), the **last seen** active period is added as a fallback.
+
+The translation per period to `FloatingRatePeriodData` is done by `FloatingRatePeriod.toData(floatingRateDTO)` — see below.
+
+## `FloatingRatePeriod` declaration
+
+```java
+@Entity
+@Table(name = "m_floating_rates_periods")
+public class FloatingRatePeriod extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "floating_rates_id", nullable = false)
+    private FloatingRate floatingRate;
+
+    @Column(name = "from_date", nullable = false)
+    private LocalDate fromDate;
+
+    @Column(name = "interest_rate", scale = 6, precision = 19, nullable = false)
+    private BigDecimal interestRate;
+
+    @Column(name = "is_differential_to_base_lending_rate", nullable = false)
+    private boolean isDifferentialToBaseLendingRate;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean isActive;
+    // ...
+}
+```
+
+### Persisted fields
+
+| Column (`m_floating_rates_periods`) | Java field | Notes |
+| --- | --- | --- |
+| `floating_rates_id` | `floatingRate` | FK back to `m_floating_rates`. |
+| `from_date` | `fromDate` | Period starts on this date. Compared to the loan / disbursement date strictly. |
+| `interest_rate` (scale 6, precision 19) | `interestRate` | Either an absolute rate or a delta to the base rate. |
+| `is_differential_to_base_lending_rate` | `isDifferentialToBaseLendingRate` | When true, `interestRate` is a delta; `toData(...)` adds the active base rate. |
+| `is_active` | `isActive` | False ⇒ deactivated by an update; not returned by `fetchInterestRates(...)`. |
+
+There is no `to_date` — the period stretches to "until the next period in the ordered set starts". That makes the period set effectively a step function indexed by `fromDate`.
+
+### `toData(FloatingRateDTO)`
+
+```java
+public FloatingRatePeriodData toData(final FloatingRateDTO floatingRateDTO) {
+    BigDecimal interest = getInterestRate().add(floatingRateDTO.getInterestRateDiff());
+    if (isDifferentialToBaseLendingRate()) {
+        interest = interest.add(floatingRateDTO.fetchBaseRate(fetchFromDate()));
+    }
+    final LocalDate fromDate = getFromDate();
+    return new FloatingRatePeriodData(getId(), fromDate, interest, isDifferentialToBaseLendingRate(), isActive());
+}
+```
+
+So the rate that ends up on the produced `FloatingRatePeriodData` is:
+
+```
+rate = interestRate + floatingRateDTO.interestRateDiff
+       + (isDifferentialToBaseLendingRate ? floatingRateDTO.fetchBaseRate(fromDate) : 0)
+```
+
+Where:
+
+- `interestRateDiff` is the **product-level spread** (`LoanProduct.interest_rate_differential`).
+- `fetchBaseRate(date)` is the base lending rate active on `date` (the FQ loan engine resolves this via the catalog's base rate before calling).
+
+### `setActive(boolean)`
+
+The only mutable setter — used by `FloatingRate.updateRatePeriods(...)` to deactivate future periods being replaced.
+
+### Constructor
+
+```java
+public FloatingRatePeriod(LocalDate fromDate, BigDecimal interestRate, boolean isDifferentialToBaseLendingRate, boolean isActive) {
+    this.fromDate                       = fromDate;
+    this.interestRate                   = interestRate;
+    this.isDifferentialToBaseLendingRate= isDifferentialToBaseLendingRate;
+    this.isActive                       = isActive;
+}
+```
+
+`floatingRate` is set later via `updateFloatingRate(FloatingRate)` because periods are first built standalone in `getRatePeriods(JsonCommand)`.
+
+## `FloatingRateDTO` — the request envelope
+
+`FloatingRateDTO` (in `fineract-rates/.../data/`) is the request envelope that callers fill when they ask for a schedule. Notable fields:
+
+- `LocalDate startDate` — the date from which the loan begins accruing.
+- `BigDecimal interestRateDiff` — the product / loan spread to add.
+- `boolean isFloatingInterestRate` — whether the loan reprices each period or locks in the rate at `startDate`.
+- A list / lookup of base lending rate periods used by `fetchBaseRate(LocalDate)`.
+
+## Differential vs base — worked example
+
+Suppose we have:
+
+- Base lending rate `"BLR"` (`isBaseLendingRate=true`) with periods:
+  - `2024-01-01: 6.00`
+  - `2024-07-01: 6.50`
+- Catalog rate `"AutoLoan"` (`isBaseLendingRate=false`) with periods:
+  - `2024-01-01: +1.50, isDifferentialToBaseLendingRate=true`
+  - `2024-10-01: 8.25, isDifferentialToBaseLendingRate=false`
+
+A loan with `AutoLoan` disbursed on `2024-08-01`, `interestRateDiff=0`, `isFloatingInterestRate=true` would receive:
+
+- For the period starting `2024-08-01` → uses the `+1.50` differential row → `6.50 (BLR active 2024-07-01) + 1.50 = 8.00`.
+- For the period starting `2024-10-01` → uses the absolute row → `8.25`.
+
+If the loan had `isFloatingInterestRate=false`, only the period active on `2024-08-01` (the differential row) would be returned, the loan locks in `8.00` for its life.
+
+## Repository wrapper
+
+```java
+public interface FloatingRateRepositoryWrapper {
+    FloatingRate findOneWithNotFoundDetection(Long floatingRateId);
+}
+```
+
+Throws `FloatingRateNotFoundException` on miss. Used by loan-product write services when binding a product's `floatingRateId` parameter.
+
+## Cross-references
+
+- For the REST surface: [Floating rates API](/rates/floating-rates-api).
+- For the module map: [Rates overview](/rates/overview).
+- For shared `JsonCommand`, `AbstractAuditableWithUTCDateTimeCustom`, `JsonParserHelper`, `DateUtils.getBusinessLocalDate()`: [Portfolio shared domain](/core/portfolio-shared-domain).
+- For loan-product wiring and per-loan rate snapshots: [Loan charges](/loan/loan-charges) (loan-product reference).
+- For repricing through COB: [Jobs overview](/jobs/overview).

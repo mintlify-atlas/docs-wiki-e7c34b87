@@ -1,0 +1,348 @@
+---
+title: "Command Handler Registry — @CommandType Dispatch Map"
+sidebarTitle: "Handler Registry"
+description: "How CommandHandlerProvider builds the entity|action map from @CommandType beans, looks them up at runtime, and raises UnsupportedCommandException."
+---
+
+Apache Fineract's command framework dispatches every write to a Spring bean annotated with `@CommandType(entity, action)`. Discovery happens once at startup inside `CommandHandlerProvider`; lookup at runtime is a single `HashMap.get`. The same two-string addressing — `entityName|actionName` — also doubles as the row's `permissionCode` after stripping the pipe, which is why permissions, audit search, hooks, and maker-checker all align on the same vocabulary.
+
+This page documents the annotation, the registry, the lookup contract, the failure modes, and shows a representative slice of handlers across the codebase so you can navigate to the right module quickly.
+
+## The `@CommandType` annotation
+
+```java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+@Documented
+public @interface CommandType {
+
+    /**
+     * Returns the name of the entity for this {@link CommandType}.
+     */
+    String entity();
+
+    /**
+     * Return the name of the action for this {@link CommandType}.
+     */
+    String action();
+}
+```
+
+| Element                                                                                             | Meaning                                                                                                                       |
+| --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `@Retention(RUNTIME)` + `@Target(TYPE)`                                                             | Class-level annotation visible through reflection. `ApplicationContext.findAnnotationOnBean` needs runtime retention.          |
+| `entity()`                                                                                           | The noun: `CLIENT`, `LOAN`, `SAVINGSACCOUNT`, `JOURNALENTRY`, `GLACCOUNT`, `INTEREST_PAUSE`, …                                |
+| `action()`                                                                                           | The verb: `CREATE`, `UPDATE`, `DELETE`, `ACTIVATE`, `DISBURSE`, `DEPOSIT`, `WITHDRAW`, `APPROVE`, `REJECT`, …                  |
+
+The pair is what `CommandWrapper.commandName()` reads (`actionName + "_" + entityName`) and what every permission, audit row, and hook is keyed by.
+
+Source: `fineract-core/src/main/java/org/apache/fineract/commands/annotation/CommandType.java`.
+
+## The `NewCommandSourceHandler` contract
+
+```java
+public interface NewCommandSourceHandler {
+
+    CommandProcessingResult processCommand(JsonCommand command);
+}
+```
+
+Every `@CommandType` bean implements this single-method interface. The `JsonCommand` carries:
+
+- the parsed request JSON,
+- ids resolved from the URL (`entityId`, `subentityId`, `clientId`, `loanId`, `savingsId`, `groupId`, `productId`, `transactionId`),
+- external ids,
+- the originating `href`.
+
+The returned `CommandProcessingResult` is what `SynchronousCommandProcessingService` serialises into `CommandSource.result` and uses to refresh foreign keys via `updateForAudit`.
+
+Source: `fineract-core/src/main/java/org/apache/fineract/commands/handler/NewCommandSourceHandler.java`.
+
+## `CommandHandlerProvider` — registry mechanics
+
+```java
+@Component
+@NoArgsConstructor
+@Slf4j
+public class CommandHandlerProvider implements ApplicationContextAware, InitializingBean {
+
+    private final HashMap<String, String> registeredHandlers = new HashMap<>();
+    private ApplicationContext applicationContext;
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        initializeHandlerRegistry();
+    }
+
+    private void initializeHandlerRegistry() {
+        final String[] commandHandlerBeans = applicationContext.getBeanNamesForAnnotation(CommandType.class);
+        if (ArrayUtils.isNotEmpty(commandHandlerBeans)) {
+            for (final String commandHandlerName : commandHandlerBeans) {
+                log.debug("Register command handler '{}' ...", commandHandlerName);
+                final CommandType commandType = applicationContext.findAnnotationOnBean(commandHandlerName, CommandType.class);
+                try {
+                    if (commandType != null) {
+                        registeredHandlers.put(commandType.entity() + "|" + commandType.action(), commandHandlerName);
+                    } else {
+                        log.error("Unable to register command handler '{}'!", commandHandlerName);
+                    }
+                } catch (final Throwable th) {
+                    log.error("Unable to register command handler '{}'!", commandHandlerName, th);
+                }
+            }
+        }
+    }
+
+    public NewCommandSourceHandler getHandler(final String entity, final String action) {
+        Preconditions.checkArgument(StringUtils.isNoneEmpty(entity), "An entity must be given!");
+        Preconditions.checkArgument(StringUtils.isNoneEmpty(action), "An action must be given!");
+
+        final String key = entity + "|" + action;
+        if (!registeredHandlers.containsKey(key)) {
+            throw new UnsupportedCommandException(key);
+        }
+        return (NewCommandSourceHandler) applicationContext.getBean(registeredHandlers.get(key));
+    }
+}
+```
+
+Source: `fineract-core/src/main/java/org/apache/fineract/commands/provider/CommandHandlerProvider.java`.
+
+### Initialization
+
+`afterPropertiesSet()` (`InitializingBean`) runs after `applicationContext` has been injected. It:
+
+1. Calls `getBeanNamesForAnnotation(CommandType.class)` — Spring already classified beans annotated with `@CommandType` while building the context.
+2. Looks up the annotation on each bean (via `findAnnotationOnBean`, which honours meta-annotations).
+3. Stores `entity + "|" + action -> beanName`. The pipe is purely an internal separator — it never appears in permission names or audit rows.
+4. Logs `error` for any bean where the annotation cannot be read.
+
+The map is populated **once** at startup; it is not cleared or refreshed. New handler beans only become visible after a container restart.
+
+### Lookup
+
+```java
+public NewCommandSourceHandler getHandler(final String entity, final String action) {
+    ...
+    final String key = entity + "|" + action;
+    if (!registeredHandlers.containsKey(key)) {
+        throw new UnsupportedCommandException(key);
+    }
+    return (NewCommandSourceHandler) applicationContext.getBean(registeredHandlers.get(key));
+}
+```
+
+| Property                | Detail                                                                                                            |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Case-sensitivity        | Exact match — `CLIENT|CREATE` is distinct from `Client|create`. Production code uses upper-case nouns and verbs.    |
+| Null/empty handling     | Guava's `Preconditions.checkArgument` throws `IllegalArgumentException` with the message `"An entity must be given!"` / `"An action must be given!"`. |
+| Missing key             | Throws `UnsupportedCommandException(key)` — the unsupported command name is the pipe-joined form, e.g. `LOAN|UNICORN`. |
+| Bean resolution         | `applicationContext.getBean(name, …)` is called every lookup so prototype-scoped handlers receive a fresh instance per command. The vast majority of handlers are `@Service` (singleton). |
+
+### `UnsupportedCommandException`
+
+```java
+public class UnsupportedCommandException extends RuntimeException {
+
+    private final String unsupportedCommandName;
+
+    public UnsupportedCommandException(final String unsupportedCommandName) {
+        this.unsupportedCommandName = unsupportedCommandName;
+    }
+
+    public UnsupportedCommandException(final String unsupportedCommandName, String message) {
+        super(message);
+        this.unsupportedCommandName = unsupportedCommandName;
+    }
+}
+```
+
+The exception is mapped to HTTP `400 Bad Request` by Fineract's global mapper (`error.msg.unsupported.command`). Two callers raise it:
+
+- `CommandHandlerProvider.getHandler` — when no `@CommandType` bean matches the requested `(entity, action)`.
+- `SynchronousCommandProcessingService.findCommandHandler` — when the hard-coded dispatch for datatable / note / survey / loan-disburse-detail / interest-pause resources cannot find a sub-action.
+- `PortfolioCommandSourceWritePlatformServiceImpl.validateMakerCheckerTransaction` — uses the second constructor to signal "Maker user is missing." / "Can not be checked by the same user.".
+
+## Where the dispatch fits in
+
+```mermaid
+flowchart LR
+    A[CommandWrapper actionName/entityName] --> B[SynchronousCommandProcessingService.findCommandHandler]
+    B -->|datatable / note / survey / loan-disburse / interest-pause| C[applicationContext.getBean by name]
+    B -->|default| D[CommandHandlerProvider.getHandler]
+    D --> E{entity|action in map?}
+    E -->|yes| F[NewCommandSourceHandler bean]
+    E -->|no| G[UnsupportedCommandException]
+    F --> H[CommandSourceService.processCommand]
+```
+
+`SynchronousCommandProcessingService.findCommandHandler` first checks the special-case resources (`isDatatableResource`, `isNoteResource`, `isSurveyResource`, `isLoanDisburseDetailResource`, `isInterestPauseResource`) because their handlers are addressed by bean name rather than by `(entity, action)`. Anything outside those branches goes through `CommandHandlerProvider.getHandler(wrapper.entityName(), wrapper.actionName())`.
+
+## Representative handlers across modules
+
+The catalogue below is a small slice of the registry to show how `@CommandType` is spread across modules. Run `grep -rn "@CommandType" --include="*.java"` to see them all.
+
+| Entity                                | Action                       | Path                                                                                                                                          |
+| ------------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLIENT`                              | `CREATE`                     | `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/handler/CreateClientCommandHandler.java`                                  |
+| `CLIENT`                              | `ACTIVATE`                   | `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/handler/ActivateClientCommandHandler.java`                               |
+| `CLIENT`                              | `CLOSE`                      | `fineract-provider/src/main/java/org/apache/fineract/portfolio/client/handler/CloseClientCommandHandler.java`                                   |
+| `LOAN`                                | `DISBURSE`                   | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/handler/DisburseLoanCommandHandler.java`                                |
+| `LOAN`                                | `CLOSE`                      | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/handler/CloseLoanCommandHandler.java`                                   |
+| `LOAN`                                | `CHARGEOFF`                  | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/handler/ChargeOffLoanCommandHandler.java`                               |
+| `LOANCHARGE`                          | `CREATE`                     | `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/handler/AddLoanChargeCommandHandler.java`                               |
+| `SAVINGSACCOUNT`                      | `DEPOSIT`                    | `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/handler/DepositSavingsAccountCommandHandler.java`                       |
+| `SAVINGSACCOUNT`                      | `ACTIVATE`                   | `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/handler/ActivateSavingsAccountCommandHandler.java`                      |
+| `SAVINGSACCOUNT`                      | `CLOSE`                      | `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/handler/CloseSavingsAccountCommandHandler.java`                          |
+| `JOURNALENTRY`                        | `CREATE`                     | `fineract-provider/src/main/java/org/apache/fineract/accounting/journalentry/handler/CreateJournalEntryCommandHandler.java`                    |
+| `JOURNALENTRY`                        | `REVERSE`                    | `fineract-provider/src/main/java/org/apache/fineract/accounting/journalentry/handler/ReverseJournalEntryCommandHandler.java`                   |
+| `GLACCOUNT`                           | `CREATE`                     | `fineract-accounting/src/main/java/org/apache/fineract/accounting/glaccount/handler/CreateGLAccountCommandHandler.java`                        |
+| `GLCLOSURE`                           | `CREATE` / `UPDATE` / `DELETE` | `fineract-accounting/src/main/java/org/apache/fineract/accounting/closure/handler/CreateGLClosureCommandHandler.java` (and siblings)            |
+| `PERIODICACCRUALACCOUNTING`           | `EXECUTE`                    | `fineract-accounting/src/main/java/org/apache/fineract/accounting/accrual/handler/ExecutePeriodicAccrualCommandHandler.java`                   |
+| `EXTERNAL_ASSET_OWNER_LOAN_PRODUCT_ATTRIBUTE` | `CREATE`             | `fineract-investor/src/main/java/org/apache/fineract/investor/service/CreateExternalAssetOwnerLoanProductAttributeHandler.java`               |
+| `LOAN`                                | `SALE` / `BUYBACK` / `INTERMEDIARYSALE` | `fineract-investor/src/main/java/org/apache/fineract/investor/service/{Sale,Buyback,IntermediarySale}LoanToExternalAssetOwnerHandler.java` |
+| `TELLER`                              | `CREATE` / `UPDATE` / `DELETE` | `fineract-branch/src/main/java/org/apache/fineract/organisation/teller/handler/CreateTellerCommandHandler.java` (and siblings)              |
+| `CHARGE`                              | `CREATE` / `UPDATE` / `DELETE` | `fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/handler/CreateChargeDefinitionCommandHandler.java` (and siblings)        |
+| `LOAN_ORIGINATOR`                     | `CREATE` / `UPDATE` / `ATTACH` / `DETACH` / `DELETE` | `fineract-loan-origination/src/main/java/org/apache/fineract/portfolio/loanorigination/handler/*.java`                              |
+| `CACHE`                               | `UPDATE`                     | `fineract-core/src/main/java/org/apache/fineract/infrastructure/cache/handler/CacheSwitchCommandHandler.java`                                  |
+| `CURRENCY`                            | `UPDATE`                     | `fineract-core/src/main/java/org/apache/fineract/organisation/monetary/handler/CurrencyUpdateCommandHandler.java`                              |
+| `PAYMENTTYPE`                         | `CREATE` / `DELETE`          | `fineract-core/src/main/java/org/apache/fineract/portfolio/paymenttype/handler/PaymentType{Create,Delete}CommandHandler.java`                  |
+
+### Anatomy of a representative handler
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "DISBURSE")
+public class DisburseLoanCommandHandler implements NewCommandSourceHandler {
+
+    private final LoanWritePlatformService writePlatformService;
+    private final DataIntegrityErrorHandler dataIntegrityErrorHandler;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+
+        try {
+            return this.writePlatformService.disburseLoan(command.entityId(), command, false);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve, "loan.disbursement",
+                    "Disbursement");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+Everything you need to write a new handler is visible here:
+
+1. `@Service` so it is a Spring-managed bean.
+2. `@CommandType(entity = "LOAN", action = "DISBURSE")` — the **only** thing registering it with `CommandHandlerProvider`.
+3. Implements `NewCommandSourceHandler`.
+4. `@Transactional` so the handler-side persistence joins `CommandSourceService.processCommand`'s outer transaction (`Propagation.REQUIRED`).
+5. Delegates to a write-platform service that contains the actual business logic.
+6. Translates database-integrity exceptions into validation errors via `DataIntegrityErrorHandler`.
+
+### Two more for shape
+
+```java
+@Service
+@CommandType(entity = "CLIENT", action = "CREATE")
+public class CreateClientCommandHandler implements NewCommandSourceHandler {
+
+    private final ClientWritePlatformService clientWritePlatformService;
+
+    @Autowired
+    public CreateClientCommandHandler(final ClientWritePlatformService clientWritePlatformService) {
+        this.clientWritePlatformService = clientWritePlatformService;
+    }
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return this.clientWritePlatformService.createClient(command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "SAVINGSACCOUNT", action = "DEPOSIT")
+public class DepositSavingsAccountCommandHandler implements NewCommandSourceHandler {
+
+    private final SavingsAccountWritePlatformService writePlatformService;
+
+    @Autowired
+    public DepositSavingsAccountCommandHandler(final SavingsAccountWritePlatformService writePlatformService) {
+        this.writePlatformService = writePlatformService;
+    }
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return this.writePlatformService.deposit(command.getSavingsId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "JOURNALENTRY", action = "CREATE")
+@RequiredArgsConstructor
+public class CreateJournalEntryCommandHandler implements NewCommandSourceHandler {
+
+    private final JournalEntryWritePlatformService writePlatformService;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return this.writePlatformService.createJournalEntry(command);
+    }
+}
+```
+
+The handler is almost always a thin façade: pull ids from the `JsonCommand`, delegate to a `*WritePlatformService`, return its `CommandProcessingResult`.
+
+## Adding a new handler — checklist
+
+<Steps>
+  <Step title="Pick canonical names">
+    Choose `entity` and `action` strings. Reuse an existing entity name (`LOAN`, `SAVINGSACCOUNT`, …) unless you are adding a genuinely new resource. The permission `<ACTION>_<ENTITY>` must be inserted into `m_permission`.
+  </Step>
+  <Step title="Implement the handler">
+    Create a `@Service` class implementing `NewCommandSourceHandler`, annotated with `@CommandType(entity = "...", action = "...")` and `@Transactional`. Delegate to a write-platform service; do not put validation in the handler.
+  </Step>
+  <Step title="Wire the API">
+    Build the wrapper in your `*ApiResource` using `CommandWrapperBuilder` (add a verb method like `createMyEntity(...)`) and submit through `PortfolioCommandSourceWritePlatformService.logCommandSource`.
+  </Step>
+  <Step title="Insert permissions">
+    Add Liquibase entries for `<ACTION>_<ENTITY>` and (if maker-checker is desired) `<ACTION>_<ENTITY>_CHECKER` to `m_permission`.
+  </Step>
+  <Step title="Test the dispatch">
+    A `CommandHandlerProvider` integration test pattern is established in `fineract-provider/src/test/java/org/apache/fineract/commands/provider/CommandHandlerProviderStepDefinitions.java`. Add a Cucumber step or a unit test that invokes `getHandler(entity, action)` and asserts the bean type.
+  </Step>
+</Steps>
+
+## Failure modes at a glance
+
+| Situation                                              | Outcome                                                                                                                                             |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Two beans annotated with the same `(entity, action)`   | Both are inserted into the `HashMap`; the second write **wins** silently. Detected only by integration tests — keep the (entity, action) pair globally unique. |
+| Bean annotated but does not implement `NewCommandSourceHandler` | Runtime `ClassCastException` in `getHandler` on first call. Always implement the interface.                                                |
+| Annotation values empty / null                         | Map key becomes `"|CREATE"` or `"LOAN|"`, breaking lookups. Always provide both values.                                                              |
+| Module excluded from a build profile                   | `getBeanNamesForAnnotation` returns no name for it; lookup throws `UnsupportedCommandException`. Useful when running stripped-down deployments.       |
+| Action mismatch in caller                              | E.g. `CommandWrapperBuilder` sets `actionName = "DISBURSEMENT"` while the handler uses `DISBURSE`. Lookup fails — verify both ends use the same constant. |
+
+## Cross references
+
+<CardGroup cols={2}>
+  <Card title="Command framework overview" icon="layer-group" href="/command/overview">Module map including `fineract-command`.</Card>
+  <Card title="CommandSource" icon="database" href="/command/command-source">Where `actionName + "_" + entityName` is stored as `permissionCode`.</Card>
+  <Card title="Synchronous command processing" icon="forward" href="/command/synchronous-command-processing">`findCommandHandler` dispatch table including the special-case branches.</Card>
+  <Card title="Maker-checker" icon="user-check" href="/command/maker-checker">How `<ACTION>_<ENTITY>_CHECKER` is derived from the handler key.</Card>
+  <Card title="Idempotency" icon="rotate" href="/command/idempotency">Why each handler invocation is one row keyed by `(action, entity, idempotency_key)`.</Card>
+  <Card title="Audit trail" icon="clipboard-list" href="/command/audit-trail">Search audits by `actionName` / `entityName` — the same vocabulary.</Card>
+  <Card title="Command execution flow" icon="diagram-project" href="/flows/command-execution-flow">End-to-end visualisation of the dispatch.</Card>
+  <Card title="Core commands framework" icon="layer-group" href="/core/commands-framework">`CommandWrapperBuilder`, `JsonCommand`, and `CommandProcessingResult`.</Card>
+  <Card title="Security overview" icon="shield" href="/security/overview">`AppUser` permission model that backs the handler keys.</Card>
+</CardGroup>

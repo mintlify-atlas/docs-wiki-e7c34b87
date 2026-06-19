@@ -1,0 +1,471 @@
+---
+title: "Custom Jakarta Bean Validation constraints in fineract-validation"
+sidebarTitle: "Constraints"
+description: "Reference for the @EnumValue, @LocalDate, and @Locale annotations in fineract-validation — targets, validator logic, messages, and DTO wiring."
+---
+
+The `fineract-validation` module ships three custom Jakarta Bean Validation constraints used across typed request DTOs in `fineract-core` and `fineract-provider`. They are intentionally small, declarative, and side-effect-free: their job is to let Hibernate Validator reject malformed string inputs *before* the request reaches a command handler. This page is the complete reference for the three annotations, their `ConstraintValidator` implementations, the message catalogue, and the DTO patterns that consume them.
+
+<Info>
+All three constraints share one important convention: their default `message` attribute points at a key in `ValidationMessages.properties` — `{org.apache.fineract.validation.locale}`, `{org.apache.fineract.validation.local-date}`, `{org.apache.fineract.validation.enum}`. DTOs can override `message` with a more specific key (e.g. `{org.apache.fineract.businessdate.type.invalid}`) to produce a per-field globalisation code without changing the validator.
+</Info>
+
+## Module layout
+
+```text
+fineract-validation/src/main/java/org/apache/fineract/validation/constraints/
+├── EnumValue.java              — annotation
+├── EnumValueValidator.java     — ConstraintValidator<EnumValue, String>
+├── LocalDate.java              — class-level annotation
+├── LocalDateValidator.java     — ConstraintValidator<LocalDate, Object> using reflection
+├── Locale.java                 — annotation
+└── LocaleValidator.java        — ConstraintValidator<Locale, String>
+
+fineract-validation/src/main/resources/
+└── ValidationMessages.properties  — message templates for these + module-specific keys
+```
+
+Tests under `fineract-validation/src/test/java/org/apache/fineract/validation/constraints/` (`LocalDateValidationTest`, `LocaleValidationTest`) document the exact accepted/rejected inputs.
+
+## `@EnumValue` — string matches enum constant name
+
+### Signature
+
+```java
+// fineract-validation/.../validation/constraints/EnumValue.java
+@Documented
+@Constraint(validatedBy = EnumValueValidator.class)
+@Target({ ElementType.FIELD })
+@Retention(RetentionPolicy.RUNTIME)
+public @interface EnumValue {
+
+    String message() default "{org.apache.fineract.validation.enum}";
+
+    Class<?>[] groups() default {};
+
+    Class<? extends Payload>[] payload() default {};
+
+    Class<? extends Enum<?>> enumClass();
+}
+```
+
+| Aspect | Value |
+| --- | --- |
+| `@Target` | `FIELD` only — class-level use is unsupported. |
+| `@Retention` | `RUNTIME`. |
+| Required attribute | `enumClass` — the `Class<? extends Enum<?>>` whose constants form the accepted set. |
+| Default message key | `org.apache.fineract.validation.enum` → *"The parameter has an invalid enum value: `${validatedValue}`."* |
+| Validates | `String` only. |
+
+### Validator implementation
+
+```java
+// fineract-validation/.../validation/constraints/EnumValueValidator.java
+public class EnumValueValidator implements ConstraintValidator<EnumValue, String> {
+
+    private Set<String> acceptedValues;
+
+    @Override
+    public void initialize(EnumValue annotation) {
+        acceptedValues = Arrays.stream(annotation.enumClass().getEnumConstants())
+                .map(e -> e.name().toLowerCase())
+                .collect(Collectors.toSet());
+    }
+
+    @Override
+    public boolean isValid(String value, ConstraintValidatorContext context) {
+        return value != null && acceptedValues.contains(value.toLowerCase());
+    }
+}
+```
+
+Key behavioural details an engineer should not miss:
+
+<Warning>
+The match is **case-insensitive**: the validator lower-cases both the enum constant names (once, in `initialize`) and the incoming value before comparison. `BUSINESS_DATE`, `business_date`, and `Business_Date` are all accepted.
+</Warning>
+
+<Warning>
+`null` is treated as **invalid** — there is no built-in null-tolerance. If the field is optional, pair `@EnumValue` with the absence of `@NotNull` and handle nullability elsewhere, *or* expect a separate `@NotNull` violation when null is sent.
+</Warning>
+
+- The accepted set is computed **once at validator initialization**, not per request.
+- The validator never inspects enum metadata other than `.name()` — custom getters on the enum are ignored.
+
+### DTO usage
+
+```java
+// fineract-core/.../infrastructure/businessdate/data/api/BusinessDateUpdateRequest.java
+@EnumValue(enumClass = BusinessDateType.class,
+           message  = "{org.apache.fineract.businessdate.type.invalid}")
+@NotNull(message    = "{org.apache.fineract.businessdate.type.not-blank}")
+private String type;
+```
+
+```java
+// fineract-provider/.../portfolio/loanaccount/api/request/ReAgePreviewRequest.java
+@EnumValue(enumClass = PeriodFrequencyType.class,
+           message  = "{org.apache.fineract.frequency-type.invalid}")
+private String frequencyType;
+```
+
+```java
+// fineract-provider/.../portfolio/loanaccount/api/request/ReAmortizationPreviewRequest.java
+@EnumValue(enumClass = LoanReAmortizationInterestHandlingType.class,
+           message  = "{org.apache.fineract.interest-handling-type.invalid}")
+private String interestHandlingType;
+```
+
+The corresponding entries in `ValidationMessages.properties`:
+
+```properties
+# fineract-validation/src/main/resources/ValidationMessages.properties
+
+org.apache.fineract.validation.enum=The parameter has an invalid enum value: `${validatedValue}`.
+org.apache.fineract.businessdate.type.invalid=The parameter 'type' must be valid BusinessDateType value. Provided value: '${validatedValue}'.
+org.apache.fineract.frequency-type.invalid=The parameter 'frequencyType' must be valid PeriodFrequencyType value. Provided value: '${validatedValue}'.
+```
+
+The `${validatedValue}` token is a standard Jakarta Bean Validation placeholder substituted by Hibernate Validator with the rejected input — useful for surfacing what the client actually sent.
+
+### Failure path
+
+1. `EnumValueValidator.isValid` returns `false`.
+2. Hibernate Validator constructs a `ConstraintViolation` with the message template (e.g. `{org.apache.fineract.businessdate.type.invalid}`) and the `propertyPath` (`type`).
+3. Jersey raises `ConstraintViolationException`.
+4. [`JakartaValidationExceptionMapper`](/core/exception-mappers) flattens it into `ApiGlobalErrorResponse.badClientRequest(...)` and returns **HTTP 400**.
+
+## `@Locale` — valid BCP-47 language tag
+
+### Signature
+
+```java
+// fineract-validation/.../validation/constraints/Locale.java
+@Documented
+@Constraint(validatedBy = LocaleValidator.class)
+@Target({ ElementType.FIELD, ElementType.PARAMETER })
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Locale {
+
+    String message() default "{org.apache.fineract.validation.locale}";
+
+    Class<?>[] groups() default {};
+
+    Class<? extends Payload>[] payload() default {};
+}
+```
+
+| Aspect | Value |
+| --- | --- |
+| `@Target` | `FIELD` and `PARAMETER` (e.g. JAX-RS query params). |
+| Default message key | `org.apache.fineract.validation.locale` → *"The parameter `locale` has an invalid language value: `${validatedValue}`."* |
+| Validates | `String` only. |
+
+### Validator implementation
+
+```java
+// fineract-validation/.../validation/constraints/LocaleValidator.java
+public class LocaleValidator implements ConstraintValidator<Locale, String> {
+
+    @Override
+    public boolean isValid(String value, ConstraintValidatorContext context) {
+        if (StringUtils.isBlank(value)) {
+            return false; // empty string is invalid
+        }
+
+        // Normalize input to use BCP 47 format (e.g., "en-US")
+        String languageTag = value.replace('_', '-');
+
+        java.util.Locale inputLocale = java.util.Locale.forLanguageTag(languageTag);
+
+        // If language is empty, it's not a valid locale
+        if (inputLocale.getLanguage().isEmpty()) {
+            return false;
+        }
+
+        // Check if it matches any available locale
+        return Arrays.stream(java.util.Locale.getAvailableLocales())
+                .anyMatch(available -> available.toLanguageTag().equalsIgnoreCase(inputLocale.toLanguageTag()));
+    }
+}
+```
+
+Behavioural notes:
+
+- **Blank → invalid.** Empty strings fail before any locale parsing happens.
+- **Both POSIX and BCP-47 syntaxes accepted.** `en_US` is normalised to `en-US` before parsing.
+- **Must have a language component.** `Locale.forLanguageTag("ZZ")` produces a locale with an empty `getLanguage()` — rejected.
+- **Must match an `available` locale.** The check is `equalsIgnoreCase` against `Locale.getAvailableLocales()`. Locale availability is JVM-version dependent — exotic tags valid on one JDK may fail on another.
+
+<Note>
+Pair `@Locale` with `@NotBlank` when the field is mandatory. `@Locale` alone rejects blanks but the resulting message will be the locale-invalid one — not necessarily what you want for "missing parameter".
+</Note>
+
+### DTO usage
+
+```java
+// BusinessDateUpdateRequest.java
+@NotBlank(message = "{org.apache.fineract.businessdate.locale.not-blank}")
+@Locale
+private String locale;
+```
+
+```java
+// ReAgePreviewRequest.java
+@NotBlank(message = "{org.apache.fineract.reage.locale.not-blank}")
+@Locale
+private String locale;
+```
+
+The default message key:
+
+```properties
+org.apache.fineract.validation.locale=The parameter `locale` has an invalid language value: `${validatedValue}`.
+```
+
+## `@LocalDate` — cross-field date/format/locale check
+
+### Signature
+
+```java
+// fineract-validation/.../validation/constraints/LocalDate.java
+@Documented
+@Constraint(validatedBy = LocalDateValidator.class)
+@Target({ ElementType.TYPE })
+@Retention(RetentionPolicy.RUNTIME)
+public @interface LocalDate {
+
+    String message() default "{org.apache.fineract.validation.local-date}";
+
+    String dateField();
+    String formatField();
+    String localeField();
+
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+```
+
+| Aspect | Value |
+| --- | --- |
+| `@Target` | `TYPE` — class-level only. |
+| Required attributes | `dateField`, `formatField`, `localeField` — names of the three `String` fields to inspect via reflection. |
+| Default message key | `org.apache.fineract.validation.local-date` → *"Wrong local date fields."* |
+
+This is a **class-level** constraint because the three values must be validated *together*: a date string is meaningless without a `dateFormat`, and locale-sensitive parsing requires the `locale`.
+
+### Validator implementation
+
+```java
+// fineract-validation/.../validation/constraints/LocalDateValidator.java
+@Slf4j
+public class LocalDateValidator implements ConstraintValidator<LocalDate, Object> {
+
+    private String dateField;
+    private String formatField;
+    private String localeField;
+
+    @Override
+    public void initialize(LocalDate annotation) {
+        this.dateField   = annotation.dateField();
+        this.formatField = annotation.formatField();
+        this.localeField = annotation.localeField();
+    }
+
+    @Override
+    public boolean isValid(Object value, ConstraintValidatorContext context) {
+        try {
+            var dateAttr   = value.getClass().getDeclaredField(dateField);
+            var formatAttr = value.getClass().getDeclaredField(formatField);
+            var localeAttr = value.getClass().getDeclaredField(localeField);
+
+            dateAttr.setAccessible(true);
+            formatAttr.setAccessible(true);
+            localeAttr.setAccessible(true);
+
+            var date   = (String) dateAttr.get(value);
+            var format = (String) formatAttr.get(value);
+            var locale = (String) localeAttr.get(value);
+
+            if (StringUtils.isBlank(date) || StringUtils.isBlank(format) || StringUtils.isBlank(locale)) {
+                return false;
+            }
+
+            toLocalDate(date, format, locale);
+
+            return true;
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            throw new RuntimeException("Invalid configuration for @LocalDate", e);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void toLocalDate(String date, String format, String locale) {
+        var formatter = new DateTimeFormatterBuilder()
+                .parseCaseInsensitive()
+                .parseLenient()
+                .appendPattern(format.replace("y", "u"))
+                .optionalStart().appendPattern(" HH:mm:ss").optionalEnd()
+                .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
+                .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
+                .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
+                .toFormatter(Locale.forLanguageTag(locale))
+                .withResolverStyle(ResolverStyle.STRICT);
+
+        parse(date, formatter);
+    }
+}
+```
+
+Behavioural notes — read these carefully if you write a new DTO that uses `@LocalDate`:
+
+<Warning>
+**Reflection by field name.** The validator looks up `dateField`, `formatField`, `localeField` via `getDeclaredField` on the **annotated class itself** — inherited fields are not visible. If you refactor the DTO to extend a base class, move the constraint to the subclass or keep the fields concrete.
+</Warning>
+
+<Warning>
+**Configuration errors throw `RuntimeException`.** A typo in `dateField = "...."` produces a `NoSuchFieldException` which is rethrown as `RuntimeException("Invalid configuration for @LocalDate", e)`. This is a developer-time fatality — not a validation failure.
+</Warning>
+
+- **`y` → `u`** in the pattern: era-aware year. `format.replace("y", "u")` swaps `yyyy-MM-dd` for `uuuu-MM-dd` so `ResolverStyle.STRICT` rejects implausible historic dates correctly.
+- **Optional time-of-day**: a trailing `HH:mm:ss` is accepted but not required; missing components default to zero. This is why endpoints like `BusinessDate` accept either `2024-01-31` or `2024-01-31 14:00:00` with the same `dateFormat`.
+- **Strict resolution**: `February 30th` fails. Invalid dates (`2024-02-30`) are caught by `parse(...)` and converted to `false`.
+- **Blank inputs → invalid.** If any of the three strings is blank, the validator returns `false` immediately without attempting to parse — but it does **not** annotate which field was blank. Pair the class-level constraint with field-level `@NotBlank` to get a precise error.
+
+### DTO usage
+
+```java
+// fineract-core/.../infrastructure/businessdate/data/api/BusinessDateUpdateRequest.java
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@LocalDate(dateField = "date", formatField = "dateFormat", localeField = "locale")
+public class BusinessDateUpdateRequest implements Serializable {
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date-format.not-blank}")
+    private String dateFormat;
+
+    @EnumValue(enumClass = BusinessDateType.class, message = "{org.apache.fineract.businessdate.type.invalid}")
+    @NotNull(message  = "{org.apache.fineract.businessdate.type.not-blank}")
+    private String type;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date.not-blank}")
+    private String date;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.locale.not-blank}")
+    @Locale
+    private String locale;
+}
+```
+
+```java
+// fineract-provider/.../portfolio/loanaccount/api/request/ReAgePreviewRequest.java
+@LocalDate(dateField = "startDate", formatField = "dateFormat", localeField = "locale")
+public class ReAgePreviewRequest { ... }
+```
+
+The default message key:
+
+```properties
+org.apache.fineract.validation.local-date=Wrong local date fields.
+```
+
+## End-to-end response shape
+
+When `BusinessDateUpdateRequest` fails validation with multiple errors (missing `type`, invalid `locale`, garbage `date`) Hibernate Validator emits one `ConstraintViolation` per failing constraint. The mapper flattens those into one `ApiParameterError` each. Approximate response:
+
+```json
+{
+  "developerMessage": "Validation errors exist.",
+  "httpStatusCode": "400",
+  "defaultUserMessage": "Validation errors exist.",
+  "userMessageGlobalisationCode": "validation.msg.validation.errors.exist",
+  "errors": [
+    {
+      "developerMessage": "The parameter 'type' is mandatory.",
+      "defaultUserMessage": "The parameter 'type' is mandatory.",
+      "userMessageGlobalisationCode": "org.apache.fineract.businessdate.type.not-blank",
+      "parameterName": "type"
+    },
+    {
+      "developerMessage": "The parameter `locale` has an invalid language value: `zz`.",
+      "defaultUserMessage": "The parameter `locale` has an invalid language value: `zz`.",
+      "userMessageGlobalisationCode": "org.apache.fineract.validation.locale",
+      "parameterName": "locale"
+    },
+    {
+      "developerMessage": "Wrong local date fields.",
+      "defaultUserMessage": "Wrong local date fields.",
+      "userMessageGlobalisationCode": "org.apache.fineract.validation.local-date",
+      "parameterName": ""
+    }
+  ]
+}
+```
+
+The class-level `@LocalDate` has empty `parameterName` because the violation's `propertyPath` is the DTO root.
+
+## `ValidationMessages.properties` keys at a glance
+
+The file holds default + module-specific keys. The most commonly used:
+
+```properties
+# Built-in constraint defaults
+org.apache.fineract.validation.local-date=Wrong local date fields.
+org.apache.fineract.validation.locale=The parameter `locale` has an invalid language value: `${validatedValue}`.
+org.apache.fineract.validation.enum=The parameter has an invalid enum value: `${validatedValue}`.
+
+# Business Date
+org.apache.fineract.businessdate.date-format.not-blank=The parameter 'dateFormat' is mandatory.
+org.apache.fineract.businessdate.type.not-blank=The parameter 'type' is mandatory.
+org.apache.fineract.businessdate.type.invalid=The parameter 'type' must be valid BusinessDateType value. Provided value: '${validatedValue}'.
+org.apache.fineract.businessdate.date.not-blank=The parameter 'date' is mandatory.
+org.apache.fineract.businessdate.locale.not-blank=The parameter 'locale' is mandatory.
+
+# Re-Age
+org.apache.fineract.reage.frequency-number.not-blank=The parameter 'frequencyNumber' is mandatory.
+org.apache.fineract.reage.frequency-number.min=The parameter 'frequencyNumber' must be at least 1.
+org.apache.fineract.reage.frequency-type.not-blank=The parameter 'frequencyType' is mandatory.
+org.apache.fineract.reage.start-date.not-blank=The parameter 'startDate' is mandatory.
+org.apache.fineract.reage.number-of-installments.not-blank=The parameter 'numberOfInstallments' is mandatory.
+org.apache.fineract.reage.number-of-installments.min=The parameter 'numberOfInstallments' must be at least 1.
+org.apache.fineract.frequency-type.invalid=The parameter 'frequencyType' must be valid PeriodFrequencyType value. Provided value: '${validatedValue}'.
+```
+
+Plus module-specific blocks for **External Events**, **Cache**, **Currency**, **Note**, **Document Management**, **Payment Type**, **Interest rate chart / slabs / incentives**, **Staff**, and **Meeting**. Each block follows the convention `org.apache.fineract.<module>.<field>.<rule>`.
+
+<Tip>
+The `${validatedValue}` placeholder is interpolated by Hibernate Validator using the rejected input. This makes the message both client-localizable (by globalisation code) and self-documenting (by showing what failed) in a single response.
+</Tip>
+
+## Writing a new custom constraint — checklist
+
+If you need a fourth annotation, follow the existing pattern exactly so it composes cleanly with the rest of the stack:
+
+<Steps>
+  <Step title="Create the annotation">
+    Place it under `fineract-validation/src/main/java/org/apache/fineract/validation/constraints/`. Use `@Constraint(validatedBy = ...)`, `@Documented`, `@Target`, `@Retention(RUNTIME)`. Always provide a default `message` that points at a `{org.apache.fineract.<...>}` key.
+  </Step>
+  <Step title="Implement the ConstraintValidator">
+    Implement `ConstraintValidator<YourAnnotation, T>`. Decide explicitly how `null` should be handled — there is no convention forced on you, but the existing three all treat null as invalid.
+  </Step>
+  <Step title="Add the default message key">
+    Add `org.apache.fineract.validation.<name>=...` to `ValidationMessages.properties`. Use `${validatedValue}` to embed the rejected input.
+  </Step>
+  <Step title="Provide a test">
+    Mirror `LocalDateValidationTest` / `LocaleValidationTest` under `fineract-validation/src/test/java/...`. They construct a small DTO inline, call the JSR-380 `Validator.validate(...)` API, and assert on violation counts and message templates.
+  </Step>
+  <Step title="Compose with `@NotNull` / `@NotBlank`">
+    The custom constraint should validate *content*, not *presence*. Mandatory-ness belongs on a Jakarta core constraint with its own dedicated message key.
+  </Step>
+</Steps>
+
+## Cross-references
+
+- [`/validation/overview`](/validation/overview) — where these constraints sit in the request lifecycle alongside the imperative `DataValidatorBuilder` layer.
+- [`/validation/data-validator-builder`](/validation/data-validator-builder) — the imperative counterpart used by command handlers when there is no typed DTO.
+- [`/core/exception-mappers`](/core/exception-mappers) — `JakartaValidationExceptionMapper` and `PlatformApiDataValidationExceptionMapper`, both producing the same `ApiGlobalErrorResponse` shape.
+- [`/core/serialization-and-json`](/core/serialization-and-json) — how typed DTOs are deserialized and where Jersey hooks Hibernate Validator into the dispatch chain.
+- [`/command/overview`](/command/overview) — what happens *after* a DTO passes Bean Validation: the command-source layer takes over.

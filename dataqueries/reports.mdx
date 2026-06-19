@@ -1,0 +1,240 @@
+---
+title: "Reports — Report Entity, ReportType and ReportsApiResource"
+sidebarTitle: "Reports"
+description: "Apache Fineract reports: the Report entity in stretchy_report, the ReportType whitelist, report_type strings (Table/Chart/Pentaho) and the /v1/reports API."
+---
+
+Apache Fineract treats **reports** as first-class persistent objects. Each row in `stretchy_report` (`Report` JPA entity) carries a SQL string (for `Table` / `Chart` reports) or a reference to a Pentaho `.prpt` file (for `Pentaho Reports`), plus a parameter contract declared through `stretchy_report_parameter` rows. The catalogue is exposed via `/v1/reports` (`ReportsApiResource`); execution happens through `/v1/runreports/{reportName}` (`RunreportsApiResource`, documented separately in [Run reports](/dataqueries/run-reports)) which dispatches the call through `ReportingProcessServiceProvider` — see [Report provider](/report/report-provider) for the plug-in surface.
+
+For the wider data queries map see [Data queries overview](/dataqueries/overview).
+
+## Aggregate — `Report`
+
+```java
+@Entity
+@Table(name = "stretchy_report",
+       uniqueConstraints = @UniqueConstraint(columnNames = "report_name", name = "unq_report_name"))
+public final class Report extends AbstractPersistableCustom<Long> {
+    @Column(name = "report_name", nullable = false, unique = true) private String reportName;
+    @Column(name = "report_type", nullable = false)                private String reportType;     // "Table" / "Chart" / "Pentaho Reports" / "SMS"
+    @Column(name = "report_subtype")                               private String reportSubType;  // "Bar" / "Pie" for Chart, else blank
+    @Column(name = "report_category")                              private String reportCategory; // free-form label
+    @Column(name = "description")                                  private String description;
+    @Column(name = "core_report", nullable = false)                private boolean coreReport;    // platform-seeded
+    @Column(name = "use_report", nullable = false)                 private boolean useReport;     // surface in UI list
+    @Column(name = "report_sql")                                   private String reportSql;      // body for Table/Chart
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "report",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    private Set<ReportParameterUsage> reportParameterUsages = new HashSet<>();
+}
+```
+
+The `core_report` boolean is set to `false` by `fromJson(...)` for any user-created row; `true` rows are the bundled platform reports inserted by Liquibase seed scripts. Only `core_report = false` rows are mutable through the API (with one exception — `use_report` can be flipped on core reports).
+
+### Field semantics
+
+| Field | Purpose |
+|---|---|
+| `reportName` | Unique key used everywhere — by the run endpoint, by campaign business-rule references, by `m_permission` rows (`READ_<reportName>`) |
+| `reportType` | Selects the `ReportingProcessService` implementation; must be one of the values returned by `ReportingProcessServiceProvider.findAllReportingTypes()` |
+| `reportSubType` | `"Bar"` / `"Pie"` for `Chart`; must be blank for everything else |
+| `reportCategory` | Free-form grouping for the UI catalogue (e.g. `"Client"`, `"Loan"`, `"Accounting"`) |
+| `description` | Free text |
+| `coreReport` | `true` for platform-seeded reports; restricts mutability |
+| `useReport` | Toggles whether this report appears in the reference UI's run list — does **not** prevent execution by name |
+| `reportSql` | Inline SQL for `Table` and `Chart` types; **must be blank** for `Pentaho Reports` (which lives on disk) |
+| `reportParameterUsages` | Per-report parameter contract: pairs `Report` ↔ `ReportParameter` with the report-specific parameter name |
+
+### `ReportType` enum — SQL injection whitelist
+
+```java
+// fineract-core/.../infrastructure/dataqueries/domain/ReportType.java
+public enum ReportType {
+    REPORT("report"),
+    PARAMETER("parameter");
+}
+```
+
+This enum is **not** the `report_type` column. It is a whitelist consumed by `ReadReportingServiceImpl.getSql(name, type)` to decide which catalogue table to query (`stretchy_report` vs `stretchy_parameter`) when resolving a SQL body. The check prevents SQL injection at the table-name level:
+
+```java
+private String getSql(final String name, final String type) {
+    if (!ReportType.isValidType(type)) {
+        throw new IllegalArgumentException("Invalid report type provided");
+    }
+    final ReportType reportType = ReportType.fromValue(type);
+    final String quotedTableName    = getQuotedTableName(reportType);
+    final String quotedColumnSqlName = getQuotedColumnName(reportType, "_sql");
+    final String quotedColumnNameName = getQuotedColumnName(reportType, "_name");
+    final String inputSql = "SELECT " + quotedColumnSqlName + " AS the_sql FROM " + quotedTableName
+                          + " WHERE " + quotedColumnNameName + " = ?";
+    // ...
+    final SqlRowSet rs = this.jdbcTemplate.queryForRowSet(this.genericDataService.wrapSQL(inputSql), name);
+    if (rs.next() && rs.getString("the_sql") != null) {
+        return rs.getString("the_sql");
+    }
+    throw new ReportNotFoundException(name);
+}
+```
+
+Both `quotedTableName` and the column names are passed through `SqlInjectionPreventerService.quoteIdentifier(...)` so even the whitelist values are properly quoted per database. See [SQL injection prevention](/security/sql-injection-prevention).
+
+The `report_type` *column* values (`Table`, `Chart`, `Pentaho Reports`, `SMS`) are a separate concept: they drive which `ReportingProcessService` handles the report. The `ReportType` enum, in contrast, is purely about which catalogue table to read SQL from.
+
+## `report_type` string catalogue
+
+The values understood by the bundled `ReportingProcessServiceProvider` are:
+
+| `report_type` value | Service | Behaviour |
+|---|---|---|
+| `Table` | `DatatableReportingProcessService` | Runs `reportSql` and returns `GenericResultsetData` (or CSV / XLS / PDF on export) |
+| `Chart` | `DatatableReportingProcessService` | Same as `Table`; UI renders the rows as a bar or pie chart based on `reportSubType` |
+| `Pentaho Reports` | Pentaho adapter (out-of-tree) | Looks up `{reportName}.prpt` under the configured Pentaho directory and renders to HTML/PDF/XLS |
+| `SMS` | Stretchy report path | SQL is run but with the SMS campaign convention — the result is consumed by campaign materialisation rather than returned as a report |
+
+`Report.validate(reportTypes)` enforces:
+
+- `reportType` must be one of the configured `reportTypes` set (taken from `ReportingProcessServiceProvider.findAllReportingTypes()`).
+- For `Chart` the subtype must be `"Bar"` or `"Pie"`.
+- For all other types the subtype must be blank.
+- `Table` and `Chart` require non-blank `reportSql`.
+- Other types require blank `reportSql`.
+
+### Parameters — `ReportParameter` / `ReportParameterUsage`
+
+The parameter catalogue lives in two tables:
+
+- `stretchy_parameter` (`ReportParameter`) — the master list of parameters available platform-wide. Each row carries a `parameter_name`, a label, and a SQL fragment that produces the value lookup (e.g. a list of office ids for `officeId`).
+- `stretchy_report_parameter` (`ReportParameterUsage`) — the join table mapping a `Report` to each `ReportParameter` it uses, with a per-report alias (`report_parameter_name`).
+
+The alias is what the API caller types as `R_<alias>` (e.g. `R_officeId`); the SQL body uses `${alias}` as the placeholder.
+
+## REST surface — `ReportsApiResource`
+
+`@Path("/v1/reports")`. All write paths use the `PortfolioCommandSourceWritePlatformService` dispatcher:
+
+| Method | Path | Operation | Permission |
+|---|---|---|---|
+| `GET` | `/v1/reports` | List the catalogue | `READ_REPORT` |
+| `GET` | `/v1/reports/{id}` | One report by id (use `?template=true` to include allowed parameters) | `READ_REPORT` |
+| `GET` | `/v1/reports/template` | Template (`allowedParameters` + all reporting types) | `READ_REPORT` |
+| `POST` | `/v1/reports` | Create | `CREATE_REPORT` → `REPORT.CREATE` command |
+| `PUT` | `/v1/reports/{id}` | Update | `UPDATE_REPORT` → `REPORT.UPDATE` |
+| `DELETE` | `/v1/reports/{id}` | Delete | `DELETE_REPORT` → `REPORT.DELETE` |
+
+`/v1/runreports/{reportName}` is documented separately in [Run reports](/dataqueries/run-reports).
+
+The response shape is `ReportData` (`fineract-core/.../dataqueries/data/ReportData.java`) — the same set of fields as the `Report` entity, plus the list of `ReportParameterData` describing each `R_*` parameter.
+
+### Create body
+
+```http
+POST /v1/reports
+Content-Type: application/json
+
+{
+  "reportName":     "Active Clients By Office",
+  "reportType":     "Table",
+  "reportSubType":  null,
+  "reportCategory": "Client",
+  "description":    "Active clients grouped by office, scoped to the caller's office hierarchy",
+  "useReport":      true,
+  "reportSql":      "SELECT o.name AS office, COUNT(c.id) AS active_clients FROM m_client c JOIN m_office o ON o.id = c.office_id WHERE c.status_enum = 300 AND o.hierarchy LIKE CONCAT('${currentUserHierarchy}', '%') GROUP BY o.name",
+  "reportParameters": [
+    { "parameterId": 5, "reportParameterName": "officeId" }
+  ]
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `reportName` | yes | Unique; ≤ 100 chars |
+| `reportType` | yes | One of `Table` / `Chart` / `Pentaho Reports` / `SMS` (whatever providers register) |
+| `reportSubType` | conditional | Required+restricted for `Chart`; must be blank otherwise |
+| `reportCategory` | optional | ≤ 45 chars |
+| `description` | optional | Free text |
+| `useReport` | optional, default `false` | Controls UI catalogue visibility |
+| `reportSql` | conditional | Required for `Table`/`Chart`; forbidden otherwise |
+| `reportParameters[]` | optional | List of `(parameterId, reportParameterName)` pairs declaring the parameter contract |
+
+### What `POST /v1/reports` does
+
+`ReportWritePlatformServiceImpl.createReport(JsonCommand)`:
+
+1. Validates the body via `ReportCommandFromApiJsonDeserializer.validateForCreate(...)`.
+2. Resolves the set of registered `reportTypes` via `ReportingProcessServiceProvider.findAllReportingTypes()`.
+3. Builds `Report.fromJson(command, reportTypes)`. The constructor sets `coreReport = false` and calls `validate(reportTypes)`.
+4. Walks the `reportParameters` array and creates `ReportParameterUsage` rows referencing the master `ReportParameter` by id, with the supplied `reportParameterName` alias.
+5. Persists via `ReportRepository.save(report)`. Catches `DataIntegrityViolationException` / `JpaSystemException` / `PersistenceException` and produces a `PlatformDataIntegrityException` with `error.msg.report.duplicate.entry` on unique violations.
+6. **Inserts the matching permission row**: a `m_permission` with `code = "READ_<reportName>"` is created so role assignment can be scoped to specific reports.
+
+### Update — what changes are allowed
+
+`PUT /v1/reports/{id}` runs `Report.update(command, reportTypes)` which uses the standard `command.isChangeInStringParameterNamed(...)` pattern, builds a change map, then re-validates against `reportTypes`. The post-update check enforces the core-report rule:
+
+```java
+if (!actualChanges.isEmpty()) {
+    if (isCoreReport()) {
+        for (final String key : actualChanges.keySet()) {
+            if (!key.equals("useReport")) {
+                throw new PlatformDataIntegrityException(
+                    "error.msg.only.use.report.can.be.updated.for.core.report",
+                    "Only the Use Report field can be updated for Core Reports", key);
+            }
+        }
+    }
+}
+```
+
+So core reports are effectively read-only except for `useReport` (which lets an operator hide them from the UI catalogue without deleting them).
+
+### Delete
+
+`DELETE /v1/reports/{id}`:
+
+1. Loads the report; throws `ReportNotFoundException` if missing.
+2. Refuses to delete `core_report = true` rows.
+3. Deletes the report (cascades remove the `ReportParameterUsage` rows).
+4. Removes the matching `READ_<reportName>` permission row and any role-permission joins.
+
+## Inline SQL conventions
+
+The platform substitutes a handful of well-known placeholders before running `reportSql`. These let reports stay tenant-scoped and date-aware without per-call wiring:
+
+| Placeholder | Substituted with | Source |
+|---|---|---|
+| `${currentUserHierarchy}` | The caller's office hierarchy string (e.g. `.0.1.5.`) | `AppUser.getOffice().getHierarchy()` |
+| `${currentUserId}` | The caller's user id | `AppUser.getId()` |
+| `${currentDate}` | Tenant's current business date | `DatabaseSpecificSQLGenerator.currentBusinessDate()` |
+| `${<reportParameterName>}` | The matching `R_<reportParameterName>` query parameter | URL query string |
+| `NOW()` (case-insensitive) | Tenant's current date+time | `DatabaseSpecificSQLGenerator.currentTenantDateTime()` |
+| `curdate()` (case-insensitive) | Tenant's current business date | `DatabaseSpecificSQLGenerator.currentBusinessDate()` |
+| `CURRENT_DATE` | Tenant's current business date | `DatabaseSpecificSQLGenerator.currentBusinessDate()` |
+
+`${currentUserHierarchy}` is the canonical way to restrict reports to "what the calling user is allowed to see" — `WHERE o.hierarchy LIKE CONCAT('${currentUserHierarchy}', '%')` is the idiomatic pattern.
+
+The substitution happens in `ReadReportingServiceImpl.getSQLtoRun(...)` — see [Run reports](/dataqueries/run-reports#parameter-substitution-rules) for the full rules and the wrapping behaviour.
+
+## Pentaho reports
+
+A Pentaho-typed report (`report_type = "Pentaho Reports"`) carries `report_sql = null`. The execution path goes through a Pentaho adapter — `ReadReportingServiceImpl.generatePentahoReportAsOutputStream(reportName, outputType, ...)` reads `{reportName}.prpt` from the configured Pentaho directory and renders to PDF / XLS / HTML according to the requested output. See [Report provider](/report/report-provider) for how `@ReportService` plugs in Pentaho adapters.
+
+## Errors
+
+| Exception | Trigger |
+|---|---|
+| `ReportNotFoundException` | Unknown id on read/update/delete, or `reportName` not in `stretchy_report` at execution time |
+| `ReportParameterNotFoundException` | `reportParameters[].parameterId` references an unknown master row |
+| `PlatformApiDataValidationException` | `ReportCommandFromApiJsonDeserializer` rejected the payload, or `Report.validate(...)` failed (bad type, missing SQL, etc.) |
+| `PlatformDataIntegrityException` | Unique name violation (`error.msg.report.duplicate.entry`); core-report mutation attempt |
+| `PermissionNotFoundException` | Permission row deletion failed when removing a report (rare; indicates manual cleanup needed) |
+| `NoAuthorizationException` | Caller lacks `READ_<reportName>` at run time |
+
+## Related references
+
+- The execution endpoint, parameter rules and SQL substitution: [Run reports](/dataqueries/run-reports).
+- The plug-in surface for `ReportingProcessService`: [Report provider](/report/report-provider).
+- The job that emails reports daily: [Report mailing job](/report/report-mailing-job).
+- The `Report` field on campaigns: [Email campaigns](/campaigns/email-campaigns), [SMS campaigns](/campaigns/sms-campaigns).
+- The SQL injection prevention primitives: [SQL injection prevention](/security/sql-injection-prevention).
+- The REST view of all reporting endpoints: [Reports and data APIs](/api/reports-and-data-apis).

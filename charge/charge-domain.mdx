@@ -1,0 +1,347 @@
+---
+title: "Charge JPA Entity, Enum Surface and Field Reference"
+sidebarTitle: "Charge Domain"
+description: "Deep reference for the Apache Fineract Charge entity: persisted fields, ChargeTimeType, ChargeCalculationType, ChargeAppliesTo and ChargePaymentMode enums, validation invariants and update behavior."
+---
+
+The Apache Fineract `Charge` entity (`fineract-charge/src/main/java/org/apache/fineract/portfolio/charge/domain/Charge.java`) maps the row in `m_charge` that templates a fee or penalty across loans, savings, clients, and shares. This page documents the persisted field layout, the four enums that classify a charge (`ChargeTimeType`, `ChargeCalculationType`, `ChargeAppliesTo`, `ChargePaymentMode`), and the invariants enforced at construction and update time.
+
+The `ChargeAddInstallmentMode` enum is **not** present in the current Apache Fineract codebase — the only places referring to "InstallmentChargeAdd" are integration-test helpers. Installment-fee fan-out logic is owned by `LoanInstallmentCharge` in `fineract-loan` (see [Loan charges](/loan/loan-charges)).
+
+## Entity declaration
+
+```java
+@Entity
+@Table(name = "m_charge",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "name" }, name = "name") })
+public class Charge extends AbstractPersistableCustom<Long> {
+    public static final String CHARGE_TIME_PARAM_NAME       = "chargeTimeType";
+    public static final String CHARGE_CALCULATION_TYPE_PARAM_NAME = "chargeCalculationType";
+    public static final String FEE_ON_MONTH_DAY_PARAM_NAME  = "feeOnMonthDay";
+    public static final String FEE_INTERVAL_PARAM_NAME      = "feeInterval";
+    public static final String FEE_FREQUENCY_PARAM_NAME     = "feeFrequency";
+    public static final String LOCALE_PARAM_NAME            = "locale";
+    // ...fields
+}
+```
+
+`AbstractPersistableCustom<Long>` provides the surrogate `id`. There is no `@Audited` annotation — JPA-level audit columns are not stored on this row; the catalog is a slow-changing dimension and changes flow through `m_command_source`.
+
+### Persisted fields
+
+| Column (`m_charge`) | Java field | Notes |
+| --- | --- | --- |
+| `name` (length 100, unique) | `String name` | Catalog name. `Charge.delete()` rewrites it as `<id>_<name>` so the unique index frees up. |
+| `amount` (scale 6, precision 19) | `BigDecimal amount` | Default amount or percentage. |
+| `currency_code` (length 3) | `String currencyCode` | ISO currency. |
+| `charge_applies_to_enum` | `Integer chargeAppliesTo` | `ChargeAppliesTo` int code. |
+| `charge_time_enum` | `Integer chargeTimeType` | `ChargeTimeType` int code. |
+| `charge_calculation_enum` | `Integer chargeCalculation` | `ChargeCalculationType` int code. |
+| `charge_payment_mode_enum` | `Integer chargePaymentMode` | `ChargePaymentMode` int code — loan-only. |
+| `fee_on_day`, `fee_on_month` | `Integer feeOnDay, feeOnMonth` | Monthly/annual recurrence anchor. Populated from `feeOnMonthDay` for monthly/annual fees. |
+| `fee_interval` | `Integer feeInterval` | Recurrence interval (e.g. `1` ⇒ every month, `3` ⇒ every quarter for monthly fees). |
+| `fee_frequency` | `Integer feeFrequency` | `PeriodFrequencyType` int (DAYS/WEEKS/MONTHS/YEARS), used for recurring fees. |
+| `is_penalty` | `boolean penalty` | True for penalty, false for fee. |
+| `is_active` | `boolean active` | Catalog activation flag. |
+| `is_deleted` | `boolean deleted` | Soft delete. |
+| `min_cap`, `max_cap` (scale 6, precision 19) | `BigDecimal minCap, maxCap` | Percentage caps. |
+| `is_free_withdrawal` | `boolean enableFreeWithdrawal` | Savings withdrawal-fee waiver toggle. |
+| `free_withdrawal_charge_frequency` | `Integer freeWithdrawalFrequency` | How many waived withdrawals before the fee kicks in. |
+| `restart_frequency` | `Integer restartFrequency` | Counter restart interval. |
+| `restart_frequency_enum` | `Integer restartFrequencyEnum` | `PeriodFrequencyType` int for counter restart. |
+| `is_payment_type` | `boolean enablePaymentType` | When true the fee applies only to a given `PaymentType`. |
+| `payment_type_id` | `PaymentType paymentType` | `@ManyToOne` FK to `m_payment_type`. |
+| `income_or_liability_account_id` | `GLAccount account` | Income (or liability) GL account, lazily fetched. |
+| `tax_group_id` | `TaxGroup taxGroup` | Optional `m_tax_group` FK; see [TaxGroup](/tax/tax-group). |
+
+### Construction — `Charge.fromJson(...)`
+
+The factory `fromJson(JsonCommand, GLAccount, TaxGroup, PaymentType)` reads the parameters by name and runs the type / time invariants in one shot:
+
+```java
+public static Charge fromJson(final JsonCommand command, final GLAccount account, final TaxGroup taxGroup,
+        final PaymentType paymentType) {
+    final String     name                  = command.stringValueOfParameterNamed("name");
+    final BigDecimal amount                = command.bigDecimalValueOfParameterNamed("amount");
+    final String     currencyCode          = command.stringValueOfParameterNamed("currencyCode");
+    final ChargeAppliesTo      chargeAppliesTo     = ChargeAppliesTo.fromInt(command.integerValueOfParameterNamed("chargeAppliesTo"));
+    final ChargeTimeType       chargeTimeType      = ChargeTimeType.fromInt(command.integerValueOfParameterNamed(CHARGE_TIME_PARAM_NAME));
+    final ChargeCalculationType chargeCalculationType = ChargeCalculationType.fromInt(command.integerValueOfParameterNamed(CHARGE_CALCULATION_TYPE_PARAM_NAME));
+    final Integer    chargePaymentMode     = command.integerValueOfParameterNamed("chargePaymentMode");
+    final ChargePaymentMode    paymentMode = chargePaymentMode == null ? null : ChargePaymentMode.fromInt(chargePaymentMode);
+    final boolean    penalty               = command.booleanPrimitiveValueOfParameterNamed("penalty");
+    final boolean    active                = command.booleanPrimitiveValueOfParameterNamed("active");
+    final MonthDay   feeOnMonthDay         = command.extractMonthDayNamed(FEE_ON_MONTH_DAY_PARAM_NAME);
+    final Integer    feeInterval           = command.integerValueOfParameterNamed(FEE_INTERVAL_PARAM_NAME);
+    final BigDecimal minCap                = command.bigDecimalValueOfParameterNamed("minCap");
+    final BigDecimal maxCap                = command.bigDecimalValueOfParameterNamed("maxCap");
+    final Integer    feeFrequency          = command.integerValueOfParameterNamed(FEE_FREQUENCY_PARAM_NAME);
+    boolean enableFreeWithdrawalCharge = command.booleanPrimitiveValueOfParameterNamed("enableFreeWithdrawalCharge");
+    boolean enablePaymentType         = command.booleanPrimitiveValueOfParameterNamed("enablePaymentType");
+
+    Integer freeWithdrawalFrequency = null;
+    Integer restartCountFrequency   = null;
+    PeriodFrequencyType countFrequencyType = null;
+    if (enableFreeWithdrawalCharge) {
+        freeWithdrawalFrequency = command.integerValueOfParameterNamed("freeWithdrawalFrequency");
+        restartCountFrequency   = command.integerValueOfParameterNamed("restartCountFrequency");
+        countFrequencyType      = PeriodFrequencyType.fromInt(command.integerValueOfParameterNamed("countFrequencyType"));
+    }
+    return new Charge(name, amount, currencyCode, chargeAppliesTo, chargeTimeType, chargeCalculationType,
+            penalty, active, paymentMode, feeOnMonthDay, feeInterval, minCap, maxCap, feeFrequency,
+            enableFreeWithdrawalCharge, freeWithdrawalFrequency, restartCountFrequency, countFrequencyType,
+            account, taxGroup, enablePaymentType, paymentType);
+}
+```
+
+The private constructor then enforces invariants. The most important ones:
+
+- **Monthly / annual recurrence** — when `chargeTimeType ∈ {MONTHLY_FEE, ANNUAL_FEE}` the constructor sets `feeOnMonth = feeOnMonthDay.getMonthValue()` and `feeOnDay = feeOnMonthDay.getDayOfMonth()`.
+- **Savings charges** — must use an allowed savings time, an allowed savings calculation type, and the only `chargeTimeType` that allows `PERCENT_OF_AMOUNT` are `WITHDRAWAL_FEE` and `SAVINGS_NOACTIVITY_FEE`:
+
+```java
+if (!(ChargeTimeType.fromInt(getChargeTimeType()).isWithdrawalFee()
+        || ChargeTimeType.fromInt(getChargeTimeType()).isSavingsNoActivityFee())
+        && ChargeCalculationType.fromInt(getChargeCalculation()).isPercentageOfAmount()) {
+    baseDataValidator.reset().parameter(CHARGE_CALCULATION_TYPE_PARAM_NAME).value(this.chargeCalculation)
+            .failWithCodeNoParameterAddedToErrorCode(
+                    "savings.charge.calculation.type.percentage.allowed.only.for.withdrawal.or.NoActivity");
+}
+```
+
+- **Loan charges** — `penalty=true` with `DISBURSEMENT` or `TRANCHE_DISBURSEMENT` throws `ChargeDueAtDisbursementCannotBePenaltyException`; `chargeTimeType=OVERDUE_INSTALLMENT` with `penalty=false` throws `ChargeMustBePenaltyException`. Both come from `fineract-charge/exception`.
+- **Min/max cap** — only stored when calculation is `PERCENT_OF_DISBURSEMENT_AMOUNT` or `PERCENT_OF_AMOUNT`.
+
+### `Charge.update(JsonCommand command)`
+
+The update method walks every supported parameter, records what changed in a `Map<String,Object>` returned to the handler, and re-runs the same invariants. Two notable rules:
+
+```java
+// AA: Do not allow to change chargeAppliesTo.
+if (command.isChangeInIntegerParameterNamed("chargeAppliesTo", this.chargeAppliesTo)) {
+    throw new ChargeParameterUpdateNotSupportedException("charge.applies.to",
+            "Update of Charge applies to is not supported");
+}
+```
+
+```java
+// taxGroup may be assigned only when there isn't one yet
+if (command.isChangeInLongParameterNamed(ChargesApiConstants.taxGroupIdParamName, getTaxGroupId())) {
+    final Long newValue = command.longValueOfParameterNamed(ChargesApiConstants.taxGroupIdParamName);
+    actualChanges.put(ChargesApiConstants.taxGroupIdParamName, newValue);
+    if (taxGroup != null) {
+        baseDataValidator.reset().parameter(ChargesApiConstants.taxGroupIdParamName)
+            .failWithCode("modification.not.supported");
+    }
+}
+```
+
+`chargePaymentMode` is editable only when `isLoanCharge()` is true — otherwise it is silently skipped.
+
+### `Charge.delete()` is a soft delete
+
+```java
+public void delete() {
+    this.deleted = true;
+    this.name = getId() + "_" + this.name;
+}
+```
+
+The rewrite of `name` is the trick that keeps the `name` unique constraint usable after a delete — operators can create a new charge with the original name.
+
+### `Charge.toData()` projection
+
+`toData()` builds the `ChargeData` DTO that all read endpoints return. Highlights:
+
+```java
+public ChargeData toData() {
+    final EnumOptionData chargeTimeType        = ChargeEnumerations.chargeTimeType(this.chargeTimeType);
+    final EnumOptionData chargeAppliesTo       = ChargeEnumerations.chargeAppliesTo(this.chargeAppliesTo);
+    final EnumOptionData chargeCalculationType = ChargeEnumerations.chargeCalculationType(this.chargeCalculation);
+    final EnumOptionData chargePaymentMode     = ChargeEnumerations.chargePaymentMode(this.chargePaymentMode);
+    EnumOptionData feeFrequencyType = (this.feeFrequency != null) ? ChargeEnumerations.feeFrequencyType(this.feeFrequency) : null;
+    // ...
+    return ChargeData.builder().id(getId()).name(this.name).amount(this.amount).currency(currency)
+        .chargeTimeType(chargeTimeType).chargeAppliesTo(chargeAppliesTo).chargeCalculationType(chargeCalculationType)
+        .chargePaymentMode(chargePaymentMode).feeOnMonthDay(getFeeOnMonthDay()).feeInterval(this.feeInterval)
+        .penalty(this.penalty).active(this.active).freeWithdrawal(this.enableFreeWithdrawal)
+        .freeWithdrawalChargeFrequency(this.freeWithdrawalFrequency).restartFrequency(this.restartFrequency)
+        .restartFrequencyEnum(this.restartFrequencyEnum).isPaymentType(this.enablePaymentType)
+        .paymentTypeOptions(paymentTypeData).minCap(this.minCap).maxCap(this.maxCap)
+        .feeFrequency(feeFrequencyType).incomeOrLiabilityAccount(accountData).taxGroup(taxGroupData).build();
+}
+```
+
+`ChargeData` itself lives in `fineract-core` (`org.apache.fineract.portfolio.charge.data`) so any module that depends on `fineract-core` can read it.
+
+## `ChargeTimeType` (lives in `fineract-core`)
+
+`fineract-core/src/main/java/org/apache/fineract/portfolio/charge/domain/ChargeTimeType.java` defines the **moment** at which a fee/penalty fires. The values are:
+
+| Code | Constant | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `0` | `INVALID` | — | Sentinel. |
+| `1` | `DISBURSEMENT` | LOAN | Charged at first disbursement. |
+| `2` | `SPECIFIED_DUE_DATE` | LOAN, SAVINGS, CLIENT | Charged on an explicit calendar date. |
+| `3` | `SAVINGS_ACTIVATION` | SAVINGS | Charged once when the account is activated. |
+| `4` | `SAVINGS_CLOSURE` | SAVINGS | Charged on closure. |
+| `5` | `WITHDRAWAL_FEE` | SAVINGS | Charged on every withdrawal transaction. |
+| `6` | `ANNUAL_FEE` | SAVINGS | Recurring annual maintenance fee. |
+| `7` | `MONTHLY_FEE` | SAVINGS | Recurring monthly fee. |
+| `8` | `INSTALMENT_FEE` | LOAN | Fan-out per installment via `LoanInstallmentCharge`. |
+| `9` | `OVERDUE_INSTALLMENT` | LOAN | Penalty raised by the overdue-loans job. |
+| `10` | `OVERDRAFT_FEE` | SAVINGS | Charged while in overdraft. |
+| `11` | `WEEKLY_FEE` | SAVINGS | Recurring weekly fee. |
+| `12` | `TRANCHE_DISBURSEMENT` | LOAN | Per-tranche multi-disbursement fee. |
+| `13` | `SHAREACCOUNT_ACTIVATION` | SHARES | Charged on share account activation. |
+| `14` | `SHARE_PURCHASE` | SHARES | Charged on share purchase. |
+| `15` | `SHARE_REDEEM` | SHARES | Charged on share redemption. |
+| `16` | `SAVINGS_NOACTIVITY_FEE` | SAVINGS | Charged when an account is dormant. |
+
+The class exposes per-applies-to allowed-value arrays (used both by the validator and by the read-side dropdowns):
+
+```java
+public static Object[] validLoanValues() {
+    return new Integer[] { DISBURSEMENT.getValue(), SPECIFIED_DUE_DATE.getValue(),
+            INSTALMENT_FEE.getValue(), OVERDUE_INSTALLMENT.getValue(), TRANCHE_DISBURSEMENT.getValue() };
+}
+
+public static Object[] validLoanChargeValues() { // narrower — for ad-hoc loan charges
+    return new Integer[] { DISBURSEMENT.getValue(), SPECIFIED_DUE_DATE.getValue(), INSTALMENT_FEE.getValue() };
+}
+
+public static Object[] validSavingsValues() {
+    return new Integer[] { SPECIFIED_DUE_DATE.getValue(), SAVINGS_ACTIVATION.getValue(),
+            SAVINGS_CLOSURE.getValue(), WITHDRAWAL_FEE.getValue(), ANNUAL_FEE.getValue(),
+            MONTHLY_FEE.getValue(), OVERDRAFT_FEE.getValue(), WEEKLY_FEE.getValue(),
+            SAVINGS_NOACTIVITY_FEE.getValue() };
+}
+
+public static Object[] validClientValues() { return new Integer[] { SPECIFIED_DUE_DATE.getValue() }; }
+
+public static Object[] validShareValues() {
+    return new Integer[] { SHAREACCOUNT_ACTIVATION.getValue(),
+                           SHARE_PURCHASE.getValue(), SHARE_REDEEM.getValue() };
+}
+```
+
+There are also boolean predicates — `isInstalmentFee()`, `isMonthlyFee()`, `isAnnualFee()`, `isOverdueInstallment()`, `isTrancheDisbursement()`, `isDisbursementOrTrancheDisbursementCharge()`, `isAllowedLoanChargeTime()`, `isAllowedSavingsChargeTime()`, `isAllowedClientChargeTime()` — used throughout `fineract-loan` and `fineract-savings`.
+
+## `ChargeCalculationType` (lives in `fineract-charge`)
+
+`fineract-charge/.../domain/ChargeCalculationType.java`:
+
+| Code | Constant | Meaning |
+| --- | --- | --- |
+| `0` | `INVALID` | Sentinel. |
+| `1` | `FLAT` | A literal `amount`. |
+| `2` | `PERCENT_OF_AMOUNT` | `amount` is a percentage applied to the relevant principal/withdrawal/balance. |
+| `3` | `PERCENT_OF_AMOUNT_AND_INTEREST` | Percentage applied to `(amount + interest)`. Loan-only. |
+| `4` | `PERCENT_OF_INTEREST` | Percentage applied to interest portion. Loan-only. |
+| `5` | `PERCENT_OF_DISBURSEMENT_AMOUNT` | Percentage of tranche disbursement amount. Loan-only. |
+
+Per-applies-to allowlists (used by the validator):
+
+```java
+public static Object[] validValuesForLoan() {
+    return new Integer[] { FLAT.getValue(), PERCENT_OF_AMOUNT.getValue(), PERCENT_OF_AMOUNT_AND_INTEREST.getValue(),
+                           PERCENT_OF_INTEREST.getValue(), PERCENT_OF_DISBURSEMENT_AMOUNT.getValue() };
+}
+public static Object[] validValuesForSavings()                  { return new Integer[] { FLAT.getValue(), PERCENT_OF_AMOUNT.getValue() }; }
+public static Object[] validValuesForShares()                   { return new Integer[] { FLAT.getValue(), PERCENT_OF_AMOUNT.getValue() }; }
+public static Object[] validValuesForClients()                  { return new Integer[] { FLAT.getValue() }; }
+public static Object[] validValuesForShareAccountActivation()   { return new Integer[] { FLAT.getValue() }; }
+public static Object[] validValuesForTrancheDisbursement()      { return new Integer[] { FLAT.getValue(), PERCENT_OF_DISBURSEMENT_AMOUNT.getValue() }; }
+```
+
+The boolean helpers are `isFlat()`, `isPercentageOfAmount()`, `isPercentageOfAmountAndInterest()`, `isPercentageOfInterest()`, `isPercentageOfDisbursementAmount()`, `isPercentageBased()` and the compound `hasInterest()` / `isAllowedSavingsChargeCalculationType()` / `isAllowedClientChargeCalculationType()`.
+
+## `ChargeAppliesTo`
+
+Source: `fineract-charge/.../domain/ChargeAppliesTo.java`.
+
+```java
+public enum ChargeAppliesTo {
+    INVALID(0,  "chargeAppliesTo.invalid"),
+    LOAN(1,     "chargeAppliesTo.loan"),
+    SAVINGS(2,  "chargeAppliesTo.savings"),
+    CLIENT(3,   "chargeAppliesTo.client"),
+    SHARES(4,   "chargeAppliesTo.shares");
+    // ...
+}
+```
+
+`Charge.fromJson` calls `fromInt(...)` and stores the integer value in `charge_applies_to_enum`. `Charge.update(...)` refuses to change this field (`ChargeParameterUpdateNotSupportedException`) — a `Charge` is permanently bound to its account type once persisted, which is what guarantees the per-account FK-bearing tables (`m_loan_charge`, `m_savings_account_charge`, etc.) can rely on it.
+
+## `ChargePaymentMode`
+
+Source: `fineract-charge/.../domain/ChargePaymentMode.java`.
+
+```java
+public enum ChargePaymentMode {
+    REGULAR(0,          "chargepaymentmode.regular"),
+    ACCOUNT_TRANSFER(1, "chargepaymentmode.accounttransfer");
+    // ...
+    public boolean isPaymentModeAccountTransfer() { return this.value.equals(ACCOUNT_TRANSFER.getValue()); }
+}
+```
+
+The mode applies only to **loan charges**. When `ACCOUNT_TRANSFER` is set, the loan account expects the borrower to fund the charge through an account-to-account transfer from a savings account — the actual transfer is orchestrated by `fineract-savings` / the account-transfers service.
+
+## `Charge.equals` and `hashCode`
+
+The entity overrides both methods on the **business key** (all persisted fields except the surrogate id):
+
+```java
+@Override
+public boolean equals(Object o) {
+    if (this == o) return true;
+    if (!(o instanceof Charge)) return false;
+    Charge other = (Charge) o;
+    return Objects.equals(name, other.name)
+        && Objects.equals(amount, other.amount)
+        && Objects.equals(currencyCode, other.currencyCode)
+        && Objects.equals(chargeAppliesTo, other.chargeAppliesTo)
+        && Objects.equals(chargeTimeType, other.chargeTimeType)
+        && Objects.equals(chargeCalculation, other.chargeCalculation)
+        && Objects.equals(chargePaymentMode, other.chargePaymentMode)
+        && Objects.equals(feeOnDay, other.feeOnDay)
+        && Objects.equals(feeInterval, other.feeInterval)
+        && Objects.equals(feeOnMonth, other.feeOnMonth)
+        && penalty == other.penalty && active == other.active && deleted == other.deleted
+        && Objects.equals(minCap, other.minCap)  && Objects.equals(maxCap, other.maxCap)
+        && Objects.equals(feeFrequency, other.feeFrequency)
+        && Objects.equals(account, other.account) && Objects.equals(taxGroup, other.taxGroup);
+}
+```
+
+This is important when `LoanProductCharge`, `SavingsProductCharge` or `ShareProductCharge` compare their attached `Charge` against the catalog row to detect drift.
+
+## Helper getters used by loan / savings code
+
+The entity exposes a handful of helpers consumed across modules:
+
+| Method | Behavior |
+| --- | --- |
+| `isLoanCharge() / isSavingsCharge() / isClientCharge()` | Wraps `ChargeAppliesTo.fromInt(...).isXxxCharge()`. |
+| `isMonthlyFee() / isAnnualFee() / isOverdueInstallment() / isDisbursementCharge()` | Wraps `ChargeTimeType.fromInt(...)` helpers. |
+| `isPercentageOfApprovedAmount() / isPercentageOfDisbursementAmount()` | Wraps `ChargeCalculationType` helpers. |
+| `isAllowedLoanChargeTime() / isAllowedSavingsChargeTime() / isAllowedClientChargeTime()` | Validates time vs. applies-to. |
+| `isAllowedSavingsChargeCalculationType() / isAllowedClientChargeCalculationType()` | Validates calculation vs. applies-to. |
+| `getFeeOnMonthDay()` | Reassembles `MonthDay` from `(feeOnMonth, feeOnDay)`. |
+| `getIncomeAccountId()` | Returns the GL income account FK or null. |
+
+The repository wrapper `ChargeRepositoryWrapper.findOneWithNotFoundDetection(Long)` is the canonical lookup — direct use of `ChargeRepository.findById` is discouraged because consumers must handle the `Optional` and produce a consistent `ChargeNotFoundException`.
+
+## Where the enums are consumed
+
+- **Loan**: `LoanCharge` stores `charge_time_enum` and `charge_calculation_enum` as ints, fed from `Charge` at attachment time. The loan transaction engine reads back through `ChargeTimeType.fromInt(...)` to decide installment fan-out (`INSTALMENT_FEE` → `LoanInstallmentCharge`), tranche fan-out (`TRANCHE_DISBURSEMENT` → `LoanTrancheCharge`) and overdue creation (`OVERDUE_INSTALLMENT` → `LoanOverdueInstallmentCharge`). See [Loan charges](/loan/loan-charges).
+- **Savings**: `SavingsAccountCharge` consumes `WITHDRAWAL_FEE`, `MONTHLY_FEE`, `ANNUAL_FEE`, `WEEKLY_FEE`, `OVERDRAFT_FEE`, `SAVINGS_NOACTIVITY_FEE`, `SAVINGS_ACTIVATION`, `SAVINGS_CLOSURE`. The recurring-fee job uses `feeOnMonthDay` + `feeInterval` + `feeFrequency`. See [Savings charges](/savings/savings-charges).
+- **Client charges**: only `SPECIFIED_DUE_DATE` + `FLAT` are allowed.
+- **Share account**: `SHAREACCOUNT_ACTIVATION` + `FLAT`, `SHARE_PURCHASE` + (FLAT|PERCENT_OF_AMOUNT), `SHARE_REDEEM` + (FLAT|PERCENT_OF_AMOUNT).
+
+## Cross-references
+
+- The REST endpoints that drive create/update/delete are in [Charges API](/charge/charges-api).
+- The JSON parameter-level rules and the three `@CommandType` handlers are in [Charge serialization and handlers](/charge/charge-serialization-and-handlers).
+- The shared `EnumOptionData`, `JsonCommand`, `DataValidatorBuilder` and `AbstractPersistableCustom` primitives that this class uses live in `fineract-core`; see [Portfolio shared domain](/core/portfolio-shared-domain).

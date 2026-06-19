@@ -1,0 +1,430 @@
+---
+title: "Journal Entries: Row Model, Reversal, External Events"
+sidebarTitle: "Journal Entries"
+description: "Fineract's double-entry ledger — the JournalEntry entity, debit/credit invariants, manual posting flow, reversal semantics, and business event publishing."
+---
+
+A journal entry in Apache Fineract is one line of the general ledger. Each posting — whether triggered manually via REST or programmatically by a loan, savings, or share transaction — produces a set of `JournalEntry` rows that together must sum to a balanced debit/credit pair. This page documents the entity, its enum, the write-service flow, the reversal mechanism, and the events emitted when entries are persisted.
+
+## Entity — `org.apache.fineract.accounting.journalentry.domain.JournalEntry`
+
+`JournalEntry` lives in `fineract-accounting` and maps to `acc_gl_journal_entry`. It extends `AbstractAuditableWithUTCDateTimeCustom<Long>`, so every row carries created-by / modified-by / created-on / modified-on audit columns automatically.
+
+```java
+@Entity
+@Getter
+@Table(name = "acc_gl_journal_entry")
+public class JournalEntry extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "office_id", nullable = false)
+    private Office office;
+
+    @ManyToOne()
+    @JoinColumn(name = "payment_details_id")
+    private PaymentDetail paymentDetail;
+
+    @ManyToOne
+    @JoinColumn(name = "account_id", nullable = false)
+    private GLAccount glAccount;
+
+    @Column(name = "currency_code", length = 3, nullable = false)
+    private String currencyCode;
+
+    @Setter
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "reversal_id")
+    private JournalEntry reversalJournalEntry;
+
+    @Column(name = "transaction_id", nullable = false, length = 50)
+    private String transactionId;
+
+    @Column(name = "loan_transaction_id")    private Long loanTransactionId;
+    @Column(name = "savings_transaction_id") private Long savingsTransactionId;
+    @Column(name = "client_transaction_id")  private Long clientTransactionId;
+    @Column(name = "share_transaction_id")   private Long shareTransactionId;
+
+    @Setter
+    @Column(name = "reversed", nullable = false)   private boolean reversed = false;
+
+    @Column(name = "manual_entry", nullable = false) private boolean manualEntry = false;
+
+    @Column(name = "entry_date")           private LocalDate transactionDate;
+    @Column(name = "type_enum", nullable = false)            private Integer type;
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;
+    @Column(name = "description", length = 500) private String description;
+    @Column(name = "entity_type_enum", length = 50) private Integer entityType;
+    @Column(name = "entity_id")            private Long entityId;
+    @Column(name = "ref_num")              private String referenceNumber;
+    @Column(name = "submitted_on_date", nullable = false)
+    private LocalDate submittedOnDate;
+```
+
+### Column reference
+
+| Column | Java | Notes |
+| --- | --- | --- |
+| `office_id` | `office` | The branch the posting is attributed to. Drives closure check. |
+| `payment_details_id` | `paymentDetail` | Optional FK to `m_payment_detail` (cheque #, account #, …). |
+| `account_id` | `glAccount` | FK to `acc_gl_account`. |
+| `currency_code` | `currencyCode` | ISO 4217 three-letter. Same as the parent transaction. |
+| `reversal_id` | `reversalJournalEntry` | Self-FK pointing from the reversed entry to its reversal entry. |
+| `transaction_id` | `transactionId` | Cross-row grouping key. Manual entries get a generated id; processor-driven entries use `LOAN_TRANSACTION_IDENTIFIER + loanTxId` etc. |
+| `loan_transaction_id`, `savings_transaction_id`, `client_transaction_id`, `share_transaction_id` | (four fields) | Mutually exclusive subledger FKs. |
+| `reversed` | `reversed` | Set to `true` when a reversal entry is created. |
+| `manual_entry` | `manualEntry` | `true` for `/v1/journalentries` POST; `false` for processor-driven postings. |
+| `entry_date` | `transactionDate` | The business date the posting affects (i.e. which closure period it belongs to). |
+| `type_enum` | `type` | 1 = CREDIT, 2 = DEBIT — see `JournalEntryType`. |
+| `amount` | `amount` | `BigDecimal(19,6)`, always positive — direction is in `type_enum`. |
+| `description` | `description` | Free-form. |
+| `entity_type_enum` | `entityType` | `PortfolioProductType.getValue()` — 1=LOAN, 2=SAVINGS, 3=CLIENT, 4=SHARES, 5=PROVISIONING. |
+| `entity_id` | `entityId` | FK into the subledger table (loan id, savings account id, etc.). |
+| `ref_num` | `referenceNumber` | Optional caller-supplied id. |
+| `submitted_on_date` | `submittedOnDate` | The business date the row was *posted on* (which may differ from `entry_date` for back-dated entries). Computed as `DateUtils.getBusinessLocalDate()` in `createNew`. |
+
+### Factory
+
+```java
+public static JournalEntry createNew(final Office office, final PaymentDetail paymentDetail,
+        final GLAccount glAccount, final String currencyCode, final String transactionId,
+        final boolean manualEntry, final LocalDate transactionDate,
+        final JournalEntryType journalEntryType, final BigDecimal amount,
+        final String description, final Integer entityType, final Long entityId,
+        final String referenceNumber, final Long loanTransaction, final Long savingsTransaction,
+        final Long clientTransaction, Long shareTransactionId) {
+    return new JournalEntry(office, paymentDetail, glAccount, currencyCode, transactionId, manualEntry,
+            transactionDate, journalEntryType.getValue(), amount, description, entityType, entityId,
+            referenceNumber, loanTransaction, savingsTransaction, clientTransaction, shareTransactionId);
+}
+```
+
+`submittedOnDate` is **not** a constructor parameter — the constructor sets it from the current business date:
+
+```java
+this.submittedOnDate = DateUtils.getBusinessLocalDate();
+```
+
+This means even if a back-dated entry is posted, you can always reconstruct *when* it was actually posted by looking at `submitted_on_date`. The trial-balance job uses this distinction (see [Trial Balance](/accounting/trial-balance)).
+
+### Predicates
+
+```java
+public boolean isDebitEntry()  { return JournalEntryType.DEBIT.getValue().equals(this.type);  }
+public boolean isCreditEntry() { return JournalEntryType.CREDIT.getValue().equals(this.type); }
+```
+
+## JournalEntryType enum
+
+```java
+public enum JournalEntryType {
+
+    CREDIT(1, "journalEntryType.credit"),
+    DEBIT(2, "journalEntrytType.debit");   // sic – typo preserved in source
+
+    public Integer getValue() { return this.value; }
+    public String getCode()   { return this.code; }
+    public static JournalEntryType fromInt(int v) { ... }
+}
+```
+
+Note the typo in `DEBIT`'s code key (`journalEntrytType` not `journalEntryType`) — preserved as-is to avoid breaking existing translations.
+
+## Double-entry invariant
+
+Every posting path enforces that the sum of debits equals the sum of credits for a `transaction_id` group.
+
+### Manual entries
+
+`JournalEntryWritePlatformServiceJpaRepositoryImpl.checkDebitAndCreditAmounts` totals the debits and credits supplied in the command and throws `JournalEntryInvalidException(DEBIT_CREDIT_SUM_MISMATCH, …)` if they differ.
+
+`JournalEntryCommand.validateForCreate` further requires at least one debit AND one credit (unless an `AccountingRule` is supplied that pre-defines either side).
+
+### Processor-driven entries
+
+Processors compute debit and credit amounts from the same loan/savings transaction DTO, so they are balanced by construction. `AccountingProcessorHelper.createCreditJournalEntryOrReversalForLoan(...)` and its peer `…ForDebit…` build the rows; `createJournalEntriesForLoan` aggregates them and persists each via `persistJournalEntry` (which also fires the business event — see below).
+
+## Write service — create manual entry
+
+`JournalEntryWritePlatformServiceJpaRepositoryImpl.createJournalEntry` (excerpt):
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult createJournalEntry(final JsonCommand command) {
+    final JournalEntryCommand journalEntryCommand = this.fromApiJsonDeserializer.commandFromApiJson(command.json());
+    journalEntryCommand.validateForCreate();
+
+    final Long officeId = command.longValueOfParameterNamed(JournalEntryJsonInputParams.OFFICE_ID.getValue());
+    final Office office = this.officeRepositoryWrapper.findOneWithNotFoundDetection(officeId);
+    final Long accountRuleId = command.longValueOfParameterNamed(JournalEntryJsonInputParams.ACCOUNTING_RULE.getValue());
+    final String currencyCode = command.stringValueOfParameterNamed(JournalEntryJsonInputParams.CURRENCY_CODE.getValue());
+
+    validateBusinessRulesForJournalEntries(journalEntryCommand);
+
+    /** Capture payment details **/
+    final Map<String, Object> changes = new LinkedHashMap<>();
+    final PaymentDetail paymentDetail = this.paymentDetailWritePlatformService
+            .createAndPersistPaymentDetail(command, changes);
+
+    final LocalDate transactionDate = command
+            .localDateValueOfParameterNamed(JournalEntryJsonInputParams.TRANSACTION_DATE.getValue());
+    final String transactionId = generateTransactionId(officeId);
+    final String referenceNumber = command.stringValueOfParameterNamed(
+            JournalEntryJsonInputParams.REFERENCE_NUMBER.getValue());
+
+    ExternalAssetOwner externalAssetOwner = null;
+    final ExternalId externalId = ExternalIdFactory.produce(command.stringValueOfParameterNamed(
+            JournalEntryJsonInputParams.EXTERNAL_ASSET_OWNER.getValue()));
+    if (!externalId.isEmpty()) {
+        if (!configurationReadPlatformService
+                .retrieveGlobalConfiguration(GlobalConfigurationConstants.ASSET_EXTERNALIZATION_OF_NON_ACTIVE_LOANS).isEnabled()) {
+            throw new JournalEntryRuntimeException("error.msg.glJournalEntry.asset.externalization.not.enabled",
+                    "GL Journal Entry with Asset Externalization not enabled");
+        }
+        externalAssetOwner = externalAssetOwnerRepository.findByExternalId(externalId)
+                .orElseThrow(() -> new ExternalAssetOwnerNotFoundException(externalId));
+    }
+    ...
+}
+```
+
+`validateBusinessRulesForJournalEntries` does three things:
+
+1. **Closure guard.** It calls `glClosureRepository.getLatestGLClosureByBranch(officeId)` and throws `JournalEntryInvalidException(ACCOUNTING_CLOSED, closingDate, …)` if `transactionDate <= closingDate`.
+2. **Account validation.** Each debit and credit entry's `glAccountId` must resolve to an enabled, detail-usage account that allows manual entries.
+3. **Total parity.** Sum of debit amounts must equal sum of credit amounts.
+
+If an `AccountingRule` is supplied, the rule may pre-pin the debit account, the credit account, or both. The handler then validates each side against the rule (see [Accounting Rules](/accounting/accounting-rules)).
+
+After validation, `saveAllDebitOrCreditEntries` iterates the array, constructs `JournalEntry` rows via the factory above, and calls `helper.persistJournalEntry` on each.
+
+### Transaction id
+
+```java
+private String generateTransactionId(final Long officeId) {
+    // pattern in helper – uses sequence + office id to form a stable opaque id
+    return AccountingProcessorHelper.PORTFOLIO_TRANSACTION_IDENTIFIER + officeId + "-" + nextSequence;
+}
+```
+
+For processor-driven entries the helper prepends a discriminator letter so you can decode the source of a posting from the id alone:
+
+```java
+public static final String LOAN_TRANSACTION_IDENTIFIER        = "L";
+public static final String SAVINGS_TRANSACTION_IDENTIFIER     = "S";
+public static final String CLIENT_TRANSACTION_IDENTIFIER      = "C";
+public static final String PROVISIONING_TRANSACTION_IDENTIFIER= "P";
+public static final String SHARE_TRANSACTION_IDENTIFIER       = "SH";
+```
+
+So a `transaction_id` of `L91872` is "the JE group for loan transaction 91872".
+
+## Reversal flow
+
+There is no UPDATE on a journal entry — once posted, rows are immutable. To unwind a posting you create a reversal entry: an entry with the *opposite* `type_enum` and the same `amount`, linked via `reversal_id`.
+
+### Manual reversal
+
+```java
+public CommandProcessingResult revertJournalEntry(final JsonCommand command) {
+    final List<JournalEntry> journalEntries = this.glJournalEntryRepository
+            .findUnReversedManualJournalEntriesByTransactionId(command.getTransactionId());
+    String reversalComment = command.stringValueOfParameterNamed("comments");
+
+    if (journalEntries.size() <= 1) {
+        throw new JournalEntriesNotFoundException(command.getTransactionId());
+    }
+    final String reversalTransactionId = revertJournalEntry(journalEntries, reversalComment);
+    return new CommandProcessingResultBuilder().withTransactionId(reversalTransactionId).build();
+}
+```
+
+The `size() <= 1` check is the double-entry invariant in disguise: a real manual posting has at least 2 rows (one debit + one credit). If a query returns just one row, something is wrong, so we refuse to reverse.
+
+The private `revertJournalEntry(List<JournalEntry>, String reversalComment)` method:
+
+```java
+final LocalDate journalEntriesTransactionDate = journalEntries.get(0).getTransactionDate();
+final GLClosure latestGLClosureByBranch = this.glClosureRepository.getLatestGLClosureByBranch(officeId);
+if (latestGLClosureByBranch != null) {
+    if (!DateUtils.isBefore(latestGLClosureByBranch.getClosingDate(), journalEntriesTransactionDate)) {
+        throw new JournalEntryInvalidException(GlJournalEntryInvalidReason.ACCOUNTING_CLOSED,
+                latestGLClosureByBranch.getClosingDate(), accountName, accountGLCode);
+    }
+}
+
+for (final JournalEntry journalEntry : journalEntries) {
+    JournalEntry reversalJournalEntry;
+    if (useDefaultComment) {
+        reversalComment = "Reversal entry for Journal Entry with Entry Id  :" + journalEntry.getId()
+                + " and transaction Id " + journalEntry.getTransactionId();
+    }
+    if (journalEntry.isDebitEntry()) {
+        reversalJournalEntry = JournalEntry.createNew(
+                journalEntry.getOffice(), journalEntry.getPaymentDetail(), journalEntry.getGlAccount(),
+                journalEntry.getCurrencyCode(), reversalTransactionId, /*manualEntry*/ true,
+                journalEntry.getTransactionDate(), JournalEntryType.CREDIT, journalEntry.getAmount(),
+                reversalComment, null, null, journalEntry.getReferenceNumber(),
+                journalEntry.getLoanTransactionId(), journalEntry.getSavingsTransactionId(),
+                journalEntry.getClientTransactionId(), journalEntry.getShareTransactionId());
+    } else {
+        reversalJournalEntry = JournalEntry.createNew(
+                journalEntry.getOffice(), journalEntry.getPaymentDetail(), journalEntry.getGlAccount(),
+                journalEntry.getCurrencyCode(), reversalTransactionId, true,
+                journalEntry.getTransactionDate(), JournalEntryType.DEBIT, journalEntry.getAmount(),
+                reversalComment, null, null, journalEntry.getReferenceNumber(),
+                journalEntry.getLoanTransactionId(), journalEntry.getSavingsTransactionId(),
+                journalEntry.getClientTransactionId(), journalEntry.getShareTransactionId());
+    }
+    helper.persistJournalEntry(reversalJournalEntry);
+    journalEntry.setReversed(true);
+    journalEntry.setReversalJournalEntry(reversalJournalEntry);
+    helper.persistJournalEntry(journalEntry);
+}
+return reversalTransactionId;
+```
+
+The flow is:
+
+1. **Closure guard** — same rule: cannot reverse an entry whose `transactionDate` falls in a closed period.
+2. **Flip type** for each row: debit → credit, credit → debit.
+3. **New `transaction_id`** for the reversal group, but same `transactionDate` (so the trial balance and running balance both see the offset on the *original* date).
+4. Set `reversed = true` on the original row, and store the new reversal row's id in `reversal_id` so the API can navigate from a reversed row back to its reversal.
+
+### Reversal of loan-driven entries
+
+When a loan transaction is reversed in the loan module, the loan side calls `JournalEntryWritePlatformService.createJournalEntryForReversedLoanTransaction(transactionDate, "L" + loanTxId, officeId)`:
+
+```java
+@Override
+public void createJournalEntryForReversedLoanTransaction(final LocalDate transactionDate,
+        final String loanTransactionId, final Long officeId) {
+    final GLClosure latestGLClosure = this.helper.getLatestClosureByBranch(officeId);
+    this.helper.checkForBranchClosures(latestGLClosure, transactionDate);
+    final String transactionId = AccountingProcessorHelper.LOAN_TRANSACTION_IDENTIFIER + loanTransactionId;
+    final List<JournalEntry> journalEntries = this.glJournalEntryRepository.findJournalEntries(transactionId,
+            PortfolioProductType.LOAN.getValue());
+    if (journalEntries == null || journalEntries.isEmpty()) {
+        return;
+    }
+    for (final JournalEntry journalEntry : journalEntries) {
+        final JournalEntry reversalJournalEntry = JournalEntry.createNew(
+                journalEntry.getOffice(), journalEntry.getPaymentDetail(),
+                journalEntry.getGlAccount(), journalEntry.getCurrencyCode(), transactionId, Boolean.FALSE,
+                transactionDate,
+                journalEntry.isDebitEntry() ? JournalEntryType.CREDIT : JournalEntryType.DEBIT,
+                journalEntry.getAmount(), journalEntry.getDescription(),
+                journalEntry.getEntityType(), journalEntry.getEntityId(),
+                journalEntry.getReferenceNumber(), journalEntry.getLoanTransactionId(),
+                journalEntry.getSavingsTransactionId(), journalEntry.getClientTransactionId(),
+                journalEntry.getShareTransactionId());
+        helper.persistJournalEntry(reversalJournalEntry);
+    }
+}
+```
+
+Differences from manual reversal:
+
+- The reversal entries reuse the **original `transaction_id`** (not a new one), which is the convention for subledger-driven reversals.
+- `manualEntry = false`.
+- Reversals are dated `transactionDate` (the business date passed by the loan module), not the original entry date.
+- The original entries are **not** marked `reversed = true` and their `reversalJournalEntry` is **not** set. Instead, the trial balance and running balance see both directions on the same `transaction_id` and net them out.
+
+## External events
+
+`AccountingProcessorHelper.persistJournalEntry` is the single place that fires the business event:
+
+```java
+public JournalEntry persistJournalEntry(JournalEntry journalEntry) {
+    boolean isNew = journalEntry.isNew();
+    JournalEntry savedJournalEntry = this.glJournalEntryRepository.saveAndFlush(journalEntry);
+    if (isNew && journalEntry.getLoanTransactionId() != null) {
+        businessEventNotifierService.notifyPostBusinessEvent(
+                new LoanJournalEntryCreatedBusinessEvent(savedJournalEntry));
+    }
+    return savedJournalEntry;
+}
+```
+
+`LoanJournalEntryCreatedBusinessEvent` is declared in `fineract-loan`:
+
+```java
+public class LoanJournalEntryCreatedBusinessEvent extends JournalEntryBusinessEvent implements NoExternalEvent {
+
+    private static final String TYPE = "JournalEntryCreatedBusinessEvent";
+    ...
+}
+```
+
+The `NoExternalEvent` marker means the event is **internal-only** — it does not get translated into an external event published on the event bus. It is consumed locally by listeners such as `ExternalAssetOwnerJournalEntryServiceImpl`:
+
+```java
+businessEventNotifierService.addPostBusinessEventListener(
+        LoanJournalEntryCreatedBusinessEvent.class, event -> { ... });
+```
+
+This is how the investor / external-asset-owner module hooks into loan postings to keep its own subledger in sync. See [Investor overview](/investor/overview).
+
+<Note>
+Only entries that carry a `loanTransactionId` and that are newly created (not re-saves) fire the event. Savings, shares, manual, and provisioning postings do **not** fire a business event from `persistJournalEntry`. If you need to react to other postings, listen on the higher-level loan / savings transaction events instead.
+</Note>
+
+## Read service
+
+`JournalEntryReadPlatformServiceImpl` implements paged queries against `acc_gl_journal_entry`:
+
+- `retrieveAll(SearchParameters, glAccountId, manualEntriesOnly, fromDate, toDate, submittedOnDateFrom, submittedOnDateTo, transactionId, entityType, JournalEntryAssociationParametersData)` — the main filter surface used by `/v1/journalentries`.
+- `retrieveGLJournalEntryById(Long, JournalEntryAssociationParametersData)` — single row, optionally with running-balance and transaction-detail enrichment.
+- `retrieveOfficeOpeningBalances(officeId, currencyCode)` — for the opening-balance workflow.
+- `retrieveJournalEntriesByEntityId(...)` — used by the reversed-loan flow above.
+
+The `JournalEntryAssociationParametersData` flags control whether the query joins to compute `runningBalance` per account-per-office or to populate `transactionDetails` (payment detail, payment type, note from the original subledger transaction).
+
+## API resource — `/v1/journalentries`
+
+`JournalEntriesApiResource` (registered at `/v1/journalentries`) maps to:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/journalentries` | List with filters (office, glAccount, manual-only, transactionId, dates, loanId, savingsId, entityType, runningBalance, transactionDetails). | `JOURNALENTRY` |
+| `GET` | `/v1/journalentries/{journalEntryId}` | Single row. | `JOURNALENTRY` |
+| `POST` | `/v1/journalentries` | Create. | `CREATE_JOURNALENTRY` |
+| `POST` | `/v1/journalentries?command=reverse&transactionId=...` | Reverse all manual rows in a group. | `REVERSE_JOURNALENTRY` |
+| `POST` | `/v1/journalentries?command=defineOpeningBalance` | Define opening balances. | `DEFINEOPENINGBALANCE_JOURNALENTRY` |
+| `POST` | `/v1/journalentries?command=updateRunningBalance` | Force a recompute. | `UPDATERUNNINGBALANCE_JOURNALENTRY` |
+| `POST` | `/v1/journalentries/downloadtemplate` | XLSX bulk import. | — |
+
+## Repositories
+
+`JournalEntryRepository extends JpaRepository<JournalEntry, Long>` adds many derived and custom queries:
+
+- `findUnReversedManualJournalEntriesByTransactionId(String)` — used by the manual reverse flow.
+- `findJournalEntries(String transactionId, Integer entityType)` — used by the reversed-loan flow.
+- `findProvisioningJournalEntriesByEntityId(Long entityId, Integer entityType)` — provisioning reversal.
+- `findNonReversedContraTransactionIds(...)` — opening-balance contra cleanup.
+- `findTransactionDatesAfter(LocalDate baselineDate)` — used by the trial-balance tasklet.
+- `findTrialBalanceLinesForDate(LocalDate)` — also trial balance.
+
+## Cross references
+
+<CardGroup cols={2}>
+  <Card title="GL accounts" icon="book" href="/accounting/gl-accounts">
+    The `account_id` target.
+  </Card>
+  <Card title="Accounting processors" icon="gears" href="/accounting/accounting-processors">
+    How loan / savings / share transactions become journal entries.
+  </Card>
+  <Card title="GL closure" icon="lock" href="/accounting/closure">
+    The closure date guard applied here.
+  </Card>
+  <Card title="Running balance" icon="rotate" href="/accounting/running-balance-job">
+    How `runningBalance` is computed per account / office.
+  </Card>
+  <Card title="Accounting rules" icon="scale-balanced" href="/accounting/accounting-rules">
+    Templates that pre-constrain debit / credit accounts on manual entries.
+  </Card>
+  <Card title="Loan overview" icon="hand-holding-dollar" href="/loan/overview">
+    Where `LoanJournalEntryCreatedBusinessEvent` is consumed.
+  </Card>
+</CardGroup>

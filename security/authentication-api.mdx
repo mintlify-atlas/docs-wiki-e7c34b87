@@ -1,0 +1,325 @@
+---
+title: "Authentication API — POST /v1/authentication Handler"
+sidebarTitle: "Auth API"
+description: "How AuthenticationApiResource validates basic-auth credentials, the AuthenticatedUserData payload, and the AccessTokenGenerationService SPIs."
+---
+
+`AuthenticationApiResource` exposes the explicit `POST /v1/authentication` endpoint that user-facing applications hit during sign-in to verify credentials and discover the caller's roles, permissions, and 2FA requirement. Unlike every other API call (where HTTP Basic credentials are simply submitted with the business request), this endpoint exists to give the UI a single round-trip that returns a rich `AuthenticatedUserData` payload along with the base64-encoded credential it should reuse on subsequent calls.
+
+The resource lives in `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/api/AuthenticationApiResource.java` and is wired into the basic-auth chain only — when `fineract.security.oauth2.enabled=true`, the equivalent endpoint is `GET /v1/userdetails` ([/security/user-details-api](/security/user-details-api)).
+
+## Class shape
+
+```java
+@Component
+@ConditionalOnProperty("fineract.security.basicauth.enabled")
+@Path("/v1/authentication")
+@Tag(name = "Authentication HTTP Basic", description = "…")
+@RequiredArgsConstructor
+public class AuthenticationApiResource {
+
+    @Value("${fineract.security.2fa.enabled}")
+    private boolean twoFactorEnabled;
+
+    public static class AuthenticateRequest {
+        public String username;
+        public String password;
+    }
+
+    @Qualifier("customAuthenticationProvider")
+    private final DaoAuthenticationProvider customAuthenticationProvider;
+    private final ToApiJsonSerializer<AuthenticatedUserData> apiJsonSerializerService;
+    private final SpringSecurityPlatformSecurityContext springSecurityPlatformSecurityContext;
+}
+```
+
+Highlights:
+
+- `@ConditionalOnProperty("fineract.security.basicauth.enabled")` — the bean is absent under OAuth2 mode.
+- `@Path("/v1/authentication")` — JAX-RS path **relative to the platform base** (`/api`). The path matchers in `SecurityConfig` use `/api/*/authentication` to permit unauthenticated POSTs.
+- The endpoint **uses `customAuthenticationProvider` directly**, bypassing the Spring Security filter chain. This means the JAX-RS resource is the auth check itself; the underlying request is permitted by `SecurityConfig` so it can reach here without an existing `Authentication` in the context.
+- `twoFactorEnabled` is read straight from properties so the response can flag whether the caller still needs to step up via OTP.
+
+## Endpoint contract
+
+| Method | Path | Consumes | Produces |
+| --- | --- | --- | --- |
+| `POST` | `/v1/authentication` | `application/json` | `application/json` |
+
+### Request
+
+```java
+public static class AuthenticateRequest {
+    public String username;
+    public String password;
+}
+```
+
+```json
+{
+  "username": "mifos",
+  "password": "password"
+}
+```
+
+The body is parsed manually with Gson rather than letting Jersey/JAX-RS unmarshal it. The inline comment explains:
+
+```java
+// TODO FINERACT-819: sort out Jersey so JSON conversion does not have
+// to be done explicitly via GSON here, but implicit by arg
+AuthenticateRequest request = new Gson().fromJson(apiRequestBodyAsJson, AuthenticateRequest.class);
+```
+
+### Authentication
+
+```java
+final Authentication authentication = new UsernamePasswordAuthenticationToken(request.username, request.password);
+final Authentication authenticationCheck = this.customAuthenticationProvider.authenticate(authentication);
+```
+
+- A fresh `UsernamePasswordAuthenticationToken` is built from the body.
+- `customAuthenticationProvider` is the `DaoAuthenticationProvider` defined in `SecurityConfig` — backed by `TenantAwareJpaPlatformUserDetailsService` and the delegating BCrypt `PasswordEncoder`.
+- Any failure (bad credentials, disabled/locked account, etc.) bubbles up as a Spring Security `AuthenticationException` and is mapped to HTTP 400/401 by the JAX-RS exception layer.
+
+### Response — `AuthenticatedUserData`
+
+The DTO lives in `fineract-security/.../data/AuthenticatedUserData.java`:
+
+```java
+@Data
+@NoArgsConstructor
+@Accessors(chain = true)
+public class AuthenticatedUserData {
+    private String username;
+    private Long userId;
+    private String base64EncodedAuthenticationKey;
+    private boolean authenticated;
+    private Long officeId;
+    private String officeName;
+    private Long staffId;
+    private String staffDisplayName;
+    private EnumOptionData organisationalRole;
+    private Collection<RoleData> roles;
+    private Collection<String> permissions;
+    private boolean shouldRenewPassword;
+    private boolean isTwoFactorAuthenticationRequired;
+}
+```
+
+Population logic (success path):
+
+```java
+final byte[] base64EncodedAuthenticationKey = Base64.getEncoder()
+    .encode((request.username + ":" + request.password).getBytes(StandardCharsets.UTF_8));
+
+final AppUser principal = (AppUser) authenticationCheck.getPrincipal();
+final Collection<RoleData> roles = new ArrayList<>();
+for (final Role role : principal.getRoles()) {
+    roles.add(role.toData());
+}
+
+final Long officeId = principal.getOffice().getId();
+final String officeName = principal.getOffice().getName();
+final Long staffId = principal.getStaffId();
+final String staffDisplayName = principal.getStaffDisplayName();
+final EnumOptionData organisationalRole = principal.organisationalRoleData();
+
+boolean isTwoFactorRequired = this.twoFactorEnabled
+    && !principal.hasSpecificPermissionTo(TwoFactorConstants.BYPASS_TWO_FACTOR_PERMISSION);
+```
+
+Field-by-field:
+
+| Field | Source |
+| --- | --- |
+| `username` | echo of the request. |
+| `userId` | `AppUser.id`. |
+| `base64EncodedAuthenticationKey` | `Base64(username:password)` — the value the client should subsequently send as `Authorization: Basic …`. |
+| `authenticated` | `true` on success. |
+| `officeId` / `officeName` | `AppUser.office`. |
+| `staffId` / `staffDisplayName` | `AppUser.staff`. |
+| `organisationalRole` | `AppUser.organisationalRoleData()`. |
+| `roles` | `AppUser.roles.stream().map(Role::toData)`. |
+| `permissions` | The `Authentication.authorities` granted by the provider (effectively the union of role permissions, plus `BYPASS_TWOFACTOR` when present). |
+| `shouldRenewPassword` | Only `true` when `SpringSecurityPlatformSecurityContext.doesPasswordHasToBeRenewed` returns true. |
+| `isTwoFactorAuthenticationRequired` | `fineract.security.2fa.enabled && !user.hasSpecificPermissionTo("BYPASS_TWOFACTOR")`. |
+
+### Password renewal branch
+
+Fineract supports an admin-driven password expiration policy. When the current user is past the policy window:
+
+```java
+if (this.springSecurityPlatformSecurityContext.doesPasswordHasToBeRenewed(principal)) {
+    authenticatedUserData = new AuthenticatedUserData()
+        .setUsername(request.username)
+        .setUserId(userId)
+        .setBase64EncodedAuthenticationKey(new String(base64EncodedAuthenticationKey, StandardCharsets.UTF_8))
+        .setAuthenticated(true)
+        .setShouldRenewPassword(true)
+        .setTwoFactorAuthenticationRequired(isTwoFactorRequired);
+    throw new PasswordResetRequiredException(authenticatedUserData);
+}
+```
+
+`PasswordResetRequiredException` carries the DTO so the JAX-RS `PasswordResetRequiredExceptionMapper` can serialise a **403 response that still contains the user metadata** the UI needs to redirect to the password-change form. See [/security/password-encoding](/security/password-encoding) and [/users/password-policy](/users/password-policy).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Web UI
+    participant Auth as POST /v1/authentication
+    participant Prov as customAuthenticationProvider (DaoAuthenticationProvider)
+    participant UDS as TenantAwareJpaPlatformUserDetailsService
+    participant Ctx as SpringSecurityPlatformSecurityContext
+
+    UI->>Auth: POST { username, password }
+    Auth->>Prov: authenticate(UsernamePasswordAuthenticationToken)
+    Prov->>UDS: loadUserByUsername(username)
+    UDS-->>Prov: AppUser (UserDetails)
+    Prov->>Prov: passwordEncoder.matches(raw, encoded)
+    Prov-->>Auth: Authentication (AppUser principal, authorities)
+    Auth->>Ctx: doesPasswordHasToBeRenewed(principal)
+    alt password expired
+        Ctx-->>Auth: true
+        Auth-->>UI: 403 + AuthenticatedUserData{shouldRenewPassword:true}
+    else password OK
+        Ctx-->>Auth: false
+        Auth-->>UI: 200 + full AuthenticatedUserData
+    end
+```
+
+## How credentials are validated
+
+The validation lifecycle is:
+
+1. **Username lookup.** `TenantAwareJpaPlatformUserDetailsService.loadUserByUsername` queries `PlatformUserRepository.findByUsernameAndDeletedAndEnabled(username, false, true)`. Deleted or disabled accounts are invisible — Spring Security raises `UsernameNotFoundException`, which is masked to "Bad credentials" by `DaoAuthenticationProvider` to avoid user enumeration.
+2. **Password match.** `DaoAuthenticationProvider.additionalAuthenticationChecks` runs `passwordEncoder.matches(rawPassword, userDetails.getPassword())`. The encoder is the delegating BCrypt encoder from `SecurityConfig.passwordEncoder()`.
+3. **Account state checks.** Post-authentication, `platformUserDetailsChecker` (set on the provider) runs additional state checks — locked, expired, credentials expired. This is where forced-renewal policies expressed at the user-details layer take effect.
+4. **Authorities materialisation.** The user's roles produce `GrantedAuthority` entries that show up as `permissions` in the response.
+
+The endpoint does **not** issue a session, cookie, or token of its own. The client is expected to reuse the returned `base64EncodedAuthenticationKey` on subsequent calls — Fineract's stateless model means every request is independently authenticated.
+
+## `AccessTokenGenerationService` / `UUIDAccessTokenGenerationService`
+
+The `/v1/authentication` endpoint **does not** issue an access token of its own — that responsibility belongs to the two-factor flow when 2FA is enabled. However, the SPI used for token issuance lives in the same module:
+
+```java
+public interface AccessTokenGenerationService {
+    String generateRandomToken();
+}
+
+@Service
+public class UUIDAccessTokenGenerationService implements AccessTokenGenerationService {
+    @Override
+    public String generateRandomToken() {
+        return UUID.randomUUID().toString().replaceAll("-", "");
+    }
+}
+```
+
+This is what `TwoFactorService.createAccessTokenFromOTP` calls when minting a `TFAccessToken` — a 32-character lowercase hex string. The interface exists so a deployment can swap in an alternative implementation (e.g. JWT-derived, JCE-derived) without rewriting `TwoFactorService`.
+
+## Why `customAuthenticationProvider` is injected directly
+
+Most endpoints rely on `SecurityContextHolder.getContext().getAuthentication()` because the filter chain has already authenticated the caller. `/v1/authentication` is the exception — it's the bootstrap call, intentionally **permitted** without authentication:
+
+```java
+.requestMatchers(API_MATCHER.matcher(HttpMethod.POST, "/api/*/authentication")).permitAll()
+```
+
+…so the resource is responsible for running the `DaoAuthenticationProvider` itself. By calling `provider.authenticate(...)` rather than going through `AuthenticationManager`, the resource:
+
+- Gets a single, deterministic provider (no other providers in the chain).
+- Receives the post-auth-checked `Authentication` directly.
+- Avoids polluting the `SecurityContext` — the request is being served stateless and the next request will reauthenticate via the basic header.
+
+## Swagger references
+
+`AuthenticationApiResource.authenticate` is annotated for OpenAPI generation:
+
+```java
+@Operation(summary = "Verify authentication",
+           description = "Authenticates the credentials provided and returns the set roles and permissions allowed.")
+@RequestBody(required = true,
+             content = @Content(schema = @Schema(implementation = AuthenticationApiResourceSwagger.PostAuthenticationRequest.class)))
+@ApiResponse(responseCode = "200", description = "OK",
+             content = @Content(schema = @Schema(implementation = AuthenticationApiResourceSwagger.PostAuthenticationResponse.class)))
+@ApiResponse(responseCode = "400", description = "Unauthenticated. Please login")
+@ApiResponse(responseCode = "403", description = "Password reset required")
+public String authenticate(@Parameter(hidden = true) final String apiRequestBodyAsJson) { … }
+```
+
+The `AuthenticationApiResourceSwagger` class declares the `PostAuthenticationRequest` and `PostAuthenticationResponse` shapes used by Swagger UI; they mirror `AuthenticateRequest` and `AuthenticatedUserData` respectively.
+
+## Example request/response
+
+```http
+POST /api/v1/authentication HTTP/1.1
+Host: fineract.example
+Content-Type: application/json
+Fineract-Platform-TenantId: default
+
+{
+  "username": "mifos",
+  "password": "password"
+}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "username": "mifos",
+  "userId": 1,
+  "base64EncodedAuthenticationKey": "bWlmb3M6cGFzc3dvcmQ=",
+  "authenticated": true,
+  "officeId": 1,
+  "officeName": "Head Office",
+  "staffId": null,
+  "staffDisplayName": null,
+  "organisationalRole": null,
+  "roles": [ { "id": 1, "name": "Super user", "description": "This role provides all application permissions." } ],
+  "permissions": [ "ALL_FUNCTIONS" ],
+  "shouldRenewPassword": false,
+  "isTwoFactorAuthenticationRequired": false
+}
+```
+
+Subsequent business calls reuse the `base64EncodedAuthenticationKey`:
+
+```http
+GET /api/v1/clients?limit=10 HTTP/1.1
+Authorization: Basic bWlmb3M6cGFzc3dvcmQ=
+Fineract-Platform-TenantId: default
+```
+
+## Error paths
+
+| Cause | HTTP status | Response |
+| --- | --- | --- |
+| Missing/invalid JSON | 400 | `IllegalArgumentException` mapped by JAX-RS. |
+| Username/password absent | 400 | Explicit `IllegalArgumentException` echoing the offending payload. |
+| Bad credentials | 401 | Spring Security `BadCredentialsException` → JAX-RS mapper. |
+| Account disabled/locked/expired | 401 | `DisabledException`, `LockedException`, `AccountExpiredException`. |
+| Password expired by policy | 403 | `PasswordResetRequiredException` carrying the `AuthenticatedUserData`. |
+
+The 400 vs 401 split mirrors the `BasicAuthenticationEntryPoint` behaviour elsewhere in the platform — clients should treat both as "credentials problem".
+
+## Pitfalls
+
+<Warning>
+The endpoint echoes the credentials back as a base64 string. That value is **the credential** — protect it like a password. Never log it, never store it in browser local storage, and never include it in tracebacks.
+</Warning>
+
+<Tip>
+If `isTwoFactorAuthenticationRequired` is `true`, the UI must immediately call `POST /v1/twofactor` (with the basic credentials) and exchange the OTP for an access token before any other business call succeeds. See [/security/two-factor-auth](/security/two-factor-auth).
+</Tip>
+
+## Related pages
+
+- [User details API](/security/user-details-api) — the OAuth2 counterpart.
+- [Two-factor authentication](/security/two-factor-auth)
+- [Password encoding](/security/password-encoding)
+- [User administration overview](/users/overview)
+- [Password policy](/users/password-policy)

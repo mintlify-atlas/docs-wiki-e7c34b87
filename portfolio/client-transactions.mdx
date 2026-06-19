@@ -1,0 +1,302 @@
+---
+title: "Client Transactions: Pay, Waive and Undo Audit"
+sidebarTitle: "Client Transactions"
+description: "Reference for ClientTransaction, ClientTransactionType and the ClientTransactionsApiResource undo workflow in Fineract."
+---
+
+# Client Transactions
+
+`ClientTransaction` is the journal of cash-touching client-level
+activity in Apache Fineract — currently every row represents either a
+charge payment (`PAY_CHARGE`) or a charge waiver (`WAIVE_CHARGE`). The
+entity is paired with [Client Charges](/portfolio/client-charges) on the
+write side: applying or waiving a charge produces a new
+`ClientTransaction`, and undoing one reverses the derived totals on the
+linked `ClientCharge`.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ClientTransaction`, `ClientTransactionType` | `fineract-provider` | `org.apache.fineract.portfolio.client.domain` |
+| `ClientTransactionRepository`, `ClientTransactionRepositoryWrapper` | `fineract-provider` | `org.apache.fineract.portfolio.client.domain` |
+| `ClientTransactionsApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.client.api` |
+| `ClientTransactionReadPlatformService(Impl)`, `ClientTransactionWritePlatformService(JpaRepositoryImpl)` | `fineract-provider` | `org.apache.fineract.portfolio.client.service` |
+| `UndoClientTransactionCommandHandler` | `fineract-provider` | `org.apache.fineract.portfolio.client.handler` |
+| Exceptions: `ClientTransactionNotFoundException`, `ClientTransactionCannotBeUndoneException` | `fineract-provider` | `org.apache.fineract.portfolio.client.exception` |
+
+## Entity
+
+```java
+@Entity
+@Table(name = "m_client_transaction",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "external_id" }, name = "external_id") })
+public class ClientTransaction extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "client_id", nullable = false)
+    private Client client;
+
+    @ManyToOne
+    @JoinColumn(name = "office_id", nullable = false)
+    private Office office;
+
+    @ManyToOne(optional = true)
+    @JoinColumn(name = "payment_detail_id", nullable = true)
+    private PaymentDetail paymentDetail;
+
+    @Column(name = "currency_code", length = 3)
+    private String currencyCode;
+
+    @Column(name = "transaction_type_enum", nullable = false)
+    private Integer typeOf;
+
+    @Column(name = "transaction_date", nullable = false)
+    private LocalDate dateOf;
+
+    @Column(name = "submitted_on_date", nullable = false)
+    private LocalDate submittedOnDate;
+
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;
+
+    @Column(name = "is_reversed", nullable = false)
+    private boolean reversed;
+
+    @Column(name = "external_id", length = 100, nullable = true, unique = true)
+    private ExternalId externalId;
+}
+```
+
+### Field map
+
+| Column | Purpose |
+| --- | --- |
+| `client_id` | Owning `Client` (cascade is none — never delete by hand) |
+| `office_id` | Snapshot of the client's office at posting time; used for journals |
+| `payment_detail_id` | Optional FK into `PaymentDetail` (cheque #, receipt # …) |
+| `currency_code` | ISO code (snapshot from the `Charge`) |
+| `transaction_type_enum` | See `ClientTransactionType` below |
+| `transaction_date` | Business-effective date |
+| `submitted_on_date` | Wall-clock posting date |
+| `amount` | Always positive; sign is implied by `transaction_type_enum` |
+| `is_reversed` | Set by the undo command — never deletes the row |
+| `external_id` | Optional integrator-owned key, unique |
+
+The row inherits `created` / `lastModified` UTC timestamps and the
+authoring user from `AbstractAuditableWithUTCDateTimeCustom`.
+
+## ClientTransactionType
+
+```java
+public enum ClientTransactionType {
+    PAY_CHARGE(1, "clientTransactionType.payCharge"),
+    WAIVE_CHARGE(2, "clientTransactionType.waiveCharge");
+}
+```
+
+Only two types exist today — both are produced by the
+[Client Charges](/portfolio/client-charges) flow. The enum is open for
+extension but any new value must be backed by:
+
+1. A new `ClientChargePaidBy` semantic (or a new join table).
+2. A new write handler + business event.
+3. New `undo` semantics in
+   `ClientTransactionWritePlatformServiceJpaRepositoryImpl`.
+
+## ClientTransactionsApiResource
+
+Mounted at `/v1/clients`. The resource is split between `clientId` /
+`clientExternalId` keys and between `transactionId` / `transactionExternalId`
+keys, so there are four combinations of each verb:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/clients/{clientId}/transactions` | Paged list | `READ_CLIENTTRANSACTION` |
+| `GET` | `/v1/clients/external-id/{clientExternalId}/transactions` | Same, keyed by client externalId | `READ_CLIENTTRANSACTION` |
+| `GET` | `/v1/clients/{clientId}/transactions/{transactionId}` | Single transaction | `READ_CLIENTTRANSACTION` |
+| `GET` | `/v1/clients/{clientId}/transactions/external-id/{transactionExternalId}` | Single (txn externalId) | `READ_CLIENTTRANSACTION` |
+| `GET` | `/v1/clients/external-id/{clientExternalId}/transactions/{transactionId}` | Single (client externalId) | `READ_CLIENTTRANSACTION` |
+| `GET` | `/v1/clients/external-id/{clientExternalId}/transactions/external-id/{transactionExternalId}` | Single (both externalIds) | `READ_CLIENTTRANSACTION` |
+| `POST` | `/v1/clients/{clientId}/transactions/{transactionId}?command=undo` | Reverse a transaction | `ADJUST_CLIENTTRANSACTION` |
+| `POST` | …same for the three external-id variants | Reverse a transaction | `ADJUST_CLIENTTRANSACTION` |
+
+There is **no `POST`** to create a transaction directly — they are only
+produced as a side-effect of the
+[Client Charges](/portfolio/client-charges) `paycharge` / `waive`
+commands. This guarantees that every `ClientTransaction` has a matching
+`ClientChargePaidBy` link.
+
+### List response
+
+```json
+{
+  "totalFilteredRecords": 3,
+  "pageItems": [
+    {
+      "id": 12,
+      "clientId": 109,
+      "officeId": 1,
+      "officeName": "Head Office",
+      "transactionType": { "id": 1, "code": "clientTransactionType.payCharge",
+                            "value": "PAY_CHARGE" },
+      "date": [2025, 1, 27],
+      "submittedOnDate": [2025, 1, 27],
+      "currency": { "code": "USD", "name": "US Dollar", "decimalPlaces": 2 },
+      "amount": 100.00,
+      "reversed": false,
+      "externalId": "EXT-CHRG-001",
+      "paymentDetailData": { "id": 4, "paymentType": { "id": 1, "name": "Cash" } }
+    }
+  ]
+}
+```
+
+### Undo
+
+```http
+POST /v1/clients/{clientId}/transactions/{transactionId}?command=undo
+Content-Type: application/json
+```
+
+```json
+{}
+```
+
+`UndoClientTransactionCommandHandler` calls
+`ClientTransactionWritePlatformService.undo(clientId, transactionId)`,
+which:
+
+1. Loads the transaction; throws `ClientTransactionNotFoundException` if
+   absent.
+2. Validates that it is not already reversed (otherwise
+   `ClientTransactionCannotBeUndoneException`).
+3. Walks each `ClientChargePaidBy` linked to the transaction and rolls
+   back the charge totals:
+
+   ```java
+   // pseudo:
+   for (ClientChargePaidBy paidBy : transaction.getChargesPaidBy()) {
+       ClientCharge cc = paidBy.getClientCharge();
+       if (transaction.isPayCharge()) {
+           cc.subtractFromAmountPaid(paidBy.getAmount());
+       } else { // WAIVE_CHARGE
+           cc.subtractFromAmountWaived(paidBy.getAmount());
+       }
+       cc.recalculateOutstanding();
+   }
+   ```
+
+4. Sets `is_reversed = true` on the transaction (the row stays for
+   audit) and emits a `ClientTransactionAdjustBusinessEvent`.
+5. Reverses the accounting journal entries (delegated to the
+   `JournalEntryWritePlatformService`).
+
+## Read service
+
+`ClientTransactionReadPlatformServiceImpl` produces
+`ClientTransactionData` via `JdbcTemplate`. The main mappers are:
+
+- `ClientTransactionMapper` — single row → `ClientTransactionData` with
+  enum lookup, `CurrencyData` and `PaymentDetailData`.
+- A paged variant for the list endpoint.
+
+The result set is filtered through the user's office hierarchy
+(`m_office.hierarchy LIKE :hierarchy%`) so cross-office reads are not
+possible without the appropriate role.
+
+## Repository helpers
+
+`ClientTransactionRepositoryWrapper#findOneWithNotFoundDetection(client,
+id)` throws `ClientTransactionNotFoundException`. The wrapper also
+exposes `retrieveTransaction(externalId)` so the external-id endpoints
+can resolve without a JDBC trip.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `ClientTransactionNotFoundException` | Unknown id / externalId for that client |
+| `ClientTransactionCannotBeUndoneException` | `is_reversed = true` already, or post-closure |
+| `ClientNotFoundException` | Bad `clientId` / `clientExternalId` |
+
+## Patterns and recipes
+
+- **Pay then undo:** to test integration code, pay a charge with a
+  fresh `externalId`, then `POST .../transactions/{txId}?command=undo`.
+  The original `ClientCharge` should be back to `outstanding == amount`
+  with `is_paid_derived = false`.
+- **Idempotent reposting:** the unique `external_id` constraint allows
+  caller-supplied keys. If the same externalId is replayed the second
+  insert violates `external_id_UNIQUE` and bubbles up as a
+  `PlatformDataIntegrityException`.
+- **Listening:** subscribe to
+  `ClientTransactionAdjustBusinessEvent` to drive reversal webhooks or
+  reconciliation systems.
+
+## Accounting integration
+
+When a `ClientTransaction` is posted, the accounting layer mirrors the
+amount into journal entries:
+
+| Transaction type | Debit account | Credit account |
+| --- | --- | --- |
+| `PAY_CHARGE` | Cash / Linked savings | Income (charge) |
+| `WAIVE_CHARGE` | Loss on waivers | Income (charge) |
+
+The accounts come from the `m_charge.income_or_liability_account_id`
+mapping on the source `Charge` and from the office's default cash GL.
+On undo, the journal entry is reversed (a new pair of entries with
+swapped sides) — never deleted, so the trial balance balances at every
+point in time.
+
+## Read patterns
+
+### Retrieve transactions for a client
+
+```http
+GET /v1/clients/109/transactions?limit=20&offset=0
+```
+
+Returns the most recent 20 transactions in descending date order. The
+read service applies the office-hierarchy filter so cross-office
+visibility is governed by the authenticated user's role.
+
+### Match a transaction across externalId
+
+```http
+GET /v1/clients/external-id/PY-0001/transactions/external-id/EXT-CHRG-001
+```
+
+Both legs of the lookup use externalId; useful for idempotent
+replication from an external billing system.
+
+### Single transaction by transactionId
+
+```http
+GET /v1/clients/109/transactions/12
+```
+
+Returns a full `ClientTransactionData` including the `paymentDetailData`
+sub-object (cheque #, receipt #, type) for reconciliation.
+
+## Listing and paging
+
+The list endpoint returns a paged result:
+
+```json
+{
+  "totalFilteredRecords": 53,
+  "pageItems": [ ... ]
+}
+```
+
+`pageItems.length` is bounded by `limit` (default 200 from
+`SearchParameters`). `offset` is zero-based. There is no Spring `Page`
+shape here — the resource pre-dates the v2 pagination conventions.
+
+## Cross-references
+
+- [Client Charges](/portfolio/client-charges) — write side
+- [Clients](/portfolio/clients) — owning entity
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `Money`,
+  `PaymentDetail`, `ExternalId`
+- [Portfolio APIs index](/api/portfolio-apis)

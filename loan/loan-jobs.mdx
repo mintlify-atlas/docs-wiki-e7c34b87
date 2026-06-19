@@ -1,0 +1,289 @@
+---
+title: "Loan-Specific Spring Batch Jobs and Tasklet Wiring"
+sidebarTitle: "Loan Jobs"
+description: "Every loan-specific Spring Batch job in fineract-loan and fineract-provider — JobName, Config class, Tasklet, and the COB step it maps to in Fineract."
+---
+
+Loan-specific Spring Batch jobs in Apache Fineract are configured under `org.apache.fineract.portfolio.loanaccount.jobs.*`. Each job follows a uniform pattern: a `*Config` `@Configuration` declares a single `Step` and `Job` keyed off a `JobName` enum value; the `*Tasklet` runs the work. Most of these jobs were originally cron-driven but now have COB-step equivalents that run them inside the daily `LOAN_COB` chain — the standalone jobs remain for backward compatibility, legacy installs, and out-of-COB recovery.
+
+This page lists every loan job, its `JobName` constant, its config and tasklet classes, and the matching COB business step (where one exists). The `JobName` enum is in `fineract-core` ([source](#)) and the COB steps are documented at [Loan COB business steps](/cob/loan-cob-business-steps).
+
+## `JobName` constants (loan-related)
+
+From `fineract-core/.../infrastructure/jobs/service/JobName.java`:
+
+```java
+public enum JobName {
+    UPDATE_LOAN_ARREARS_AGEING("Update Loan Arrears Ageing"),
+    APPLY_HOLIDAYS_TO_LOANS("Apply Holidays To Loans"),
+    TRANSFER_FEE_CHARGE_FOR_LOANS("Transfer Fee For Loans From Savings"),
+    APPLY_CHARGE_TO_OVERDUE_LOAN_INSTALLMENT("Apply penalty to overdue loans"),
+    ADD_ACCRUAL_ENTRIES("Add Accrual Transactions"),
+    ADD_PERIODIC_ACCRUAL_ENTRIES("Add Periodic Accrual Transactions"),
+    RECALCULATE_INTEREST_FOR_LOAN("Recalculate Interest For Loans"),
+    GENERATE_LOANLOSS_PROVISIONING("Generate Loan Loss Provisioning"),
+    ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_LOANS_WITH_INCOME_POSTED_AS_TRANSACTIONS(
+            "Add Accrual Transactions For Loans With Income Posted As Transactions"),
+    LOAN_COB("Loan COB"),
+    LOAN_DELINQUENCY_CLASSIFICATION("Loan Delinquency Classification"),
+    ACCRUAL_ACTIVITY_POSTING("Accrual Activity Posting"),
+    WORKING_CAPITAL_LOAN_COB_JOB("Working Capital Loan COB"),
+    // ...
+}
+```
+
+The string value (e.g. `"Update Loan Arrears Ageing"`) is the human-readable name visible in `GET /v1/jobs`; the enum name (`UPDATE_LOAN_ARREARS_AGEING`) is the value stored in `job_name` on `job` and `job_run_history` tables and used to look up the Spring `Job` bean.
+
+## Job catalog
+
+<Note>
+Jobs in **`fineract-loan`** are part of the core loan module and run on every Fineract topology. Jobs in **`fineract-provider`** are wired in the runtime module — same packaging, more dependencies (event publishing, accounting GL).
+</Note>
+
+### 1. `UPDATE_LOAN_ARREARS_AGEING`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `UPDATE_LOAN_ARREARS_AGEING` |
+| Config | `portfolio/loanaccount/jobs/updateloanarrearsageing/UpdateLoanArrearsAgeingConfig.java` (`fineract-loan`) |
+| Tasklet | `UpdateLoanArrearsAgeingTasklet` |
+| Handler | `LoanArrearsAgeingUpdateHandler` |
+| COB step | [`UPDATE_LOAN_ARREARS_AGING`](/cob/loan-cob-business-steps) (`UpdateLoanArrearsAgingBusinessStep`) |
+
+```java
+@Bean
+public Job updateLoanArrearsAgeingJob() {
+    return new JobBuilder(JobName.UPDATE_LOAN_ARREARS_AGEING.name(), jobRepository)
+            .start(updateLoanArrearsAgeingStep())
+            .incrementer(new RunIdIncrementer()).build();
+}
+```
+
+Refreshes `m_loan_arrears_aging` rows: for each open loan it computes overdue principal, interest, fees, penalties and number of days past due, then upserts the aggregate. See [Arrears and re-aging](/loan/loan-arrears-and-reaging).
+
+### 2. `LOAN_DELINQUENCY_CLASSIFICATION`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `LOAN_DELINQUENCY_CLASSIFICATION` |
+| Config | `portfolio/loanaccount/jobs/setloandelinquencytags/SetLoanDelinquencyTagsConfig.java` (`fineract-loan`) |
+| Tasklet | `SetLoanDelinquencyTagsTasklet` |
+| Collaborators | `DelinquencyWritePlatformService`, `DelinquencyReadPlatformService`, `DelinquencyEffectivePauseHelper`, `LoanRepaymentScheduleInstallmentRepository`, `LoanTransactionRepository` |
+| COB step | [`LOAN_DELINQUENCY_CLASSIFICATION`](/cob/loan-cob-business-steps) (`SetLoanDelinquencyTagsBusinessStep`) |
+
+Classifies each loan against its product's `DelinquencyBucket`, opening/closing `LoanDelinquencyTagHistory` rows. See [Delinquency](/loan/delinquency).
+
+### 3. `ADD_PERIODIC_ACCRUAL_ENTRIES`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `ADD_PERIODIC_ACCRUAL_ENTRIES` |
+| Config | `portfolio/loanaccount/jobs/addperiodicaccrualentries/AddPeriodicAccrualEntriesConfig.java` (`fineract-loan`) |
+| Tasklet | `AddPeriodicAccrualEntriesTasklet` |
+| Service | `LoanAccrualsProcessingService` |
+| COB step | [`ADD_PERIODIC_ACCRUAL_ENTRIES`](/cob/loan-cob-business-steps) (`AddPeriodicAccrualEntriesBusinessStep`) |
+
+```java
+@Configuration @RequiredArgsConstructor
+public class AddPeriodicAccrualEntriesConfig {
+    private final JobRepository jobRepository;
+    private final PlatformTransactionManager transactionManager;
+    private final LoanAccrualsProcessingService loanAccrualsProcessingService;
+
+    @Bean
+    public Job addPeriodicAccrualEntriesJob() {
+        return new JobBuilder(JobName.ADD_PERIODIC_ACCRUAL_ENTRIES.name(), jobRepository)
+                .start(addPeriodicAccrualEntriesStep())
+                .incrementer(new RunIdIncrementer()).build();
+    }
+
+    @Bean
+    public AddPeriodicAccrualEntriesTasklet addPeriodicAccrualEntriesTasklet() {
+        return new AddPeriodicAccrualEntriesTasklet(loanAccrualsProcessingService);
+    }
+}
+```
+
+Creates accrual transactions on each loan up to *today* for products with `accountingRule = ACCRUAL_PERIODIC`. See [Accounting overview](/accounting/overview).
+
+### 4. `ADD_ACCRUAL_ENTRIES`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `ADD_ACCRUAL_ENTRIES` |
+| Config | `portfolio/loanaccount/jobs/addaccrualentries/AddAccrualEntriesConfig.java` (`fineract-provider`) |
+| Tasklet | `AddAccrualEntriesTasklet` |
+| COB step | None — runs only as a standalone job |
+
+Equivalent of `ADD_PERIODIC_ACCRUAL_ENTRIES` for loans on the older "post entire schedule's accrual upfront" model. Walks open loans and posts any missing accrual transactions through to `today`.
+
+### 5. `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_LOANS_WITH_INCOME_POSTED_AS_TRANSACTIONS`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_LOANS_WITH_INCOME_POSTED_AS_TRANSACTIONS` |
+| Config | `portfolio/loanaccount/jobs/addperiodicaccrualentriesforloanswithincomepostedastransactions/AddPeriodicAccrualEntriesForLoansConfig.java` (`fineract-provider`) |
+| Tasklet | `AddPeriodicAccrualEntriesForLoansWithIncomePostedAsTransactionsTasklet` |
+
+Special variant for loan products configured to *post income as separate transactions* (income-posted-as-transactions feature). Each interest accrual is journaled both as a posting and as a stand-alone `INCOME_POSTING` `LoanTransaction`.
+
+### 6. `RECALCULATE_INTEREST_FOR_LOAN`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `RECALCULATE_INTEREST_FOR_LOAN` |
+| Config | `portfolio/loanaccount/jobs/recalculateinterestforloan/RecalculateInterestForLoanConfig.java` (`fineract-provider`) |
+| Tasklet | `RecalculateInterestForLoanTasklet` |
+| COB step | [`LOAN_INTEREST_RECALCULATION`](/cob/loan-cob-business-steps) (`LoanInterestRecalculationCOBBusinessStep`) — available, not seeded |
+
+Walks every loan with `interestRecalculationEnabled = true` and rebuilds the unpaid future schedule using the configured `LoanInterestRecalculationCompoundingMethod` and `RecalculationStrategyType`.
+
+### 7. `APPLY_CHARGE_TO_OVERDUE_LOAN_INSTALLMENT`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `APPLY_CHARGE_TO_OVERDUE_LOAN_INSTALLMENT` (human name `"Apply penalty to overdue loans"`) |
+| Config | `portfolio/loanaccount/jobs/applychargetooverdueloaninstallment/ApplyChargeToOverdueLoanInstallmentConfig.java` (`fineract-provider`) |
+| Tasklet | `ApplyChargeToOverdueLoanInstallmentTasklet` |
+| COB step | [`APPLY_CHARGE_TO_OVERDUE_LOANS`](/cob/loan-cob-business-steps) (`ApplyChargeToOverdueLoansBusinessStep`) |
+
+For each `Charge` of type `LoanCharge.OVERDUE_INSTALLMENT_FEE`, scans loans with installments past due beyond the configured grace and inserts a `LoanCharge` per overdue installment.
+
+### 8. `APPLY_HOLIDAYS_TO_LOANS`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `APPLY_HOLIDAYS_TO_LOANS` |
+| Config | `portfolio/loanaccount/jobs/applyholidaystoloans/ApplyHolidaysToLoansConfig.java` (`fineract-provider`) |
+| Tasklet | `ApplyHolidaysToLoansTasklet` |
+
+Walks active holidays whose `applicableFromDate` is on/before today and not yet applied. For each loan whose office matches an active holiday and whose schedule contains a due date inside the holiday window, the job shifts those due dates per the holiday's `repaymentSchedulingType` (`SAME_DAY`, `MOVE_TO_NEXT_REPAYMENT_MEETING_DAY`, `MOVE_TO_NEXT_BUSINESS_DAY`).
+
+### 9. `TRANSFER_FEE_CHARGE_FOR_LOANS`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `TRANSFER_FEE_CHARGE_FOR_LOANS` |
+| Config | `portfolio/loanaccount/jobs/transferfeechargeforloans/TransferFeeChargeForLoansConfig.java` (`fineract-provider`) |
+| Tasklet | `TransferFeeChargeForLoansTasklet` |
+
+Auto-collects due loan charges from a borrower's linked savings account. Used when a loan charge is configured with payment from a savings account (`autoPaymentFromSavings = true`).
+
+### 10. `GENERATE_LOANLOSS_PROVISIONING`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `GENERATE_LOANLOSS_PROVISIONING` |
+| Config | `portfolio/loanaccount/jobs/generateloanlossprovisioning/GenerateLoanlossProvisioningConfig.java` (`fineract-provider`) |
+| Tasklet | `GenerateLoanlossProvisioningTasklet` |
+
+Walks `m_provisioning_criteria` rules and inserts/updates `m_loan_provisioning_history` rows, computing the provisioning amount per loan according to its days-past-due bucket and the configured percentages.
+
+### 11. `ACCRUAL_ACTIVITY_POSTING`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `ACCRUAL_ACTIVITY_POSTING` |
+| Config | `portfolio/loanaccount/jobs/accrualactivityposting/AccrualActivityPostingConfig.java` (`fineract-provider`) |
+| Tasklet | `AccrualActivityPostingTasklet` |
+| COB step | [`ACCRUAL_ACTIVITY_POSTING`](/cob/loan-cob-business-steps) (`AccrualActivityPostingBusinessStep`) — available, not seeded |
+
+Posts daily accrual *activity* transactions distinct from the periodic accrual entry transactions. Used for products that need separate GL postings per accrual period (e.g. for monthly accrual financial reporting).
+
+### 12. `LOAN_COB` (orchestrator)
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `LOAN_COB` |
+| Config | `cob/loan/LoanCOBConfig.java` (`fineract-provider`) |
+| COB step chain | All steps in [Loan COB business steps](/cob/loan-cob-business-steps) |
+
+`LOAN_COB` is the *master* job that orchestrates the per-loan business-step chain. It does not classify or accrue on its own — instead it iterates open loans and invokes each enabled `LoanCOBBusinessStep` in configured order. The other jobs above remain available as standalone fallbacks.
+
+### 13. `WORKING_CAPITAL_LOAN_COB_JOB`
+
+| Aspect | Value |
+| --- | --- |
+| `JobName` | `WORKING_CAPITAL_LOAN_COB_JOB` |
+| Config | `fineract-working-capital-loan/.../jobs/...` |
+
+The working-capital module's analogue of `LOAN_COB`; see [Working capital loan COB](/cob/working-capital-loan-cob).
+
+## Pattern: `*Config` template
+
+Every loan job follows this pattern:
+
+```java
+@Configuration
+@RequiredArgsConstructor
+public class FooConfig {
+    private final JobRepository jobRepository;
+    private final PlatformTransactionManager transactionManager;
+    private final FooService fooService; // domain dependency
+
+    @Bean
+    protected Step fooStep() {
+        return new StepBuilder(JobName.FOO.name(), jobRepository)
+                .tasklet(fooTasklet(), transactionManager).build();
+    }
+
+    @Bean
+    public Job fooJob() {
+        return new JobBuilder(JobName.FOO.name(), jobRepository)
+                .start(fooStep())
+                .incrementer(new RunIdIncrementer()).build();
+    }
+
+    @Bean
+    public FooTasklet fooTasklet() {
+        return new FooTasklet(fooService);
+    }
+}
+```
+
+The `RunIdIncrementer` lets the framework launch a fresh execution of the same `Job` on each schedule tick. Step and job both share `JobName.FOO.name()` — the Fineract job scheduler (in `fineract-core/.../infrastructure/jobs/`) discovers `Job` beans by this name when matching `m_jobs.name` to runnable Spring beans.
+
+## Cron vs. COB
+
+Historically all loan operations ran as cron jobs:
+
+```
+0 0 5 * * ? UPDATE_LOAN_ARREARS_AGEING
+0 0 5 * * ? LOAN_DELINQUENCY_CLASSIFICATION
+0 0 5 * * ? ADD_PERIODIC_ACCRUAL_ENTRIES
+0 0 5 * * ? APPLY_CHARGE_TO_OVERDUE_LOAN_INSTALLMENT
+```
+
+The COB framework now lets the same logic execute inside a per-loan transaction in a deterministic order. Two ways to migrate:
+
+1. **Disable the standalone job** (`PUT /v1/jobs/{id} { "active": false }`) and add the matching step to the active `LOAN_COB` chain.
+2. **Run both** — safe for idempotent jobs (e.g. arrears aging just overwrites the same row).
+
+See [COB batch jobs](/cob/cob-batch-jobs) for the full picture of how `LOAN_COB` interacts with the rest of the batch system.
+
+## Job execution observability
+
+- `m_job_run_history` records each execution's start/end time, success/failure and trigger type.
+- Failed `Tasklet` invocations push errors onto the configured Slack / email channel (`JobExecutionListenerImpl`).
+- `GET /v1/jobs/{jobId}/job-history` returns the rolling history.
+
+## Manual trigger
+
+```bash
+POST /fineract-provider/api/v1/jobs/{jobId}?command=executeJob
+```
+
+For loan jobs, this is useful when:
+
+- Recovering after a COB failure mid-day.
+- Backfilling `m_loan_arrears_aging` after a manual schedule rewrite.
+- Re-classifying delinquency immediately after creating a new `DelinquencyBucket`.
+
+## Cross-references
+
+- [Loan overview](/loan/overview)
+- [Loan COB business steps](/cob/loan-cob-business-steps)
+- [COB batch jobs](/cob/cob-batch-jobs)
+- [Delinquency](/loan/delinquency)
+- [Arrears and re-aging](/loan/loan-arrears-and-reaging)
+- [Accounting overview](/accounting/overview)

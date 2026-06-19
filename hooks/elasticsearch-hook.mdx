@@ -1,0 +1,263 @@
+---
+title: "ElasticSearchHookProcessor — Ship Events to an ES Index"
+sidebarTitle: "Elasticsearch Hook"
+description: "Apache Fineract ElasticSearchHookProcessor reference — POSTs event payloads to a configured ES index URL via OkHttp+Retrofit with tenant headers."
+---
+
+`ElasticSearchHookProcessor` is the Apache Fineract hooks transport for shipping command events straight into an Elasticsearch (or any URL-addressed document store) index. It is a near-clone of [WebHookProcessor](/hooks/web-hook) — same `Payload URL` + `Content Type` configuration shape, same `WebHookService` Retrofit interface, same OkHttp client — but it is broken out as its own `@Service` so that operators can manage ES-bound hooks separately (different template id, different Liquibase-seeded schema, different name in the UI). This page documents the processor and the conventions that the `m_hook_schema` seed encodes for the `Elastic Search` template.
+
+For the general processor contract see [hooks/hook-processors](/hooks/hook-processors); for the transport plumbing it shares with `WebHookProcessor` see [hooks/web-hook](/hooks/web-hook).
+
+## Where it lives
+
+| File                                                                       | Role                                            |
+| -------------------------------------------------------------------------- | ----------------------------------------------- |
+| `infrastructure/hooks/processor/ElasticSearchHookProcessor.java`           | `@Service("elasticSearchHookProcessor")`.       |
+| `infrastructure/hooks/processor/WebHookService.java`                       | Shared Retrofit interface (`sendJsonRequest`, `sendFormRequest`). |
+| `infrastructure/hooks/processor/ProcessorHelper.java`                      | OkHttpClient + Retrofit construction.           |
+| `infrastructure/hooks/api/HookApiConstants.java`                           | `elasticSearchTemplateName = "Elastic Search"`. |
+| `m_hook_templates` row id `3` (`name = 'Elastic Search'`)                  | Liquibase changeset 18 of `0002_initial_data.xml`. |
+| `m_hook_schema` rows id `8`, `9`, `10`                                     | Schema seed: `Payload URL`, `Content Type`, `Index Name`. |
+
+## Source
+
+```java
+// fineract-provider/.../infrastructure/hooks/processor/ElasticSearchHookProcessor.java
+@Service
+@RequiredArgsConstructor
+public class ElasticSearchHookProcessor implements HookProcessor {
+
+    private final ProcessorHelper processorHelper;
+
+    @Override
+    public void process(final Hook hook, final String payload, final String entityName,
+                        final String actionName, final FineractContext context) {
+
+        final Set<HookConfiguration> config = hook.getConfig();
+
+        String url = "";
+        String contentType = "";
+
+        for (final HookConfiguration conf : config) {
+            final String fieldName = conf.getFieldName();
+            if (fieldName.equals(payloadURLName)) {
+                url = conf.getFieldValue();
+            }
+            if (fieldName.equals(contentTypeName)) {
+                contentType = conf.getFieldValue();
+            }
+        }
+
+        sendRequest(url, contentType, payload, entityName, actionName, context);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void sendRequest(final String url, final String contentType, final String payload,
+                             final String entityName, final String actionName,
+                             final FineractContext context) {
+
+        final String fineractEndpointUrl = System.getProperty("baseUrl");
+        final WebHookService service = processorHelper.createWebHookService(url);
+
+        @SuppressWarnings("rawtypes")
+        final Callback callback = processorHelper.createCallback(url, payload);
+
+        if (contentType.equalsIgnoreCase("json") || contentType.contains("json")) {
+            final JsonObject json = new Gson().fromJson(payload, JsonObject.class);
+            service.sendJsonRequest(entityName, actionName,
+                    context.getTenantContext().getTenantIdentifier(),
+                    fineractEndpointUrl, json).enqueue(callback);
+        } else {
+            Map<String, String> map = new HashMap<>();
+            map = new Gson().fromJson(payload, map.getClass());
+            service.sendFormRequest(entityName, actionName,
+                    context.getTenantContext().getTenantIdentifier(),
+                    fineractEndpointUrl, map).enqueue(callback);
+        }
+    }
+}
+```
+
+There are exactly two differences from `WebHookProcessor`:
+
+1. The JSON branch uses `new Gson().fromJson(payload, JsonObject.class)` instead of `JsonParser.parseString(payload).getAsJsonObject()`. Functionally equivalent for any well-formed top-level JSON object.
+2. It uses the **two-argument** `createCallback(url, payload)` variant — a hook point that today logs the same `DEBUG` / `ERROR` messages but exists so that a future enhancement can put the payload into a dead-letter sink without changing the dispatch site.
+
+Everything else — the configuration shape, the `WebHookService` methods used, the headers, the async behaviour, the lack of retries — is identical to `WebHookProcessor`.
+
+## URL convention
+
+The `m_hook_schema` placeholder for the Elasticsearch URL field is the canonical hint:
+
+```
+Payload URL : http://<host>/<index name>/<type name>
+```
+
+So a typical configured URL looks like:
+
+```
+http://es.internal:9200/fineract-events/_doc
+```
+
+…where `_doc` is the index type (ES 7+) and `fineract-events` is the index name. Each event becomes one `POST` to that URL, which in ES is interpreted as "index a new document with an auto-generated `_id`". If you want to use a stable id (e.g. the Fineract resource id), you would either configure the URL with a template-rendered tail or front the cluster with a small ingest service that derives `_id` from the payload before re-`POST`ing.
+
+There is no built-in support for the ES bulk API. Each event is one document = one `POST`.
+
+### Index Name field (currently informational)
+
+The seed contains a third optional row, `Index Name`, with `placeholder = ""` and `optional = true`. The processor **does not read it** — only `Payload URL` and `Content Type` are consulted in code. The field exists so that operators can record the chosen index in a structured place, and so that future versions could derive the URL from it; today it is documentation only.
+
+## Configuration fields read
+
+| `field_name` | Constant            | Required by seed   | Used in code? | Notes                                    |
+| ------------ | ------------------- | ------------------ | ------------- | ---------------------------------------- |
+| `Payload URL`| `payloadURLName`    | yes                | yes           | Full URL including `<index>/<type>`.     |
+| `Content Type`| `contentTypeName`  | yes                | yes           | `"json"` is the recommended value.       |
+| `Index Name` | (literal `"Index Name"`) | no (optional)  | no            | Informational; not read by processor.    |
+
+Any value of `Content Type` other than one containing `"json"` falls through to the form-urlencoded branch, which is almost never what an ES cluster expects.
+
+## What is sent
+
+The body is the **raw event payload** — the same JSON object documented in [hooks/overview](/hooks/overview). Concretely each indexed document looks like:
+
+```json
+{
+  "entityName":  "LOAN",
+  "actionName":  "APPROVE",
+  "createdBy":   1,
+  "createdByName": "mifos",
+  "createdByFullName": "App Administrator",
+  "request":  { ... },
+  "response": { "resourceId": 71, ... },
+  "officeId": 1,
+  "clientId": 42,
+  "timestamp": "2024-04-01T09:13:51.234Z"
+}
+```
+
+Receivers should bear in mind:
+
+- The keys `request` and `response` are arbitrary nested objects whose shape varies by command. Avoid declaring a static ES mapping that constrains them.
+- `timestamp` is an ISO-8601 instant string; if you want to use it as the ES `@timestamp` field, configure an ingest pipeline or rename it before indexing.
+- `officeId` and `clientId` are lifted to the top level by `SynchronousCommandProcessingService.publishHookEvent` for cheap routing/filtering.
+
+## Headers
+
+Identical to `WebHookProcessor`:
+
+| Header                       | Value                                                    |
+| ---------------------------- | -------------------------------------------------------- |
+| `Content-Type`               | `application/json; charset=UTF-8` (JSON branch).         |
+| `X-Fineract-Entity`          | `entityName` from the event (e.g. `LOAN`).               |
+| `X-Fineract-Action`          | `actionName` from the event (e.g. `APPROVE`).            |
+| `Fineract-Platform-TenantId` | `context.getTenantContext().getTenantIdentifier()`.      |
+| `X-Fineract-Endpoint`        | `System.getProperty("baseUrl")`.                          |
+
+Elasticsearch ignores all the `X-Fineract-*` headers. They are still useful if you front the cluster with an indexing proxy that can route by tenant.
+
+## Authentication
+
+The processor itself sends **no authentication**. There are three common deployment shapes:
+
+1. **No auth (dev clusters).** Configure `http://localhost:9200/fineract-events/_doc`. Useful for local testing only.
+2. **Basic-auth at the URL.** Put credentials in the URL — `http://user:pass@es.example/...`. OkHttp will surface those as a `Authorization: Basic` header. Note the 100-character cap on `m_hook_configuration.field_value`.
+3. **mTLS or reverse-proxy enforced.** Terminate at an ingestion proxy (e.g. nginx + Logstash) that authenticates to the cluster on the hook's behalf. This is the only sensible production option, because it also lets you add retries, dead-lettering, transforms, and an ingest pipeline.
+
+If you need bearer-token auth from the hook itself, replace the `ElasticSearchHookProcessor` bean with one that adds an OkHttp `Interceptor` to the `ProcessorHelper`-built client (or replace `ProcessorHelper` for ES-only flows).
+
+## Validation at create time
+
+`HookWritePlatformServiceJpaRepositoryImpl.validateConfigAgainstSchema` runs the same connectivity ping it uses for `Web` only when the template name is `Web`:
+
+```java
+if (webTemplateName.equals(template.getName())) {
+    final Response<Void> response = service.sendEmptyRequest().execute();
+    if (!response.isSuccessful()) { ... }
+}
+```
+
+For `Elastic Search` templates the ping is **skipped**, so creation succeeds even if the URL is unreachable. That is sensible (ES root endpoints answer to `GET /` not `GET /<index>/<type>`), but it means operators do not get the early-failure signal they get for `Web`. The first dispatch will simply log an `onFailure` and drop the event.
+
+## Dispatch flow
+
+```mermaid
+sequenceDiagram
+    participant Listener as FineractHookListener
+    participant Proc as ElasticSearchHookProcessor
+    participant Helper as ProcessorHelper
+    participant Retro as Retrofit/OkHttp
+    participant ES as http://es.internal:9200/<br/>fineract-events/_doc
+
+    Listener->>Proc: process(hook, payload, "LOAN", "APPROVE", ctx)
+    Proc->>Proc: read Payload URL & Content Type from HookConfiguration
+    Proc->>Helper: createWebHookService(url)
+    Helper-->>Proc: WebHookService
+    Proc->>Helper: createCallback(url, payload)
+    Helper-->>Proc: Callback
+    Proc->>Retro: sendJsonRequest("LOAN", "APPROVE", "default",<br/>baseUrl, json).enqueue(callback)
+    Retro->>ES: POST /fineract-events/_doc HTTP/1.1<br/>Content-Type: application/json<br/>X-Fineract-Entity: LOAN<br/>X-Fineract-Action: APPROVE<br/>Fineract-Platform-TenantId: default<br/>X-Fineract-Endpoint: ...<br/><br/>{...event payload...}
+    ES-->>Retro: 201 Created  {"_id":"..." , ...}
+    Retro->>Helper: callback.onResponse(call, response)
+    Helper-->>Proc: LOG.debug "Status: 201"
+```
+
+## Operational guidance
+
+| Concern              | Notes                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------- |
+| Throughput           | One `POST` per event. For high volumes, front the cluster with a Logstash / Fluent Bit aggregator that uses `_bulk`. |
+| Mapping              | Use dynamic templates; `request` and `response` are heterogeneous and will trip strict mappings.    |
+| Index naming         | Date-suffix the index in the URL or in your proxy (e.g. `fineract-events-2024.04`).                 |
+| Failure handling     | None at the source — `onFailure` is logged. Make the receiver durable.                              |
+| Tenant separation    | If you index multiple tenants, route on the `Fineract-Platform-TenantId` header or include it in the URL path. |
+| Field length         | `m_hook_configuration.field_value` is `VARCHAR(100)` — long URLs with embedded creds may not fit.   |
+| Security             | Never expose `Elastic Search` hooks to the public internet without mTLS or an authenticating proxy. |
+
+## Comparison with `WebHookProcessor`
+
+| Aspect             | `WebHookProcessor`                       | `ElasticSearchHookProcessor`              |
+| ------------------ | ---------------------------------------- | ----------------------------------------- |
+| Template name      | `Web`                                    | `Elastic Search`                          |
+| Config fields read | `Payload URL`, `Content Type`            | `Payload URL`, `Content Type` (+ optional `Index Name` ignored) |
+| Body modes         | JSON / form                              | JSON / form (form rarely useful for ES)   |
+| JSON parsing       | `JsonParser.parseString(payload)`        | `new Gson().fromJson(payload, JsonObject.class)` |
+| Create-time ping   | yes (`sendEmptyRequest`)                 | no                                        |
+| Callback variant   | `createCallback(url)`                    | `createCallback(url, payload)`            |
+| Use case           | Any HTTP receiver                        | Document store / search index             |
+
+The two implementations are similar enough that a refactor into a single processor parameterised by template name would be straightforward. They are split today for clarity and to leave room for ES-specific bulk and id-mapping support.
+
+## Index design recommendations
+
+A typical production indexing topology has a small intake service in front of Elasticsearch — the hook posts to the intake; the intake batches, deduplicates and rewrites before forwarding to ES. With that pattern the hook side stays trivial and the heavy lifting (idempotency, retry, schema control) lives where it can be evolved independently of Fineract.
+
+| Concern                | Hook-side concern        | Intake / proxy concern                                                                            |
+| ---------------------- | ------------------------ | -------------------------------------------------------------------------------------------------- |
+| Document `_id`         | Whatever ES decides       | Set deterministically from `request.id` / `response.resourceId` for idempotent re-indexing.        |
+| Bulk batching          | One `POST` per event      | Buffer 10–100 events then `POST _bulk`.                                                            |
+| Field normalisation    | Raw payload as-is         | Drop `createdBy*` from queryable fields; pin `timestamp` as `@timestamp`.                          |
+| Index lifecycle (ILM)  | Not aware                | Apply rollover policy by date.                                                                     |
+| Auth                   | Optional URL basic-auth   | Hold ES API key; rotate independently.                                                             |
+| Retry on 429 / 5xx     | None — event is dropped   | Local queue + exponential backoff.                                                                 |
+
+If you cannot deploy an intake service, the next-best option is `nginx` in front of ES with a simple Lua / OpenResty hook to add the API key, plus a Logstash pipeline taking the same documents from a side queue for retries.
+
+## Schema mapping notes
+
+The two `request` / `response` fields in the body are heterogeneous by command. Two common mistakes when wiring this into ES directly:
+
+- **Strict mappings explode.** A `LOAN|CREATE` payload contains a `principal` numeric field; a `CLIENT|CREATE` payload does not. A static mapping that types `principal` as `keyword` after seeing the client event will reject the loan event. Always use dynamic templates with `match` + `match_mapping_type` rules.
+- **Field count limits.** ES caps the total number of fields per index at 1,000 by default. Aggregating every Fineract command into one index will hit this; use one index per `entityName` or a flattened-field type for `request` / `response`.
+
+The seed `m_hook_schema.placeholder` already nudges operators toward an index-per-payload-type model by putting `<index name>/<type name>` literally in the URL hint.
+
+## Cross-references
+
+- [Hooks overview](/hooks/overview) — system map and payload schema.
+- [Hook processors](/hooks/hook-processors) — `HookProcessor`, `HookProcessorProvider`, `ProcessorHelper`.
+- [Web hook](/hooks/web-hook) — sibling implementation with the same transport.
+- [Hook domain](/hooks/hook-domain) — `m_hook_schema` rows for the `Elastic Search` template.
+- [Hooks & messaging APIs](/api/hooks-and-messaging-apis) — REST CRUD shapes.
+- [Core hooks contracts](/core/hooks) — `HookEvent`, `HookEventSource`.
+- [Commands framework](/command/overview) — where event payloads originate.

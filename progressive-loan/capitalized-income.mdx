@@ -1,0 +1,595 @@
+---
+title: "Capitalized Income Feature on Progressive Loans Guide"
+sidebarTitle: "Capitalized Income"
+description: "Capitalized income on progressive loans: domain entity, write service with schedule recalc, COB amortization step, journal entries, and REST endpoints."
+---
+
+**Capitalized income** on an Apache Fineract progressive loan is a deferred-revenue construct: at some point during the loan, the lender records an inflow (typically a third-party subsidy, a yield-spread premium, or an origination top-up) that *increases the borrower's amortizing principal* and is recognised as fee or interest income over the remaining loan life. The feature combines a balance entity (`LoanCapitalizedIncomeBalance`), a write service that triggers a full schedule recalculation, a COB amortization step that drips income each day, and a dedicated REST surface that lets clients inspect both the balance and the per-day allocation history. Source code lives in `fineract-progressive-loan/` (entity, repository, REST, write service, command handler) with the processing-service contract and event types in `fineract-loan`, and the COB step in `fineract-provider`.
+
+## Configuration enums
+
+Defined in `fineract-loan/.../portfolio/loanaccount/domain/`:
+
+```java
+public enum LoanCapitalizedIncomeCalculationType implements ApiFacingEnum<LoanCapitalizedIncomeCalculationType> {
+    FLAT("loanCapitalizedIncomeCalculationType.flat", "Flat");
+}
+
+public enum LoanCapitalizedIncomeStrategy implements ApiFacingEnum<LoanCapitalizedIncomeStrategy> {
+    EQUAL_AMORTIZATION("capitalizedIncome.strategy.equalAmortization", "Equal amortization");
+}
+
+public enum LoanCapitalizedIncomeType implements ApiFacingEnum<LoanCapitalizedIncomeType> {
+    FEE("capitalizedIncome.incomeType.fee",      "Fee"),
+    INTEREST("capitalizedIncome.incomeType.interest", "Interest");
+}
+```
+
+| Enum | Values | Effect |
+| --- | --- | --- |
+| `LoanCapitalizedIncomeCalculationType` | `FLAT` | Amount provided literally — no percentage-based derivation today |
+| `LoanCapitalizedIncomeStrategy` | `EQUAL_AMORTIZATION` | Income is recognised evenly across remaining days |
+| `LoanCapitalizedIncomeType` | `FEE` / `INTEREST` | Whether amortised income posts to fee income or interest income GL |
+
+These mirror the [buy-down fee](/progressive-loan/buy-down-fee) configuration but with an important difference: capitalized income **inflates principal**.
+
+## Domain entity — `LoanCapitalizedIncomeBalance`
+
+```java
+@Entity
+@Table(name = "m_loan_capitalized_income_balance")
+@Getter
+@Setter
+public class LoanCapitalizedIncomeBalance extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Version
+    private Long version;
+
+    @ManyToOne
+    @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @ManyToOne
+    @JoinColumn(name = "loan_transaction_id", nullable = false)
+    private LoanTransaction loanTransaction;          // The originating CAPITALIZED_INCOME transaction
+
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;                        // Original capitalized amount
+
+    @Column(name = "date", nullable = false)
+    private LocalDate date;                           // Effective date
+
+    @Column(name = "unrecognized_amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal unrecognizedAmount;            // Still-to-amortize portion
+
+    @Column(name = "charged_off_amount", scale = 6, precision = 19)
+    private BigDecimal chargedOffAmount;              // Amount frozen at charge-off
+
+    @Column(name = "amount_adjustment", scale = 6, precision = 19)
+    private BigDecimal amountAdjustment;              // Adjustments applied via CAPITALIZED_INCOME_ADJUSTMENT
+
+    @Column(name = "is_deleted", nullable = false)
+    private boolean deleted = false;
+
+    @Column(name = "is_closed", nullable = false)
+    private boolean closed = false;
+}
+```
+
+One row per `CAPITALIZED_INCOME` transaction. The `unrecognizedAmount` is what the daily amortization step drains; once it reaches zero (and no adjustments are outstanding), the row's `closed` flag is flipped.
+
+A custom finder for adjustments:
+
+```java
+LoanCapitalizedIncomeBalance findByLoanIdAndLoanTransactionIdAndDeletedFalseAndClosedFalse(Long loanId, Long loanTransactionId);
+```
+
+## Read DTOs
+
+Two complementary DTOs in `fineract-progressive-loan/.../data/`:
+
+```java
+// per balance row
+public class CapitalizedIncomeDetails {
+    private BigDecimal amount;
+    private BigDecimal amortizedAmount;
+    private BigDecimal unrecognizedAmount;
+    private BigDecimal amountAdjustment;
+    private BigDecimal chargedOffAmount;
+}
+
+// deprecated aggregate
+public class LoanCapitalizedIncomeData { ... }
+```
+
+`CapitalizedIncomeDetails` is the modern read shape; `LoanCapitalizedIncomeData` (returned by the deprecated `/deferredincome` endpoints) is kept for backward compatibility.
+
+## Write service — `CapitalizedIncomeWritePlatformServiceImpl`
+
+This is the most interesting differentiator versus buy-down fee: capitalized income **does** trigger a schedule recalculation.
+
+```java
+public class CapitalizedIncomeWritePlatformServiceImpl implements CapitalizedIncomePlatformService {
+
+    private final ProgressiveLoanTransactionValidator loanTransactionValidator;
+    private final LoanAssembler loanAssembler;
+    private final LoanTransactionRepository loanTransactionRepository;
+    private final PaymentDetailWritePlatformService paymentDetailWritePlatformService;
+    private final LoanJournalEntryPoster journalEntryPoster;
+    private final ExternalIdFactory externalIdFactory;
+    private final LoanCapitalizedIncomeBalanceRepository capitalizedIncomeBalanceRepository;
+    private final ReprocessLoanTransactionsService reprocessLoanTransactionsService;
+    private final LoanBalanceService loanBalanceService;
+    private final LoanLifecycleStateMachine loanLifecycleStateMachine;
+    private final BusinessEventNotifierService businessEventNotifierService;
+    private final CodeValueRepository codeValueRepository;
+    private final LoanScheduleService loanScheduleService;
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult addCapitalizedIncome(final Long loanId, final JsonCommand command) {
+        loanTransactionValidator.validateCapitalizedIncome(command, loanId);
+        final Loan loan = loanAssembler.assembleFrom(loanId);
+        final Map<String, Object> changes = new LinkedHashMap<>();
+        final PaymentDetail paymentDetail = this.paymentDetailWritePlatformService
+                .createAndPersistPaymentDetail(command, changes);
+        final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+        final BigDecimal transactionAmount = command.bigDecimalValueOfParameterNamed("transactionAmount");
+        final ExternalId txnExternalId = externalIdFactory.createFromCommand(command, "externalId");
+
+        // 1. Resolve the amount via the calculation type (FLAT today)
+        final Money capitalizedIncomeAmount = calculateCapitalizedIncomeAmount(loan, transactionAmount);
+        final LoanTransaction capitalizedIncomeTransaction = LoanTransaction.capitalizedIncome(loan,
+                capitalizedIncomeAmount, paymentDetail, transactionDate, txnExternalId);
+
+        // 2. Classification (optional code-value tagging)
+        addClassificationCodeToTransaction(command,
+                LoanTransactionApiConstants.CAPITALIZED_INCOME_CLASSIFICATION_CODE,
+                capitalizedIncomeTransaction);
+
+        // 3. KEY DIFFERENCE: recalculate the schedule. The capitalized amount becomes new principal.
+        recalculateLoanTransactions(loan, capitalizedIncomeTransaction);
+
+        // 4. Persist the transaction
+        loan.addLoanTransaction(capitalizedIncomeTransaction);
+        loanTransactionRepository.saveAndFlush(capitalizedIncomeTransaction);
+
+        // 5. Create the m_loan_capitalized_income_balance row
+        createCapitalizedIncomeBalance(capitalizedIncomeTransaction);
+
+        // 6. Refresh derived loan fields and summary
+        loan.updateLoanScheduleDependentDerivedFields();
+        loanBalanceService.updateLoanSummaryDerivedFields(loan);
+
+        // 7. Optional note
+        final String noteText = command.stringValueOfParameterNamed("note");
+        if (noteText != null && !noteText.isEmpty()) {
+            eventPublisher.publishEvent(NoteCreateRequest.builder()
+                    .type(NoteType.LOAN_TRANSACTION)
+                    .resourceId(capitalizedIncomeTransaction.getId()).note(noteText).build());
+        }
+
+        // 8. Post journal entries: cash -> deferred income + amortizing-principal entries
+        journalEntryPoster.postJournalEntriesForLoanTransaction(capitalizedIncomeTransaction, false, false);
+
+        // 9. Lifecycle transition if this completes/over-pays the loan
+        loanLifecycleStateMachine.determineAndTransition(loan, transactionDate);
+
+        // 10. External business events
+        businessEventNotifierService.notifyPostBusinessEvent(
+                new LoanCapitalizedIncomeTransactionCreatedBusinessEvent(capitalizedIncomeTransaction));
+        businessEventNotifierService.notifyPostBusinessEvent(new LoanBalanceChangedBusinessEvent(loan));
+
+        return new CommandProcessingResultBuilder()
+                .withEntityId(capitalizedIncomeTransaction.getId())
+                .withEntityExternalId(capitalizedIncomeTransaction.getExternalId())
+                .withOfficeId(loan.getOfficeId())
+                .withClientId(loan.getClientId())
+                .withLoanId(loan.getId())
+                .build();
+    }
+    // ...
+}
+```
+
+### `recalculateLoanTransactions(...)`
+
+```java
+private void recalculateLoanTransactions(Loan loan, LoanTransaction transaction) {
+    if (loan.isInterestRecalculationEnabled() || DateUtils.isBeforeBusinessDate(transaction.getTransactionDate())) {
+        loanScheduleService.regenerateRepaymentSchedule(loan);
+        reprocessLoanTransactionsService.reprocessTransactions(loan, List.of(transaction));
+    } else {
+        reprocessLoanTransactionsService.processLatestTransaction(transaction, loan);
+    }
+}
+```
+
+Two paths:
+
+* **Full regeneration** — when interest recalculation is enabled OR the capitalized income is back-dated. The schedule is rebuilt from scratch, then every transaction (including the new one) is reprocessed.
+* **Append-only** — when interest recalculation is off and the transaction is on the business date. Only the new transaction is replayed against the existing schedule.
+
+Inside `reprocessLoanTransactionsService` / `AdvancedPaymentScheduleTransactionProcessor.handleCapitalizedIncome(...)`:
+
+```java
+private void handleCapitalizedIncomeWithEMICalculator(LoanTransaction capitalizedIncomeTransaction,
+                                                       TransactionCtx transactionCtx) {
+    ProgressiveLoanInterestScheduleModel model = ((ProgressiveTransactionCtx) transactionCtx).getModel();
+    // ...
+    Money amortizableAmount = capitalizedIncomeTransaction.getAmount(currency);
+    emiCalculator.addCapitalizedIncome(model, transactionDate, amortizableAmount);
+
+    recalculateRepaymentPeriodsWithEMICalculation(amortizableAmount, model, installments,
+            capitalizedIncomeTransaction, currency,
+            ((ProgressiveTransactionCtx) transactionCtx).getProcessedLoanCharges());
+    allocateOverpayment(capitalizedIncomeTransaction, transactionCtx);
+}
+```
+
+`emiCalculator.addCapitalizedIncome(...)` differs from `addDisbursement(...)` because it adds the amount to `InterestPeriod.capitalizedIncomePrincipal` rather than `disbursementAmount`. The accounting processors and reports use this distinction to tell capitalized principal apart from cash-disbursed principal.
+
+## Adjustment flow
+
+```java
+@Override
+public CommandProcessingResult capitalizedIncomeAdjustment(final Long loanId,
+        final Long capitalizedIncomeTransactionId, final JsonCommand command) {
+    loanTransactionValidator.validateCapitalizedIncomeAdjustment(command, loanId, capitalizedIncomeTransactionId);
+    final Loan loan = loanAssembler.assembleFrom(loanId);
+    final Map<String, Object> changes = new LinkedHashMap<>();
+    final PaymentDetail paymentDetail = this.paymentDetailWritePlatformService.createAndPersistPaymentDetail(command, changes);
+    final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+    final BigDecimal transactionAmount = command.bigDecimalValueOfParameterNamed("transactionAmount");
+    final ExternalId txnExternalId = externalIdFactory.createFromCommand(command, "externalId");
+
+    Optional<LoanTransaction> capitalizedIncome = loanTransactionRepository.findById(capitalizedIncomeTransactionId);
+    LoanTransaction capitalizedIncomeAdjustment = LoanTransaction.capitalizedIncomeAdjustment(loan,
+            Money.of(loan.getCurrency(), transactionAmount), paymentDetail, transactionDate, txnExternalId);
+    capitalizedIncomeAdjustment.getLoanTransactionRelations().add(
+            LoanTransactionRelation.linkToTransaction(capitalizedIncomeAdjustment,
+                    capitalizedIncome.get(), LoanTransactionRelationTypeEnum.ADJUSTMENT));
+    capitalizedIncomeAdjustment.setClassification(capitalizedIncome.get().getClassification());
+
+    recalculateLoanTransactions(loan, capitalizedIncomeAdjustment);
+    loan.addLoanTransaction(capitalizedIncomeAdjustment);
+    LoanTransaction savedCapitalizedIncomeAdjustment = loanTransactionRepository.saveAndFlush(capitalizedIncomeAdjustment);
+
+    loanBalanceService.updateLoanOutstandingBalances(loan);
+    // ... note creation ...
+    journalEntryPoster.postJournalEntriesForLoanTransaction(savedCapitalizedIncomeAdjustment, false, false);
+
+    LoanCapitalizedIncomeBalance capitalizedIncomeBalance = capitalizedIncomeBalanceRepository
+            .findByLoanIdAndLoanTransactionIdAndDeletedFalseAndClosedFalse(loanId, capitalizedIncomeTransactionId);
+    capitalizedIncomeBalance.setAmountAdjustment(
+            MathUtil.nullToZero(capitalizedIncomeBalance.getAmountAdjustment()).add(transactionAmount));
+    capitalizedIncomeBalance.setUnrecognizedAmount(
+            MathUtil.negativeToZero(capitalizedIncomeBalance.getUnrecognizedAmount().subtract(transactionAmount)));
+    capitalizedIncomeBalanceRepository.saveAndFlush(capitalizedIncomeBalance);
+
+    loanLifecycleStateMachine.determineAndTransition(loan, transactionDate);
+    businessEventNotifierService.notifyPostBusinessEvent(
+            new LoanCapitalizedIncomeAdjustmentTransactionCreatedBusinessEvent(savedCapitalizedIncomeAdjustment));
+    businessEventNotifierService.notifyPostBusinessEvent(new LoanBalanceChangedBusinessEvent(loan));
+    // ...
+}
+```
+
+Notice the linked-transaction pattern: a `LoanTransactionRelation` with type `ADJUSTMENT` ties the adjustment to its origin transaction, so reads can return "this capitalized income (#42) has been adjusted by these other transactions". The transaction type is `CAPITALIZED_INCOME_ADJUSTMENT`, which is also one of the transaction types routed through `handleRepayment(...)` in `AdvancedPaymentScheduleTransactionProcessor` — see [Progressive transaction processors](/progressive-loan/progressive-transaction-processors).
+
+## Command handlers
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "CAPITALIZEDINCOME")
+public class AddCapitalizedIncomeCommandHandler implements NewCommandSourceHandler {
+
+    private final CapitalizedIncomePlatformService capitalizedIncomePlatformService;
+    private final DataIntegrityErrorHandler dataIntegrityErrorHandler;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        try {
+            return this.capitalizedIncomePlatformService.addCapitalizedIncome(command.getLoanId(), command);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve,
+                    "loan.capitalized.income", "Capitalized Income");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "CAPITALIZEDINCOMEADJUSTMENT")
+public class CapitalizedIncomeAdjustmentCommandHandler implements NewCommandSourceHandler { ... }
+```
+
+## COB amortization step — `CapitalizedIncomeAmortizationBusinessStep`
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class CapitalizedIncomeAmortizationBusinessStep implements LoanCOBBusinessStep {
+
+    private final LoanCapitalizedIncomeAmortizationProcessingService loanCapitalizedIncomeAmortizationProcessingService;
+
+    @Transactional
+    @Override
+    public Loan execute(Loan loan) {
+        LocalDate businessDate = DateUtils.getBusinessLocalDate();
+
+        loanCapitalizedIncomeAmortizationProcessingService
+                .processCapitalizedIncomeAmortizationTillDate(loan, businessDate, true);
+
+        return loan;
+    }
+
+    @Override
+    public String getEnumStyledName()    { return "CAPITALIZED_INCOME_AMORTIZATION"; }
+
+    @Override
+    public String getHumanReadableName() { return "Capitalized income amortization"; }
+}
+```
+
+Lives at `fineract-provider/src/main/java/org/apache/fineract/cob/loan/CapitalizedIncomeAmortizationBusinessStep.java`. Unlike the buy-down step it does **not** short-circuit on a product flag check — the processing service makes the no-op decision internally because the loan may have legacy capitalized-income balances even after the product flag is disabled.
+
+## Processing service contract
+
+```java
+public interface LoanCapitalizedIncomeAmortizationProcessingService {
+
+    void processCapitalizedIncomeAmortizationOnLoanClosure(@NonNull Loan loan, boolean addJournal);
+
+    void processCapitalizedIncomeAmortizationOnLoanChargeOff(@NonNull Loan loan,
+            @NonNull LoanTransaction chargeOffTransaction);
+
+    void processCapitalizedIncomeAmortizationOnLoanUndoChargeOff(@NonNull LoanTransaction loanTransaction);
+
+    void processCapitalizedIncomeAmortizationTillDate(@NonNull Loan loan, @NonNull LocalDate tillDate, boolean addJournal);
+}
+```
+
+Each method has a clear trigger point:
+
+| Method | Triggered by |
+| --- | --- |
+| `processCapitalizedIncomeAmortizationTillDate` | Daily COB step + ad-hoc catch-up |
+| `processCapitalizedIncomeAmortizationOnLoanClosure` | `LoanLifecycleStateMachine` when loan transitions to `CLOSED_OBLIGATIONS_MET` |
+| `processCapitalizedIncomeAmortizationOnLoanChargeOff` | When `handleChargeOff` runs in the progressive transaction processor |
+| `processCapitalizedIncomeAmortizationOnLoanUndoChargeOff` | When a charge-off is reversed |
+
+`processCapitalizedIncomeAmortizationOnLoanClosure(loan, true)` flushes the entire `unrecognizedAmount` to fee or interest income in one final transaction so the deferred-income liability never lingers past loan closure.
+
+## Transaction types
+
+| Enum | Purpose | Created by |
+| --- | --- | --- |
+| `CAPITALIZED_INCOME` | Initial inflow (increases principal) | `addCapitalizedIncome(...)` |
+| `CAPITALIZED_INCOME_ADJUSTMENT` | Adjust the unrecognised portion | `capitalizedIncomeAdjustment(...)` |
+| `CAPITALIZED_INCOME_AMORTIZATION` | Daily income recognition | `CapitalizedIncomeAmortizationBusinessStep` via processing service |
+| `CAPITALIZED_INCOME_AMORTIZATION_ADJUSTMENT` | Reverse over-recognised amortization on undo charge-off | Processing service |
+
+Each fires its own business event (in `fineract-loan/.../infrastructure/event/business/domain/loan/transaction/`):
+
+* `LoanCapitalizedIncomeTransactionCreatedBusinessEvent`
+* `LoanCapitalizedIncomeAdjustmentTransactionCreatedBusinessEvent`
+* `LoanCapitalizedIncomeAmortizationTransactionCreatedBusinessEvent`
+* `LoanCapitalizedIncomeAmortizationAdjustmentTransactionCreatedBusinessEvent`
+
+## Effect on the schedule
+
+Because `recalculateLoanTransactions(...)` runs on every capitalized-income write, the borrower-facing schedule **changes**:
+
+1. The `addCapitalizedIncome(...)` amount is added to `InterestPeriod.capitalizedIncomePrincipal` on the interest period containing the transaction date.
+2. `ProgressiveEMICalculator.calculateEMIValueAndRateFactors(...)` re-solves EMI across the remaining repayment periods so the new principal is amortized within the original term.
+3. The recalculated `RepaymentPeriod.duePrincipal` / `dueInterest` flows back onto `LoanRepaymentScheduleInstallment` rows via `recalculateRepaymentPeriodsWithEMICalculation(...)`.
+
+Borrowers therefore see **higher EMI** (for the same term) the day capitalized income is booked.
+
+## Effect on the persistent model
+
+The `m_loan_progressive_model.model_data` JSON column is rewritten by `InterestScheduleModelRepositoryWrapper.writeInterestScheduleModel(loan, model)` after `recalculateLoanTransactions(...)`. The new model carries the additional `capitalizedIncomePrincipal` amount on the relevant `InterestPeriod`, so subsequent prepayment quotes and interest-till-date queries reflect the increased principal automatically.
+
+## Accounting impact
+
+Capitalized income is split between balance-sheet (principal-increase) and P&L (deferred income recognition) entries.
+
+### At booking (CAPITALIZED_INCOME transaction)
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Loan portfolio principal | capitalized amount |
+| CR | Deferred capitalized-income liability | capitalized amount |
+
+This is what makes the borrower's outstanding principal go up.
+
+### At each daily amortization (CAPITALIZED_INCOME_AMORTIZATION)
+
+When `incomeType == FEE`:
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Deferred capitalized-income liability | recognised portion |
+| CR | Fee income (`INCOME_FROM_FEES`) | recognised portion |
+
+When `incomeType == INTEREST`:
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Deferred capitalized-income liability | recognised portion |
+| CR | Interest income (`INTEREST_ON_LOAN`) | recognised portion |
+
+### At adjustment (CAPITALIZED_INCOME_ADJUSTMENT)
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Deferred capitalized-income liability | adjustment |
+| CR | Loan portfolio principal | adjustment |
+
+The adjustment effectively unwinds part of the original principal increase.
+
+### At charge-off (CHARGE_OFF)
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Charged-off capitalized-income expense | remaining unrecognised |
+| CR | Deferred capitalized-income liability | remaining unrecognised |
+
+`chargedOffAmount` on the balance row is set; the daily amortization step then skips the balance because the remainder is now classified as charged off.
+
+The exact GL accounts are resolved through `LoanProductGLAccountMapping` — see [Accounting processors](/accounting/accounting-processors) for the wiring.
+
+## REST surface
+
+`LoanCapitalizedIncomeApiResource` at `@Path("/v1/loans")`:
+
+### Aggregate / per-balance reads
+
+| Method | Path | Returns | Notes |
+| --- | --- | --- | --- |
+| GET | `/v1/loans/{loanId}/deferredincome` | `LoanCapitalizedIncomeData` | deprecated |
+| GET | `/v1/loans/external-id/{loanExternalId}/deferredincome` | `LoanCapitalizedIncomeData` | deprecated |
+| GET | `/v1/loans/{loanId}/capitalized-incomes` | `List<CapitalizedIncomeDetails>` | one entry per balance row |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes` | `List<CapitalizedIncomeDetails>` | |
+
+```java
+@Path("/{loanId}/capitalized-incomes")
+@GET
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Fetch the Capitalized Income related informations")
+public List<CapitalizedIncomeDetails> fetchCapitalizedIncomeDetails(
+        @PathParam("loanId") @Parameter(description = "loanId") final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return capitalizedIncomeBalanceReadService.fetchLoanCapitalizedIncomeDetails(loanId);
+}
+```
+
+### Per-transaction allocation reads
+
+For drilling into the per-day amortization history of one CAPITALIZED_INCOME transaction:
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/capitalized-incomes/{loanTransactionId}` | `LoanAmortizationAllocationData` JSON |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/{loanTransactionId}` | same |
+| GET | `/v1/loans/{loanId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | same |
+| GET | `/v1/loans/external-id/{loanExternalId}/capitalized-incomes/external-id/{loanTransactionExternalId}` | same |
+
+All four flow through one private helper that resolves loan and transaction by either int or external id and then delegates to `LoanAmortizationAllocationService`.
+
+### Write
+
+| Method | Path | Command |
+| --- | --- | --- |
+| POST | `/v1/loans/{loanId}/transactions?command=capitalizedIncome` | `LOAN/CAPITALIZEDINCOME` |
+| POST | `/v1/loans/{loanId}/transactions/{txnId}?command=capitalizedIncomeAdjustment` | `LOAN/CAPITALIZEDINCOMEADJUSTMENT` |
+
+Body shape:
+
+```json
+{
+  "transactionDate": "10 November 2025",
+  "transactionAmount": 5000.00,
+  "externalId": "ci-2025-11-10-001",
+  "paymentTypeId": 1,
+  "note": "Yield spread premium",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+## End-to-end lifecycle
+
+```mermaid
+flowchart TD
+    Client[Third-party / merchant subsidy received]
+    POST[POST /v1/loans/{id}/transactions?command=capitalizedIncome]
+    Handler[AddCapitalizedIncomeCommandHandler]
+    Svc[CapitalizedIncomeWritePlatformServiceImpl.addCapitalizedIncome]
+
+    CalcAmt[calculateCapitalizedIncomeAmount FLAT]
+    Txn[Create LoanTransaction CAPITALIZED_INCOME]
+    Recalc[recalculateLoanTransactions]
+    SchedRebuild[loanScheduleService.regenerateRepaymentSchedule]
+    Reprocess[reprocessLoanTransactionsService.reprocessTransactions\n-> AdvancedPaymentScheduleTransactionProcessor.handleCapitalizedIncome]
+    EmiCalc[emiCalculator.addCapitalizedIncome]
+    NewEMI[New EMI written to LoanRepaymentScheduleInstallment]
+    Bal[Create LoanCapitalizedIncomeBalance row]
+    JE1[Journal: principal DR / deferred income CR]
+    EVT[LoanCapitalizedIncomeTransactionCreatedBusinessEvent\nLoanBalanceChangedBusinessEvent]
+
+    COB[Daily CAPITALIZED_INCOME_AMORTIZATION COB step]
+    ProcSvc[LoanCapitalizedIncomeAmortizationProcessingService\nprocessCapitalizedIncomeAmortizationTillDate]
+    AmortTxn[Create CAPITALIZED_INCOME_AMORTIZATION LoanTransaction]
+    DecBal[Decrement unrecognized_amount]
+    JE2[Journal: deferred income DR / fee or interest income CR]
+
+    Adj[Capitalized income adjustment]
+    AdjSvc[capitalizedIncomeAdjustment]
+    AdjTxn[CAPITALIZED_INCOME_ADJUSTMENT LoanTransaction]
+    AdjBal[Update amountAdjustment & unrecognized_amount]
+    JE3[Journal: deferred income DR / principal CR]
+
+    ChargeOff[CHARGE_OFF processed]
+    OnCO[processCapitalizedIncomeAmortizationOnLoanChargeOff]
+    JE4[Journal: charged-off cap-income expense DR / deferred income CR]
+
+    Close[Final repayment processed]
+    OnCl[processCapitalizedIncomeAmortizationOnLoanClosure]
+    JE5[Journal: flush remaining unrecognised as income]
+
+    Client --> POST --> Handler --> Svc --> CalcAmt --> Txn --> Recalc
+    Recalc --> SchedRebuild --> Reprocess --> EmiCalc --> NewEMI
+    Recalc --> Bal --> JE1 --> EVT
+
+    Bal -. polled daily .-> COB
+    COB --> ProcSvc --> AmortTxn --> DecBal --> JE2
+
+    Adj --> AdjSvc --> AdjTxn --> Recalc
+    AdjSvc --> AdjBal --> JE3
+
+    Bal -. on charge-off .-> OnCO --> JE4
+    Bal -. on closure .-> OnCl --> JE5
+```
+
+## Validation
+
+`ProgressiveLoanTransactionValidatorImpl.validateCapitalizedIncome(...)` checks:
+
+* The loan is **progressive** (`loan.isProgressiveSchedule()`).
+* The loan product has `enableIncomeCapitalization = true`.
+* `transactionDate` is not before disbursement nor after business date.
+* `transactionAmount > 0`.
+* The loan is in a status that accepts capitalized income (`ACTIVE`, `OVERPAID` typically).
+
+`validateCapitalizedIncomeAdjustment(...)` additionally verifies that the referenced `CAPITALIZED_INCOME` transaction exists, isn't reversed, and that the adjustment amount does not exceed the still-unrecognised portion plus already-existing adjustments.
+
+## Comparison with buy-down fee
+
+| Concern | Buy-down fee | Capitalized income |
+| --- | --- | --- |
+| Increases borrower principal | ❌ | ✅ |
+| Triggers schedule recalc on booking | ❌ | ✅ |
+| Daily COB step | `BUY_DOWN_FEE_AMORTIZATION` | `CAPITALIZED_INCOME_AMORTIZATION` |
+| Adjustment flow | yes | yes |
+| Business event family | `LoanBuyDownFee*BusinessEvent` | `LoanCapitalizedIncome*BusinessEvent` |
+| Income type options | `FEE` / `INTEREST` | `FEE` / `INTEREST` |
+| Recognition strategy | `EQUAL_AMORTIZATION` | `EQUAL_AMORTIZATION` |
+
+## Cross references
+
+* The companion deferred-revenue feature — [Buy-down fee](/progressive-loan/buy-down-fee).
+* How `CAPITALIZED_INCOME` is processed inside the transaction processor — [Progressive transaction processors](/progressive-loan/progressive-transaction-processors).
+* Where the `capitalizedIncomePrincipal` field lives in the interest model — [Model and recalculation](/progressive-loan/model-and-recalculation).
+* The daily step that drives amortization — [Loan COB business steps](/cob/loan-cob-business-steps).
+* Journal-entry generation — [Accounting processors](/accounting/accounting-processors).
+* The HTTP surface index — [Progressive Loan API](/progressive-loan/progressive-loan-api).

@@ -1,0 +1,329 @@
+---
+title: "Portfolio Search: Clients, Loans, Groups and Ad-Hoc Queries"
+sidebarTitle: "Search"
+description: "Reference for SearchApiResource, the clients/loans/groups/savings/shares scoped search, the advanced ad-hoc query endpoint and SearchConditions."
+---
+
+Apache Fineract provides a single cross-entity full-text search across clients, groups, loans, savings, shares and client identifiers, plus a separate "ad-hoc" advanced query that filters loans by status, product, office, date and outstanding amount. Both are exposed by `SearchApiResource` at `/v1/search` and backed by `SearchReadService`. The subsystem lives partly in `fineract-core` (the DTOs and conditions struct) and partly in `fineract-provider` (the JAX-RS resource and the JDBC-backed read service).
+
+This page documents the resource type filters, the `SearchConditions` value object, the response shape (`SearchData`), and the ad-hoc query path with its `AdHocQuerySearchRequest`.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `SearchApiResource` (`/v1/search`) | `fineract-provider` | `org.apache.fineract.portfolio.search.api` |
+| `SearchReadService` interface | `fineract-provider` | `org.apache.fineract.portfolio.search.service` |
+| `SearchReadServiceImpl` (JDBC) | `fineract-provider` | `org.apache.fineract.portfolio.search.service` |
+| `SearchConditions` (scope value object) | `fineract-core` | `org.apache.fineract.portfolio.search.data` |
+| `SearchData` (response DTO) | `fineract-core` | `org.apache.fineract.portfolio.search.data` |
+| `AdHocQuerySearchRequest`, `AdHocSearchQueryData` | `fineract-provider` | `org.apache.fineract.portfolio.search.data` |
+| `SearchConstants` (enums for resources, parameters, loan-date options) | `fineract-core` | `org.apache.fineract.portfolio.search` |
+| `SearchConfiguration` (Spring) | `fineract-provider` | `org.apache.fineract.portfolio.search.starter` |
+
+There is no entity here — the search is purely a denormalised JDBC query over the existing tables.
+
+## REST surface — `SearchApiResource`
+
+```java
+// fineract-provider/.../portfolio/search/api/SearchApiResource.java
+@Path("/v1/search")
+@Component
+@Tag(name = "Search API",
+     description = "Search API allows to search scoped resources clients, loans and groups on specified fields.")
+@RequiredArgsConstructor
+@Consumes(MediaType.APPLICATION_JSON)
+@Produces(MediaType.APPLICATION_JSON)
+public class SearchApiResource {
+
+    private final SearchReadService searchReadService;
+```
+
+### `GET /v1/search/template`
+
+```java
+@GET
+@Path("/template")
+@Operation(summary = "Retrive Adhoc Search query template",
+           description = "Mandatory Fields\n\nsearch?query=000000001\n")
+public AdHocSearchQueryData retrieveAdHocSearchQueryTemplate() {
+    return searchReadService.retrieveAdHocQueryTemplate();
+}
+```
+
+Returns the option lists used to render the advanced-search UI:
+
+- loan statuses (`SearchLoanStatus`),
+- loan products,
+- offices (scoped by current user's hierarchy),
+- loan-date options (`approvalDate`, `createdDate`, `disbursalDate`),
+- amount/outstanding-amount comparison operators (`between`, `≤`, `≥`, etc.).
+
+### `GET /v1/search` — scoped full-text search
+
+```java
+@GET
+@Operation(summary = "Search Resources",
+           description = "Example Requests:\n\nsearch?query=000000001\n\nsearch?query=Petra&resource=clients,groups\n\nsearch?query=Petra&resource=clients,groups&exactMatch=true")
+public List<SearchData> searchData(@QueryParam("query") final String query,
+                                   @QueryParam("resource") final String resource,
+                                   @DefaultValue("false") @QueryParam("exactMatch") Boolean exactMatch) {
+
+    final AppUser currentUser = (AppUser) SecurityContextHolder.getContext().getAuthentication().getPrincipal();
+    final String hierarchy = currentUser.getOffice().getHierarchy();
+    final SearchConditions searchConditions = new SearchConditions(query, resource, exactMatch, hierarchy);
+
+    return searchReadService.retriveMatchingData(searchConditions);
+}
+```
+
+Three query parameters:
+
+- **`query`** — the string to look for. Matched against account numbers, external ids, names, mobile numbers, depending on the resource.
+- **`resource`** — comma-separated list of resource types to search. When omitted, every supported type is searched.
+- **`exactMatch`** — when `true`, the implementation uses `=` instead of `LIKE`.
+
+The user's office hierarchy is implicit — `currentUser.getOffice().getHierarchy()` is added to every sub-query so results are constrained by what the user is allowed to see.
+
+### `POST /v1/search/advance` — ad-hoc advanced search
+
+```java
+@POST
+@Path("/advance")
+@Operation(summary = "Adhoc query search",
+           description = "AdHocQuery search has more search options, it is a POST request, "
+                       + "it uses request body to send search parameters\n\n"
+                       + "Mandatory fields: entities\n\n"
+                       + "Optional fields: loanStatus, loanProducts, offices, loanDateOption, ...")
+public List<AdHocSearchQueryData> advancedSearch(final AdHocQuerySearchRequest request) {
+    return searchReadService.retrieveAdHocQueryMatchingData(request);
+}
+```
+
+The body is `AdHocQuerySearchRequest`. It filters loan portfolios by status, product, office, date range and outstanding-amount conditions (absolute or percentage), then aggregates the result into `AdHocSearchQueryData` rows.
+
+## Supported resource types
+
+```java
+// fineract-core/.../portfolio/search/SearchConstants.java
+public enum SearchSupportedResources {
+    CLIENTS("clients"),
+    GROUPS("groups"),
+    LOANS("loans"),
+    SAVINGS("savings"),
+    SHARES("shares"),
+    CLIENTIDENTIFIERS("clientIdentifiers");
+}
+```
+
+Pass these names (case-insensitive, comma-separated) in the `resource` query parameter:
+
+- `?resource=clients` — clients only.
+- `?resource=clients,groups` — clients and groups.
+- `?resource=loans,savings,shares` — all account types.
+- omitted — search every type.
+
+Two related enums govern advanced search:
+
+```java
+public enum SearchSupportedParameters {
+    QUERY("query"), RESOURCE("resource"), EXACTMATCH("exactMatch");
+}
+
+public enum SearchLoanDate {
+    APPROVAL_DATE("approvalDate"),
+    CREATED_DATE("createdDate"),
+    DISBURSAL_DATE("disbursalDate");
+}
+```
+
+## `SearchConditions`
+
+```java
+// fineract-core/.../portfolio/search/data/SearchConditions.java
+public class SearchConditions {
+    private final String searchQuery;
+    private final String searchResource;
+    private final Boolean clientSearch;
+    private final Boolean groupSearch;
+    private final Boolean loanSeach;       // note: misspelling preserved from source
+    private final Boolean savingSeach;
+    private final Boolean shareSeach;
+    private final Boolean clientIdentifierSearch;
+    private Boolean exactMatch;
+    private final String hierarchy;
+
+    public SearchConditions(final String searchQueryParam, final String searchResource,
+                            Boolean exactMatch, final String hierarchy) {
+        this.searchQuery = searchQueryParam;
+        this.searchResource = searchResource;
+        this.exactMatch = exactMatch;
+        this.hierarchy = hierarchy;
+        this.clientSearch = null == searchResource
+                || searchResource.toLowerCase().contains(SearchSupportedResources.CLIENTS.name().toLowerCase());
+        // ... same pattern for groupSearch, loanSeach, savingSeach, shareSeach, clientIdentifierSearch
+    }
+}
+```
+
+The resolution rule is: **omitted `resource` → all types searched**, otherwise only the substrings present in the parameter enable the corresponding sub-query.
+
+The two-arg constructor takes the user's hierarchy and turns the comma-separated resource string into per-resource booleans; a longer constructor lets callers (e.g. internal callers) wire each boolean directly without parsing.
+
+## `SearchData` — response shape
+
+```java
+// fineract-core/.../portfolio/search/data/SearchData.java
+@Getter
+public class SearchData {
+    private final Long entityId;
+    private final String entityAccountNo;
+    private final String entityExternalId;
+    private final String entityName;
+    private final String entityType;     // "CLIENT" | "GROUP" | "LOAN" | "SAVING" | "SHARE" | "CLIENTIDENTIFIER"
+    private final Long parentId;
+    private final String parentName;
+    private final String entityMobileNo;
+    private final EnumOptionData entityStatus;
+    private final String parentType;
+    private final String subEntityType;
+}
+```
+
+Per-type semantics:
+
+| `entityType` | `entityId` | `entityAccountNo` | `entityName` | `parentId` / `parentName` | `subEntityType` |
+| --- | --- | --- | --- | --- | --- |
+| `CLIENT` | client id | client account no | display name | office id / office name | `null` |
+| `GROUP` | group id | group account no | group name | parent center / office | `null` |
+| `LOAN` | loan id | loan account no | client/group display name | client/group id and name | loan product short name |
+| `SAVING` | savings id | savings account no | client/group display name | client/group id and name | savings product short name |
+| `SHARE` | share account id | share account no | client display name | client id / name | share product short name |
+| `CLIENTIDENTIFIER` | identifier id | identifier key | client display name | client id / name | document type label |
+
+A flat list is returned so the UI can render heterogeneous results in one autocomplete dropdown.
+
+## `SearchReadServiceImpl` mechanics
+
+The impl issues one SQL query per active resource type, all parameterised by `query`/`exactMatch`/`hierarchy`. Examples:
+
+- **CLIENTS** — `WHERE (display_name LIKE ? OR account_no LIKE ? OR external_id LIKE ? OR mobile_no LIKE ?) AND office_hierarchy LIKE ?`
+- **GROUPS** — same shape against `m_group`.
+- **LOANS** — joins `m_loan` to client/group and office; filters by `account_no`/`external_id`.
+- **SAVINGS** — joins `m_savings_account` similarly.
+- **SHARES** — joins `m_share_account`.
+- **CLIENTIDENTIFIERS** — joins `m_client_identifier` to `m_client` and `m_code_value`.
+
+The `LIKE` patterns are `%query%` by default and `query` when `exactMatch=true`.
+
+The results are concatenated; ordering is by relevance (per-source SQL ordering) — no global re-rank.
+
+## Advanced search — `AdHocQuerySearchRequest`
+
+```java
+// fineract-provider/.../portfolio/search/data/AdHocQuerySearchRequest.java
+@Data @Builder @NoArgsConstructor @AllArgsConstructor
+public class AdHocQuerySearchRequest implements Serializable {
+
+    private String locale;
+    private String dateFormat;
+    private List<String> entities;                       // mandatory; "LOAN", "SAVING", ...
+    private List<String> loanStatus;
+    private List<Long> loanProducts;
+    private List<Long> offices;
+    private String loanDateOption;                       // SearchLoanDate value
+    private LocalDate loanFromDate;
+    private LocalDate loanToDate;
+    private Boolean includeOutStandingAmountPercentage;
+    private String outStandingAmountPercentageCondition; // e.g. "between"
+    private BigDecimal minOutStandingAmountPercentage;
+    private BigDecimal maxOutStandingAmountPercentage;
+    private BigDecimal outStandingAmountPercentage;
+    private Boolean includeOutstandingAmount;
+    private String outstandingAmountCondition;
+    private BigDecimal minOutstandingAmount;
+    private BigDecimal maxOutstandingAmount;
+    private BigDecimal outstandingAmount;
+}
+```
+
+The two outstanding-amount blocks are parallel: one filters by **percentage** (outstanding ÷ original-principal) and the other by **absolute**. Each can be turned on independently. Both use a `condition` string with values:
+
+- `between` — both `min*` and `max*` are required.
+- `≤` (`lessThanEqualTo`), `≥` (`greaterThanEqualTo`), `<`, `>`, `=` — the single `outstanding*` value is used.
+
+The handler converts the request to a SQL WHERE clause, dispatches per `entities` element, and rolls up the result into `AdHocSearchQueryData`. The rollup typically groups by office or by loan product and returns counts plus aggregate `outstanding` figures, which the UI renders as a portfolio breakdown.
+
+## Permissions
+
+- `READ_SEARCH` covers the basic search.
+- `READ_ADHOCSEARCHQUERY` covers the advanced search.
+
+Both require the standard `Authorization` header. Office-hierarchy scoping is enforced inside the read service, not at the security filter — the filter only authenticates the user.
+
+## Failure modes
+
+- **HTTP 400** — empty `query` parameter; the resource accepts it but the SQL returns an empty result set, so callers should validate before calling.
+- **HTTP 400** — unknown `entities` value in the advanced search request.
+- **HTTP 500** — uncommon; typically SQL/identifier issues in custom builds.
+
+## Performance considerations
+
+- Each search call runs as many SQL queries as the resource scope allows. With `?resource=clients`, only one query runs; with all six types, six run.
+- The `LIKE %query%` form does **not** use an index — for installations with millions of rows, this becomes the slowest endpoint. Mitigations:
+  - Use `exactMatch=true` whenever the UI permits.
+  - Restrict the resource scope.
+  - Consider adding full-text indexes at the DB layer.
+- The advanced search is a single SQL with parameter binding, so it scales much better.
+
+## SQL injection defence
+
+The `SearchApiResource` does not pass `query`/`resource` directly to SQL — `SearchConditions` parses `resource` into typed booleans and the search SQL is built with bind parameters. The `?orderBy`/`?sortOrder` parameters (used by other resources but not here) are validated through `SqlValidator` to defeat injection.
+
+## Example responses
+
+```json
+GET /v1/search?query=00000010
+[
+  {
+    "entityId": 12,
+    "entityAccountNo": "000000010",
+    "entityExternalId": null,
+    "entityName": "Maria Lopez",
+    "entityType": "CLIENT",
+    "parentId": 1,
+    "parentName": "Head Office",
+    "entityMobileNo": "555-1234",
+    "entityStatus": { "id": 300, "code": "clientStatusType.active", "value": "Active" },
+    "parentType": "OFFICE",
+    "subEntityType": null
+  },
+  {
+    "entityId": 45,
+    "entityAccountNo": "000000010",
+    "entityExternalId": null,
+    "entityName": "Maria Lopez",
+    "entityType": "LOAN",
+    "parentId": 12,
+    "parentName": "Maria Lopez",
+    "entityMobileNo": null,
+    "entityStatus": { "id": 300, "code": "loanStatusType.active", "value": "Active" },
+    "parentType": "CLIENT",
+    "subEntityType": "Standard Loan"
+  }
+]
+```
+
+## Comparison to `Client Search v2`
+
+Fineract also ships a newer client-only typed search at `/v1/clients/search` (see [/portfolio/client-search-v2](/portfolio/client-search-v2)). That endpoint supports rich pagination, structured query parameters and complex filter trees — it is purpose-built for client-listing UIs, while `/v1/search` is the cross-entity autocomplete back-end.
+
+## Cross-references
+
+- [/portfolio/client-search-v2](/portfolio/client-search-v2) — newer typed client-search endpoint with pagination.
+- [/portfolio/clients](/portfolio/clients), [/portfolio/groups-and-centers](/portfolio/groups-and-centers) — the entities indexed.
+- [/loan/loan-read-service](/loan/loan-read-service), [/savings/savings-read-service](/savings/savings-read-service) — the per-entity read services for full detail.
+- [/portfolio/client-identifiers](/portfolio/client-identifiers) — the identifier index used by `CLIENTIDENTIFIER`.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/runtime/jersey-jaxrs](/runtime/jersey-jaxrs) — Jersey configuration that mounts the search resource.
+- [/security/data-scope](/security/data-scope) — office-hierarchy scoping that constrains results.

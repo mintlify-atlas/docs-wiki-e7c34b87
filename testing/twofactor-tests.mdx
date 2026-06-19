@@ -1,0 +1,242 @@
+---
+title: "Two-Factor Tests: OTP-by-Email Flow Coverage with GreenMail"
+sidebarTitle: "2FA Tests"
+description: "The twofactor-tests subproject activates the 2FA security profile in Cargo Tomcat 10x and uses GreenMail as an in-process SMTP server to intercept OTP delivery."
+---
+
+The `twofactor-tests/` Gradle subproject covers Fineract's two-factor authentication profile. It deploys the same `fineract-provider.war` as the other Cargo suites, but with `fineract.security.basicauth.enabled=true`, `fineract.security.oauth2.enabled=false`, and `fineract.security.2fa.enabled=true`. The single test class uses **GreenMail** as an in-process SMTP server to intercept the OTP email Fineract sends, parses the token out of the message body, and completes the second step of the login.
+
+## Module shape
+
+```text
+twofactor-tests/
+├── build.gradle
+├── dependencies.gradle
+└── src/test/java/org/apache/fineract/twofactortests/
+    └── TwoFactorAuthenticationTest.java
+```
+
+One test class; five test methods.
+
+## Cargo wiring and security flags
+
+The relevant JVM args block in `build.gradle`:
+
+```groovy
+def jvmArgs = '--add-exports=java.naming/com.sun.jndi.ldap=ALL-UNNAMED ' +
+              '--add-opens=java.base/java.lang=ALL-UNNAMED ' +
+              // …other --add-opens flags…
+              '-Dfineract.security.basicauth.enabled=true ' +
+              '-Dfineract.security.oauth2.enabled=false ' +
+              '-Dfineract.security.2fa.enabled=true '
+```
+
+The rest of the Cargo setup is the same as in [OAuth2 Tests](/testing/oauth2-tests) — Tomcat 10x on `https://localhost:8443`, deployable mounted at context `fineract-provider`, keystore `keystore.jks` / `openmf`, default MariaDB datasource with `-PdbType=postgresql|mysql` switches.
+
+Lifecycle binding:
+
+```groovy
+cargoRunLocal.dependsOn ':fineract-war:war'
+cargoStartLocal.dependsOn ':fineract-war:war'
+cargoStartLocal.mustRunAfter 'testClasses'
+
+test {
+    dependsOn(cargoStartLocal)
+    finalizedBy cargoStopLocal
+}
+```
+
+## GreenMail integration
+
+The test class registers GreenMail as a JUnit Jupiter extension. The `withPerMethodLifecycle(true)` flag ensures the inbox is reset between methods, so each test starts from `0` received messages:
+
+```java
+@RegisterExtension
+static GreenMailExtension greenMail = new GreenMailExtension(ServerSetupTest.SMTP)
+    .withConfiguration(GreenMailConfiguration.aConfig().withUser("support@cloudmicrofinance.com", "support81"))
+    .withPerMethodLifecycle(true);
+```
+
+`ServerSetupTest.SMTP` listens on `127.0.0.1:3025` (GreenMail's standard offset). The Fineract server, configured via its seed data to send mail through that host/port, will hand off OTP messages directly into the GreenMail in-memory inbox.
+
+## Setup
+
+```java
+@BeforeEach
+public void setup() throws InterruptedException {
+    initializeRestAssured();
+    this.requestSpec = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+
+    awaitSpringBootActuatorHealthyUp();
+    String json = RestAssured.given().contentType(ContentType.JSON)
+        .body("{\"username\":\"mifos\", \"password\":\"password\"}")
+        .expect().log().ifError().when().post(LOGIN_URL).asString();
+    assertFalse(StringUtils.isBlank(json));
+
+    this.basicAuthenticationKey = JsonPath.with(json).get("base64EncodedAuthenticationKey");
+    assertFalse(StringUtils.isBlank(this.basicAuthenticationKey));
+
+    this.requestSpec.header("Authorization", "Basic " + basicAuthenticationKey);
+
+    this.requestSpecWithoutBasic = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+    this.responseSpec    = new ResponseSpecBuilder().expectStatusCode(200).build();
+    this.responseSpec403 = new ResponseSpecBuilder().expectStatusCode(403).build();
+    this.responseSpec401 = new ResponseSpecBuilder().expectStatusCode(401).build();
+}
+```
+
+The setup performs the **basic-auth** login (basic auth remains enabled in this profile) and stashes the returned `base64EncodedAuthenticationKey`. The first-step `Authorization` header is then `Basic <key>`. Subsequent requests will need a **second** header — `Fineract-Platform-TFA-Token` — before they are accepted.
+
+## Smoke checks
+
+| Test | URL | Status | Notes |
+| --- | --- | --- | --- |
+| `testActuatorAccess` | `/actuator/info` | 200 | actuator stays public |
+| `testApiDocsAccess` | `/legacy-docs/apiLive.htm` | 200 | docs stay public |
+| `testAccessWithoutTwofactor` | `/api/v1/offices/1?tenantIdentifier=default` | 403 | basic auth alone is not enough |
+
+`testCheckTwofactorEnabled` then logs in directly through `/api/v1/authentication` and confirms the response advertises 2FA:
+
+```java
+@Test
+public void testCheckTwofactorEnabled() {
+    String json = RestAssured.given().contentType(ContentType.JSON)
+        .body("{\"username\":\"mifos\", \"password\":\"password\"}")
+        .expect().log().ifError().when()
+        .post("/fineract-provider/api/v1/authentication?" + TENANT_IDENTIFIER).asString();
+    Boolean key = JsonPath.with(json).get("isTwoFactorAuthenticationRequired");
+    assertEquals(true, key);
+}
+```
+
+## The `/twofactor` delivery-methods endpoint
+
+`testGetTwofactorMethods` asserts the email delivery target is populated from seed data:
+
+```java
+@Test
+public void testGetTwofactorMethods() {
+    String json = RestAssured.given().spec(requestSpec).expect().log().ifError().when()
+        .get("/fineract-provider/api/v1/twofactor?" + TENANT_IDENTIFIER).asString();
+    List<HashMap<String, Object>> twoFactorMethods = JsonPath.with(json).getList("$");
+    assertEquals("email", twoFactorMethods.get(0).get("name"));
+    assertEquals("demomfi@mifos.org", twoFactorMethods.get(0).get("target"));
+}
+```
+
+This is the canonical way to discover what delivery channels a user is configured for. Production responses also surface the masked `target` so clients can label the buttons.
+
+## The full OTP login
+
+`testTwofactorLogin` is the central scenario. It exercises the request → email → validate → use → invalidate cycle:
+
+```java
+@Test
+public void testTwofactorLogin() throws IOException, MessagingException {
+    assertEquals(0, greenMail.getReceivedMessages().length);
+
+    // 1. Ask the server to send an OTP via email
+    performServerPost(requestSpec, responseSpec,
+        "/fineract-provider/api/v1/twofactor?deliveryMethod=email&extendedToken=false&" + TENANT_IDENTIFIER,
+        "", "");
+    assertEquals(1, greenMail.getReceivedMessages().length);
+
+    // 2. Parse the OTP out of the email body
+    Pattern p = Pattern.compile("token is (.+).");
+    Matcher m = p.matcher((CharSequence) greenMail.getReceivedMessages()[0].getContent());
+    String token = null;
+    while (m.find()) { token = m.group(1); }
+    assertNotNull(token);
+
+    // 3. Exchange the OTP for a TFA token
+    String tfaToken = performServerPost(requestSpec, responseSpec,
+        "/fineract-provider/api/v1/twofactor/validate?token=" + token + "&" + TENANT_IDENTIFIER,
+        "", "token");
+    assertNotNull(tfaToken);
+
+    // 4. Use Basic + TFA together to call a protected endpoint
+    RequestSpecification requestSpecWithTFA = new RequestSpecBuilder()
+        .setContentType(ContentType.JSON)
+        .addHeader("Fineract-Platform-TFA-Token", tfaToken)
+        .addHeader("Authorization", "Basic " + basicAuthenticationKey)
+        .build();
+    performServerGet(requestSpecWithTFA, responseSpec,
+        "/fineract-provider/api/v1/offices/1?" + TENANT_IDENTIFIER, "");
+
+    // 5. Invalidate the token
+    performServerPost(requestSpecWithTFA, responseSpec,
+        "/fineract-provider/api/v1/twofactor/invalidate?" + TENANT_IDENTIFIER,
+        "{ \"token\": \"" + tfaToken + "\" }", "");
+
+    // 6. Calls with the invalidated token are now 401
+    performServerGet(requestSpecWithTFA, responseSpec401,
+        "/fineract-provider/api/v1/offices/1?" + TENANT_IDENTIFIER, "");
+}
+```
+
+Headers used in the protected request:
+
+| Header | Value |
+| --- | --- |
+| `Authorization` | `Basic <base64EncodedAuthenticationKey>` from the first-step login |
+| `Fineract-Platform-TFA-Token` | the token returned by `/twofactor/validate?token=<OTP>` |
+
+The OTP itself is parsed out of the email body with `Pattern.compile("token is (.+).")` — Fineract's default mail template uses the literal "your token is XXXXXX." phrasing.
+
+## The configuration round-trip
+
+`testTfaConfigSettings` validates that `/twofactor/configure` is reachable with a valid TFA token and that updates take effect on the next OTP delivery. The flow:
+
+1. Request and validate an OTP (as in `testTwofactorLogin`).
+2. `GET /twofactor/configure` — note `otp-token-length` is currently equal to the length of the OTP just received.
+3. `PUT /twofactor/configure` with `{"otp-token-length": 10}` to widen the token.
+4. Invalidate the current TFA token.
+5. Request a new OTP — assert the inbox now has **two** messages.
+6. Parse the new token; assert its length is `10`.
+7. Validate it, restore `otp-token-length` to the original value, invalidate the TFA token again.
+
+This is the closest thing the suite has to a "long" integration scenario; it proves that 2FA configuration round-trips work and that the server's OTP generator honours the configured length on the very next message.
+
+## Helpers in this class
+
+Like `oauth2-tests`, `twofactor-tests` does not depend on the `Utils` class. It ships its own minimal HTTP wrappers:
+
+| Method | Purpose |
+| --- | --- |
+| `initializeRestAssured()` | sets `RestAssured.baseURI`/`port`/`keyStore`/`useRelaxedHTTPSValidation()` |
+| `awaitSpringBootActuatorHealthyUp()` | 10-attempt poll of `/actuator/health` |
+| `performServerGet(req, resp, getURL, jsonAttribute)` | RestAssured GET with optional JsonPath extraction |
+| `performServerPost(req, resp, postURL, jsonBody, jsonAttribute)` | RestAssured POST |
+| `performServerPut(req, resp, putURL, jsonBody, jsonAttribute)` | RestAssured PUT |
+
+`baseURI` is hard-coded to `https://localhost`; `port` is `8443`; the keystore is the same `src/main/resources/keystore.jks` / `openmf` used everywhere else.
+
+## Running locally
+
+```bash
+# Build the WAR
+./gradlew :fineract-war:war
+
+# Run the full 2FA suite (Cargo + GreenMail)
+./gradlew :twofactor-tests:test
+
+# Same against PostgreSQL
+./gradlew :twofactor-tests:test -PdbType=postgresql
+```
+
+No external SMTP server is required — GreenMail listens in-process on `127.0.0.1:3025`. The Fineract deploy must be configured (via its standard external-services seed data) to point at that endpoint; the bundled seed data already does so.
+
+## Conventions and gotchas
+
+- **`@RegisterExtension` with per-method lifecycle.** Resets the inbox between methods. Without this, `assertEquals(0, greenMail.getReceivedMessages().length)` at the start of each method would fail after the first run.
+- **Two headers, not one.** Production callers must always send `Authorization: Basic …` *and* `Fineract-Platform-TFA-Token: …` together. Dropping the second yields 403.
+- **Token regex is template-coupled.** `Pattern.compile("token is (.+).")` will only match the default Fineract OTP email template. If you customise the template, update the test or the test will silently capture an empty group.
+- **Invalidation is mandatory.** The tests explicitly invalidate the TFA token at the end. In production, clients should call `/twofactor/invalidate` on logout to prevent token replay.
+- **Profile combinations.** This suite asserts the `basicauth=on` + `2fa=on` combo. There is no test class covering `2fa=on` + `basicauth=off`; the OAuth2 + 2FA combo is currently untested at this layer.
+
+## Related pages
+
+- [Testing Overview](/testing/overview)
+- [Integration Tests](/testing/integration-tests) — the basic-auth-only baseline.
+- [OAuth2 Tests](/testing/oauth2-tests) — the OAuth2-only variant.
+- [Gradle Multi-Module Build](/build/gradle-multi-module)

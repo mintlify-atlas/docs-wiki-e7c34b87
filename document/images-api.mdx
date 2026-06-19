@@ -1,0 +1,364 @@
+---
+title: "Images API for Avatar Uploads on Clients and Staff"
+sidebarTitle: "Images API"
+description: "Reference for Apache Fineract ImagesApiResource — avatar GET/POST/PUT/DELETE for clients and staff, with base64, data-URL, and resize support."
+---
+
+The Apache Fineract `ImagesApiResource` (`fineract-document/src/main/java/org/apache/fineract/infrastructure/documentmanagement/api/ImagesApiResource.java`) is the JAX-RS resource that handles the **single avatar image** attached to an entity such as a `Client` or a `Staff` member. Unlike the documents resource, which allows many files per entity and tracks rich metadata, the images resource manages at most one image per (entityType, entityId) pair and stores only the bytes' location — the foreign-key link back to `m_client.image_id` or `m_staff.image_id` is maintained by per-entity `EntityImageIdAdapter` implementations. This page documents every endpoint, the GET-side content-processor pipeline (resize, base64, data-URL), and the dual upload modes (multipart and raw data-URL body).
+
+<Info>
+`ImagesApiResource` is `@Deprecated` at the class level — the long-term plan is to fold images into `DocumentApiResource`. It is kept for backward compatibility with the community app and external integrations that POST avatars as data URLs. New code should prefer the documents API. The `@Path` is `/v1/{entityType}/{entityId}/images` (singular *image* in concept, plural *images* in URL for legacy reasons).
+</Info>
+
+## Class wiring
+
+```java
+@Deprecated
+@Slf4j
+@RequiredArgsConstructor
+@Component
+@Path("/v1/{entityType}/{entityId}/images")
+public class ImagesApiResource {
+
+    private final ImageReadPlatformService          imageReadPlatformService;
+    private final CommandPipeline                   commandPipeline;
+    private final ImageResizeContentProcessor       imageResizeContentProcessor;
+    private final Base64EncoderContentProcessor     base64EncoderContentProcessor;
+    private final DataUrlEncoderContentProcessor    dataUrlEncoderContentProcessor;
+    private final Base64DecoderContentProcessor     base64DecoderContentProcessor;
+    private final DataUrlDecoderContentProcessor    dataUrlDecoderContentProcessor;
+    private final FileUploadValidator               fileUploadValidator;
+}
+```
+
+The constructor pulls in five `ContentProcessor` beans. Each is a stateless byte transform with a `.then(other)` combinator so the resource can build short pipelines on the fly without writing imperative I/O.
+
+## Endpoint summary
+
+| Method | Sub-path | Purpose | Consumes | Produces |
+| --- | --- | --- | --- | --- |
+| `GET` | `/` | Retrieve the avatar | `application/json` | varies (`text/plain` for data-URL, `application/octet-stream` for raw) |
+| `POST` | `/` | Upload via multipart | `multipart/form-data` | `application/json` |
+| `POST` | `/` | Upload via data-URL body | `text/plain` / `text/html` / `application/json` | `application/json` |
+| `PUT` | `/` | Same as POST (multipart) | `multipart/form-data` | `application/json` |
+| `PUT` | `/` | Same as POST (data-URL) | `text/plain` / `text/html` / `application/json` | `application/json` |
+| `DELETE` | `/` | Delete the avatar | — | `application/json` |
+
+The PUT variants simply call the corresponding POST handler — there is no "patch" semantic; an upload replaces the previous avatar wholesale.
+
+## GET / — retrieve
+
+```java
+@GET
+@Consumes(MediaType.APPLICATION_JSON)
+// FINERACT-1265: Do NOT specify @Produces(TEXT_PLAIN) here -
+// it may actually not (if it calls the next methods it's octet-stream)
+public Response retrieveImage(
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_TYPE) final String entityName,
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_ID)   final Long   entityId,
+        @QueryParam(IMAGE_API_PARAM_MAX_WIDTH)     final Integer maxWidth,
+        @QueryParam(IMAGE_API_PARAM_MAX_HEIGHT)    final Integer maxHeight,
+        @QueryParam(IMAGE_API_PARAM_OUTPUT)        String        output,
+        @HeaderParam(ACCEPT)                       String        acceptHeader) { ... }
+```
+
+### Query parameters
+
+| Param | Constant | Type | Notes |
+| --- | --- | --- | --- |
+| `maxWidth` | `IMAGE_API_PARAM_MAX_WIDTH` | Integer | When set with `maxHeight`, triggers `ImageResizeContentProcessor`. |
+| `maxHeight` | `IMAGE_API_PARAM_MAX_HEIGHT` | Integer | Companion to `maxWidth`. Both must be supplied for resize. |
+| `output` | `IMAGE_API_PARAM_OUTPUT` | String | One of `octet`, `inline_octet`, or unset. Other values are ignored. |
+| `Accept` header | — | String | `application/octet-stream` flips to raw bytes; anything else uses the base64 / data-URL path. |
+
+```java
+// prevent clients sending non-sense
+if (!"octet".equalsIgnoreCase(output) && !"inline_octet".equalsIgnoreCase(output)) {
+    output = null;
+}
+```
+
+### Decision matrix
+
+```mermaid
+flowchart TD
+    Q{output=octet/inline_octet OR\nAccept=application/octet-stream?}
+    Q -->|yes| OCT{maxWidth+maxHeight?}
+    OCT -->|yes| RZ[Resize via ImageResizeContentProcessor] --> STREAM[Stream as octet-stream\nContent-Disposition: attachment|inline]
+    OCT -->|no| STREAM
+    Q -->|no| B{maxWidth+maxHeight?}
+    B -->|yes| RZB64[Resize -> Base64 -> Data-URL]
+    B -->|no| B64[Base64 -> Data-URL]
+    RZB64 --> PLAIN[Stream as text/plain]
+    B64 --> PLAIN
+```
+
+### Octet output path
+
+```java
+if (maxWidth != null && maxHeight != null) {
+    ctx = imageResizeContentProcessor.process(content.getStream(), Map.of(
+        IMAGE_RESIZE_PARAM_MAX_WIDTH, maxWidth,
+        IMAGE_RESIZE_PARAM_MAX_HEIGHT, maxHeight,
+        IMAGE_RESIZE_PARAM_FORMAT, content.getFormat()));
+}
+
+if (IMAGE_API_VALUE_OUTPUT_INLINE_OCTET.equalsIgnoreCase(output)) {
+    dispositionType = DISPOSITION_TYPE_INLINE;       // Content-Disposition: inline
+} else {
+    dispositionType = DISPOSITION_TYPE_ATTACHMENT;   // Content-Disposition: attachment
+}
+
+type = content.getContentType();
+```
+
+`inline_octet` is the value to use when the avatar will be displayed in an `<img>` tag without prompting a download.
+
+### Base64 / data-URL output path (default)
+
+```java
+ctx = base64EncoderContentProcessor.then(dataUrlEncoderContentProcessor).process(
+        content.getStream(),
+        Map.of(DATA_URL_ENCODE_PARAM_CONTENT_TYPE, content.getContentType(),
+               DATA_URL_ENCODE_PARAM_ENCODING,     IMAGE_API_VALUE_ENCODING_BASE64));
+type = TEXT_PLAIN_VALUE;
+```
+
+This produces a `data:image/jpeg;base64,/9j/4AAQ…` string in the response body — directly consumable as the `src` attribute of an HTML `<img>`. The `.then(other)` combinator chains the encoders without intermediate buffering.
+
+With resize the chain becomes three stages: `imageResizeContentProcessor.then(base64Encoder).then(dataUrlEncoder).process(...)`.
+
+## POST / (multipart) — upload
+
+```java
+@POST
+@Consumes({ MediaType.MULTIPART_FORM_DATA })
+@Produces({ MediaType.APPLICATION_JSON })
+public ImageCreateResponse createImage(
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_TYPE) final String entityType,
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_ID)   final Long   entityId,
+        @HeaderParam(CONTENT_LENGTH)               final Long   fileSize,
+        @FormDataParam(DOCUMENT_API_PARAM_FILE) final InputStream                is,
+        @FormDataParam(DOCUMENT_API_PARAM_FILE) final FormDataContentDisposition fileDetails,
+        @FormDataParam(DOCUMENT_API_PARAM_FILE) final FormDataBodyPart           filePart) {
+
+    fileUploadValidator.validate(fileSize, is, fileDetails, filePart);
+
+    final var command = new ImageCreateCommand();
+    command.setPayload(ImageCreateRequest.builder()
+            .entityId(entityId).entityType(entityType)
+            .fileName(fileDetails.getFileName()).size(fileSize)
+            .type(Optional.ofNullable(filePart.getMediaType()).map(MediaType::toString).orElse(null))
+            .stream(is)
+            .build());
+
+    final Supplier<ImageCreateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+Same `FileUploadValidator` gate as `DocumentApiResource`. The only differences from a document upload are:
+
+- No `name` / `description` parts — an avatar is identityless.
+- Only one image per entity. The write service finds the existing `m_image` row (via `EntityImageIdAdapter.get`), deletes its bytes, and replaces them.
+
+## POST / (data-URL body) — upload
+
+```java
+@POST
+@Consumes({ MediaType.TEXT_PLAIN, MediaType.TEXT_HTML, MediaType.APPLICATION_JSON })
+public ImageCreateResponse createImage(
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_TYPE) final String entityType,
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_ID)   final Long   entityId,
+        final InputStream body) {
+
+    requireNonNull(body, "Missing input stream");
+
+    final var command = new ImageCreateCommand();
+
+    var ctx = dataUrlDecoderContentProcessor
+            .then(base64DecoderContentProcessor)
+            .process(new ContentProcessorContext(body));
+
+    command.setPayload(ImageCreateRequest.builder()
+            .entityId(entityId).entityType(entityType)
+            .stream(ctx.getInputStream())
+            .build());
+
+    final Supplier<ImageCreateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+This is the **avatar-by-paste path**. The request body is a single string in the canonical data-URL form:
+
+```
+data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA…
+```
+
+The resource chains `DataUrlDecoderContentProcessor.then(Base64DecoderContentProcessor)`:
+
+1. `DataUrlDecoderContentProcessor` strips the `data:image/jpeg;base64,` prefix and emits the base64 payload.
+2. `Base64DecoderContentProcessor` decodes the base64 to raw bytes.
+
+The decoded `InputStream` flows into `ImageCreateRequest.stream(...)`. `fileName` and `type` are left null — `ImageWritePlatformServiceImpl` then fabricates a filename of `UUID.randomUUID() + ".jpg"` (defaulting to JPEG, see [Document overview](overview)) and runs Tika to fill `type`.
+
+This is conceptually the **`ImageDataUriParser`** equivalent: there is no class by that name in the modern code — the parsing happens inside the data-URL / base64 content-processor pair.
+
+## PUT / — replace
+
+```java
+@PUT
+@Consumes(MediaType.MULTIPART_FORM_DATA)
+public ImageCreateResponse updateImage(... multipart parts ...) {
+    return createImage(entityName, entityId, fileSize, inputStream, fileDetails, bodyPart);
+}
+
+@PUT
+@Consumes({ MediaType.TEXT_PLAIN, MediaType.TEXT_HTML, MediaType.APPLICATION_JSON })
+public ImageCreateResponse updateImage(... InputStream body ...) {
+    return createImage(entityName, entityId, body);
+}
+```
+
+The PUT entry points are thin delegates. They exist so REST clients that follow the "PUT to replace" convention work without surprises — but on the wire the behaviour is identical to POST.
+
+## DELETE / — remove
+
+```java
+@DELETE
+public ImageDeleteResponse deleteImage(
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_TYPE) final String entityType,
+        @PathParam(DOCUMENT_API_PARAM_ENTITY_ID)   final Long   entityId) {
+
+    final var command = new ImageDeleteCommand();
+    command.setPayload(ImageDeleteRequest.builder()
+            .entityId(entityId).entityType(entityType).build());
+    final Supplier<ImageDeleteResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+`ImageWritePlatformServiceImpl.delete(entityType, entityId)`:
+
+1. Finds the right `EntityImageIdAdapter` (via `accept(entityType)`).
+2. Calls `adapter.set(entityId, null)` — this both retrieves the old `imageId` and clears the FK on the parent row.
+3. Loads the `Image` row by id.
+4. Deletes the bytes via `storeService.delete(image.getLocation())`.
+5. Deletes the `m_image` row.
+
+A `DocumentNotFoundException` is raised if no `Image` row was attached.
+
+## Constants and supported encodings
+
+```java
+public final class ImageApiConstants {
+    public static final String IMAGE_API_PARAM_MAX_WIDTH  = "maxWidth";
+    public static final String IMAGE_API_PARAM_MAX_HEIGHT = "maxHeight";
+    public static final String IMAGE_API_PARAM_OUTPUT     = "output";
+
+    public static final String IMAGE_API_VALUE_OUTPUT_INLINE_OCTET = "inline_octet";
+    public static final String IMAGE_API_VALUE_IMAGE_TYPE_JPG       = "jpg";
+    public static final String IMAGE_API_VALUE_ENCODING_BASE64      = "base64";
+    // (PNG and GIF are commented out in source — JPEG is the only first-class type)
+}
+```
+
+The default filename extension for data-URL uploads is `.jpg` (per `ImageWritePlatformServiceImpl.DEFAULT_EXTENSION`). PNG and GIF still work via multipart upload because Tika detects them correctly, but the data-URL pathway is tuned for JPEG.
+
+## Content-processor combinators
+
+The processors form a tiny algebra:
+
+```java
+@FunctionalInterface
+public interface ContentProcessor {
+    ContentProcessorContext process(InputStream is, Map<String, Object> params);
+
+    default ContentProcessor then(ContentProcessor other) {
+        return (is, params) -> other.process(this.process(is, params).getInputStream(), params);
+    }
+}
+```
+
+Existing processors:
+
+| Class | Direction | Purpose |
+| --- | --- | --- |
+| `Base64EncoderContentProcessor` | bytes → ASCII | Standard MIME base64 wrap. |
+| `Base64DecoderContentProcessor` | ASCII → bytes | Inverse. |
+| `DataUrlEncoderContentProcessor` | ASCII → ASCII | Prepends `data:{contentType};{encoding},`. |
+| `DataUrlDecoderContentProcessor` | ASCII → ASCII | Strips the prefix. |
+| `Gzip{Encoder,Decoder}ContentProcessor` | bytes ↔ bytes | Optional compression. Not used by the image GET path. |
+| `ImageResizeContentProcessor` | bytes → bytes | Wraps Thumbnailator. Params: `maxWidth`, `maxHeight`, `format`. |
+| `SizeContentProcessor` | bytes → bytes | Counts bytes through the pipe. |
+
+Because each processor returns a `ContentProcessorContext` containing a fresh `InputStream`, you can compose any number of stages without intermediate buffering on the JVM heap.
+
+## Avatar write — sequence
+
+```mermaid
+sequenceDiagram
+    actor App as Mobile / Web app
+    participant Res as ImagesApiResource
+    participant Dec as DataUrlDecoder.then(Base64Decoder)
+    participant Pipe as CommandPipeline
+    participant W as ImageWritePlatformServiceImpl
+    participant Det as ContentDetectorManager
+    participant Store as ContentStoreService
+    participant Adapter as ClientImageIdAdapter
+    participant DB as m_image / m_client
+
+    App->>Res: POST /v1/clients/42/images\nbody = "data:image/jpeg;base64,…"
+    Res->>Dec: process(body)
+    Dec-->>Res: decoded bytes
+    Res->>Pipe: send(ImageCreateCommand)
+    Pipe->>W: createImage(request)
+    W->>W: filename = UUID.randomUUID() + ".jpg"
+    W->>Det: detect by filename
+    Det-->>W: image/jpeg
+    W->>Store: upload("images/clients/42/<uuid>.jpg", stream, image/jpeg)
+    Store-->>W: stored path
+    W->>Adapter: get(42)
+    Adapter-->>W: Optional<existing imageId>
+    alt existing avatar
+        W->>Store: delete(old.location)
+        W->>DB: UPDATE m_image SET location, storage_type_enum
+    else first time
+        W->>DB: INSERT INTO m_image
+    end
+    W->>Adapter: set(42, newImageId)
+    Adapter->>DB: UPDATE m_client SET image_id = newImageId
+    W-->>Res: ImageCreateResponse{ resourceId }
+    Res-->>App: 200 OK
+```
+
+## Error responses
+
+| HTTP | Exception | Cause |
+| --- | --- | --- |
+| 400 | `PlatformApiDataValidationException` | `FileUploadValidator` failure on multipart paths. |
+| 400 | `ContentPolicyException` | Whitelist / traversal failure. |
+| 400 | `DocumentInvalidRequestException` | Unexpected failure during upload (e.g. data-URL malformed). |
+| 404 | `DocumentNotFoundException` | GET / DELETE when no avatar attached. |
+| 500 | `ContentStoreException` | I/O or S3 failure. |
+
+## When to use Documents vs Images
+
+| Need | Use |
+| --- | --- |
+| Single avatar per entity, rendered as `<img src="data:…">` | Images API |
+| Multiple files per entity with name + description metadata | Documents API |
+| KYC scans / signed agreements / loan supporting documents | Documents API |
+| Profile picture for a client / staff member | Images API |
+| New code that wants type safety and lifecycle events | Documents API |
+
+## Cross-references
+
+- [Document overview](overview) — module file map.
+- [Domain model](document-management-domain) — `Image`, `ImageRepository`, `EntityImageIdAdapter`.
+- [Document API](document-api) — sibling resource for richer file metadata.
+- [Content store](content-store) — `ContentStoreService` SPI that backs the writes.
+- [Detector and policies](detector-and-policies) — what gates the upload.
+- [Portfolio / Clients](/portfolio/clients) — the client entity that owns avatars.
+- [API / Document APIs](/api/document-apis) — published OpenAPI reference.

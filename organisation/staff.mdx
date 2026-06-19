@@ -1,0 +1,358 @@
+---
+title: "Staff — Loan Officers, Branch Managers and Field Agents"
+sidebarTitle: "Staff"
+description: "Apache Fineract Staff entity: loan-officer flag, StaffOrganisationalRoleType, parent-staff supervision, StaffApiResource endpoints, status filter and bulk import."
+---
+
+In Apache Fineract a **`Staff`** record is the institution's employee. It is what a `Client`, `Group`, `Loan` or `SavingsAccount` carries on its `loan_officer_id` / `field_officer_id` FK, what links to an `AppUser` for branch staff with login access, and what the unassigned-loans report queries by `office_id`. Critically, the boolean `is_loan_officer` is the **only role** Fineract treats as a first-class business concept; everything else (`PROGRAM_DIRECTOR`, `BRANCH_MANAGER`, `FIELD_OFFICER_COORDINATOR`, `FIELD_OFFICER`) is informational and surfaced through the `StaffOrganisationalRoleType` enum.
+
+<Note>
+The `Staff` entity sits in `fineract-core`; the JAX-RS resource, command pipeline and bulk-import scaffolding live in `fineract-provider`. Unlike most other domain objects, the create/update flow does **not** go through `CommandWrapperBuilder` — it uses the newer [command pipeline](/core/commands-framework) (`CommandPipeline.send(...)`) directly.
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `Staff` | `fineract-core` |
+| Enum | `StaffOrganisationalRoleType`, `StaffEnumerations` | `fineract-core` |
+| Repository | `StaffRepository`, `StaffRepositoryWrapper` | `fineract-provider` |
+| Read service | `StaffReadService` / `StaffReadServiceImpl` | `fineract-provider` |
+| Write service | `StaffWriteService` / `StaffWriteServiceImpl` | `fineract-provider` |
+| Commands | `StaffCreateCommand`, `StaffUpdateCommand`, `StaffUploadCommand` | `fineract-provider` |
+| Mappers | `StaffDataMapper`, `StaffCreateRequestMapper`, `StaffDateMapper`, `StaffImageIdAdapter` | `fineract-provider` |
+| Validators | `StaffForceStatus`, `StaffForceStatusValidator` | `fineract-provider` |
+| JAX-RS | `StaffApiResource` (`/v1/staff`) | `fineract-provider` |
+| Handlers | `StaffCreateCommandHandler`, `StaffUpdateCommandHandler`, `StaffUploadCommandHandler` | `fineract-provider` |
+| Exceptions | `StaffNotFoundException` (core), `StaffRoleException` (provider) | core / provider |
+
+## `Staff` entity
+
+```java
+// fineract-core/.../staff/domain/Staff.java
+@Getter @Setter
+@Entity
+@Table(name = "m_staff", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"display_name"}, name = "display_name"),
+    @UniqueConstraint(columnNames = {"external_id"},  name = "external_id_UNIQUE"),
+    @UniqueConstraint(columnNames = {"mobile_no"},    name = "mobile_no_UNIQUE")
+})
+public class Staff extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "firstname", length = 50)         private String firstname;
+    @Column(name = "lastname",  length = 50)         private String lastname;
+    @Column(name = "display_name", length = 100)     private String displayName;
+    @Column(name = "mobile_no", length = 50, nullable = false, unique = true) private String mobileNo;
+    @Column(name = "external_id", length = 100, unique = true)               private String externalId;
+    @Column(name = "email_address", length = 50, unique = true)              private String emailAddress;
+
+    @ManyToOne @JoinColumn(name = "office_id", nullable = false)
+    private Office office;
+
+    @Column(name = "is_loan_officer", nullable = false)
+    private boolean loanOfficer;
+
+    @Column(name = "organisational_role_enum")
+    private Integer organisationalRoleType;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean active;
+
+    @Column(name = "joining_date")
+    private LocalDate joiningDate;
+
+    @ManyToOne
+    @JoinColumn(name = "organisational_role_parent_staff_id")
+    private Staff organisationalRoleParentStaff;
+
+    @Column(name = "image_id")
+    private Long imageId;
+}
+```
+
+### Column inventory
+
+| Column | Field | Constraints | Purpose |
+| --- | --- | --- | --- |
+| `firstname`, `lastname` | first/last name | 50 chars | Raw name parts |
+| `display_name` | `displayName` | unique, 100 chars | Pre-computed `lastname, firstname` — used by reports |
+| `mobile_no` | `mobileNo` | `NOT NULL`, unique | Used by SMS notifications, also looked up on registration |
+| `email_address` | `emailAddress` | unique, 50 chars | Optional; SMTP notifications |
+| `external_id` | `externalId` | unique, 100 chars | Stable cross-system identifier (note: `String`, not `ExternalId` here) |
+| `office_id` | `office` | FK to `m_office`, `NOT NULL` | Home branch |
+| `is_loan_officer` | `loanOfficer` | `NOT NULL` | First-class flag — drives `loan.loan_officer_id` eligibility |
+| `organisational_role_enum` | `organisationalRoleType` | nullable | Maps to `StaffOrganisationalRoleType.fromInt(...)` |
+| `is_active` | `active` | `NOT NULL` | Soft deactivation |
+| `joining_date` | `joiningDate` | nullable | Used by HR reports |
+| `organisational_role_parent_staff_id` | `organisationalRoleParentStaff` | FK to self | Reporting line (e.g. field-agent → coordinator) |
+| `image_id` | `imageId` | FK to `m_image` | Avatar — see [document management](/core/document-management-domain) |
+
+### `StaffOrganisationalRoleType`
+
+```java
+public enum StaffOrganisationalRoleType {
+    INVALID(0,                    "staffOrganisationalRoleType.invalid"),
+    PROGRAM_DIRECTOR(100,         "staffOrganisationalRoleType.programDirector"),
+    BRANCH_MANAGER(200,           "staffOrganisationalRoleType.branchManager"),
+    FIELD_OFFICER_COORDINATOR(300,"staffOrganisationalRoleType.coordinator"),
+    FIELD_OFFICER(400,            "staffOrganisationalRoleType.fieldAgent");
+}
+```
+
+| Value | Enum | Code |
+| --- | --- | --- |
+| 100 | `PROGRAM_DIRECTOR` | `staffOrganisationalRoleType.programDirector` |
+| 200 | `BRANCH_MANAGER` | `staffOrganisationalRoleType.branchManager` |
+| 300 | `FIELD_OFFICER_COORDINATOR` | `staffOrganisationalRoleType.coordinator` |
+| 400 | `FIELD_OFFICER` | `staffOrganisationalRoleType.fieldAgent` |
+| 0 | `INVALID` | `staffOrganisationalRoleType.invalid` |
+
+These integer values are persisted in `m_staff.organisational_role_enum`. `StaffEnumerations.organisationalRole(int)` produces the `EnumOptionData` that `AppUser.organisationalRoleData()` returns to the user template:
+
+```java
+public EnumOptionData organisationalRoleData() {
+    EnumOptionData organisationalRole = null;
+    if (this.staff != null && this.staff.getOrganisationalRoleType() != null) {
+        organisationalRole = StaffEnumerations.organisationalRole(this.staff.getOrganisationalRoleType());
+    }
+    return organisationalRole;
+}
+```
+
+### Deprecated helpers
+
+```java
+@Deprecated(forRemoval = true) public boolean isNotLoanOfficer() { return !isLoanOfficer(); }
+@Deprecated(forRemoval = true) public boolean isNotActive()      { return !isActive(); }
+```
+
+Marked for removal — JSON serialisers (Gson) used to call them as inadvertent properties; new code should use `isLoanOfficer()` / `isActive()` directly.
+
+## `StaffApiResource` — `/v1/staff`
+
+```java
+@Path("/v1/staff")
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Component
+@Tag(name = "Staff", description = "Allows you to model staff members. At present the key role of significance is whether this staff member is a loan officer or not.")
+@RequiredArgsConstructor
+public class StaffApiResource {
+    private final StaffReadService                  readPlatformService;
+    private final OfficeReadPlatformService         officeReadPlatformService;
+    private final BulkImportWorkbookPopulatorService bulkImportWorkbookPopulatorService;
+    private final CommandPipeline                   commandPipeline;
+    // …
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command class | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/staff` | `retrieveAll` | — | List; `?officeId=`, `?staffInOfficeHierarchy=`, `?loanOfficersOnly=`, `?status=` |
+| GET | `/v1/staff/{staffId}` | `retrieveOne` | — | One staff; `?template=true` appends `allowedOffices` |
+| GET | `/v1/staff/downloadtemplate` | `getTemplate` | — | XLSX template for bulk import |
+| POST | `/v1/staff` | `createStaff` | `StaffCreateCommand` | Create staff |
+| PUT | `/v1/staff/{staffId}` | `updateStaff` | `StaffUpdateCommand` | Update staff |
+| POST | `/v1/staff/uploadtemplate` | `postTemplate` | `StaffUploadCommand` | Bulk import (multipart) |
+
+### `GET /v1/staff`
+
+```java
+@GET
+public List<StaffData> retrieveAll(@QueryParam("officeId") final Long officeId,
+        @DefaultValue("false") @QueryParam("staffInOfficeHierarchy") final boolean staffInOfficeHierarchy,
+        @DefaultValue("false") @QueryParam("loanOfficersOnly") final boolean loanOfficersOnly,
+        @DefaultValue("active") @QueryParam("status") final String status) {
+    return staffInOfficeHierarchy
+            ? readPlatformService.retrieveAllStaffInOfficeAndItsParentOfficeHierarchy(officeId, loanOfficersOnly)
+            : readPlatformService.retrieveAllStaff(officeId, loanOfficersOnly, Optional.ofNullable(status).orElse("active"));
+}
+```
+
+Query parameters:
+
+| Parameter | Default | Behaviour |
+| --- | --- | --- |
+| `officeId` | (none) | Scope to one office; combined with `staffInOfficeHierarchy=true` walks the parent chain |
+| `staffInOfficeHierarchy` | `false` | When `true`, walks **upward** from the office to include managers of parent branches |
+| `loanOfficersOnly` | `false` | Filter to `is_loan_officer = 1` |
+| `status` | `active` | One of `active`, `inactive`, `all` — case-insensitive |
+
+`active` (the default) is the most common usage from the web UI: "show me available loan officers in this branch". `staffInOfficeHierarchy=true` is what the loan-create template uses so a sub-branch can pick a branch-manager from the parent office.
+
+### `GET /v1/staff/{staffId}` with template
+
+```java
+public StaffData retrieveOne(@PathParam("staffId") final Long staffId,
+        @DefaultValue("false") @QueryParam("template") boolean template) {
+    StaffData staff = readPlatformService.retrieveStaff(staffId);
+    if (template) {
+        final Collection<OfficeData> allowedOffices = officeReadPlatformService.retrieveAllOfficesForDropdown();
+        staff = StaffData.builder()
+                .id(staff.getId()).firstname(staff.getFirstname()).lastname(staff.getLastname())
+                .displayName(staff.getDisplayName()).officeId(staff.getOfficeId()).officeName(staff.getOfficeName())
+                .isLoanOfficer(staff.getIsLoanOfficer()).externalId(staff.getExternalId()).mobileNo(staff.getMobileNo())
+                .isActive(staff.getIsActive()).joiningDate(staff.getJoiningDate())
+                .allowedOffices(allowedOffices)
+                .build();
+    }
+    return staff;
+}
+```
+
+`?template=true` is meant for the **edit screen**: it appends the list of allowed offices so the dropdown can be populated. Note that the API does not return the `organisationalRoleType` on this builder branch — it is omitted when `template=true`, which is a subtle behaviour to know about.
+
+### `POST /v1/staff`
+
+```java
+@POST
+@Operation(summary = "Create a staff member", operationId = "createStaff", description = """
+        Creates a staff member.
+        Mandatory fields:
+        - officeId
+        - firstname
+        - lastname
+        Optional fields:
+        - isLoanOfficer
+        - isActive
+        """)
+public StaffCreateResponse createStaff(@RequestBody(required = true) @Valid StaffCreateRequest request) {
+    final var command = new StaffCreateCommand();
+    command.setPayload(request);
+    final Supplier<StaffCreateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+Unlike the legacy `OfficesApiResource`, this resource uses the **typed command pipeline**:
+
+1. Body is bound to `StaffCreateRequest` (a `@Valid` DTO with bean-validation annotations).
+2. A `StaffCreateCommand` wraps it.
+3. `commandPipeline.send(...)` returns a `Supplier<StaffCreateResponse>` — calling `.get()` actually executes the pipeline (validators → handler → audit) and yields the response.
+
+`StaffCreateCommandHandler` ultimately writes via `StaffWriteServiceImpl.create(...)`, which:
+
+- Loads the office,
+- Builds the `Staff` instance,
+- Generates the `displayName` as `lastname, firstname`,
+- Saves and emits a `StaffCreatedBusinessEvent` (see [business events](/core/event-business)).
+
+### `PUT /v1/staff/{staffId}`
+
+```java
+public StaffUpdateResponse updateStaff(@PathParam("staffId") final Long staffId,
+        @RequestBody(required = true) @Valid StaffUpdateRequest request) {
+    request.setId(staffId);
+    final var command = new StaffUpdateCommand();
+    command.setPayload(request);
+    final Supplier<StaffUpdateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+Same pattern as create. `StaffUpdateRequest` carries diffable fields:
+
+- `officeId`, `firstname`, `lastname`, `mobileNo`, `emailAddress`,
+- `isLoanOfficer`, `isActive`, `organisationalRoleType`, `joiningDate`, `externalId`,
+- `forceStatus` — see below.
+
+#### `forceStatus`
+
+`StaffForceStatusValidator` enforces an edge case: you **cannot** deactivate a staff member that is still assigned as the active loan officer on any open loan unless the request body sets `forceStatus = true`. This avoids accidental orphaning of portfolios; admins can override with the `forceStatus` flag if they have already re-assigned downstream loans.
+
+### Bulk import
+
+```java
+@GET
+@Path("downloadtemplate")
+@Produces("application/vnd.ms-excel")
+public Response getTemplate(@QueryParam("officeId") final Long officeId,
+        @QueryParam("dateFormat") final String dateFormat) {
+    return bulkImportWorkbookPopulatorService.getTemplate(GlobalEntityType.STAFF.toString(), officeId, null, dateFormat);
+}
+
+@POST
+@Path("uploadtemplate")
+@Consumes(MediaType.MULTIPART_FORM_DATA)
+public Long postTemplate(@FormDataParam("file") InputStream uploadedInputStream,
+        @FormDataParam("file") FormDataContentDisposition fileDetail,
+        @FormDataParam("locale") final String locale,
+        @FormDataParam("dateFormat") final String dateFormat) {
+    final var command = new StaffUploadCommand();
+    command.setPayload(StaffUploadRequest.builder()
+            .uploadedInputStream(uploadedInputStream).fileDetail(fileDetail)
+            .locale(locale).dateFormat(dateFormat).build());
+    final Supplier<StaffUpdateResponse> response = commandPipeline.send(command);
+    return response.get().getResourceId();
+}
+```
+
+The XLSX uses `GlobalEntityType.STAFF`. `officeId` on the GET pre-fills the office dropdown column. The upload returns the import job id — poll the standard import status endpoint to track completion.
+
+<Note>
+The bulk-upload handler returns a raw `Long` rather than a JSON object. A `// TODO: return the whole body, a number is not a valid JSON element!` comment in the source acknowledges this is a known wart kept for backwards compatibility.
+</Note>
+
+## DTOs
+
+| DTO | Purpose |
+| --- | --- |
+| `StaffData` | Read DTO returned by GETs |
+| `StaffCreateRequest` / `StaffCreateResponse` | Typed POST payloads |
+| `StaffUpdateRequest` / `StaffUpdateResponse` | Typed PUT payloads |
+| `StaffUploadRequest` / `StaffUploadResponse` | Bulk-import payloads |
+
+All requests carry bean-validation constraints (`@NotBlank`, `@Size`, etc.) consumed by `@Valid` at the resource boundary. `StaffDataMapper` (MapStruct) is what `StaffReadServiceImpl` uses to project JDBC rows into `StaffData`.
+
+## Repository wrappers
+
+`StaffRepositoryWrapper.findOneWithNotFoundDetection(...)` is the canonical accessor:
+
+```java
+public Staff findOneWithNotFoundDetection(final Long id) {
+    return this.repository.findById(id).orElseThrow(() -> new StaffNotFoundException(id));
+}
+```
+
+Two additional methods are used by validation paths in the loan module:
+
+- `findOneByLoanOfficerInOffice(staffId, officeId)` — used when assigning a loan to validate the staff really is a loan officer of the loan's office.
+- `findOneByOfficeHierarchy(staffId, hierarchy)` — used for group lifecycle transfers.
+
+## Exceptions
+
+| Exception | HTTP | Message key | Raised when |
+| --- | --- | --- | --- |
+| `StaffNotFoundException` | 404 | `error.msg.staff.id.invalid` | Lookup miss |
+| `StaffRoleException` | 403 | `error.msg.staff.invalid.role` | A non-loan-officer was assigned as a loan officer, or a deactivated staff is re-used |
+
+`StaffForceStatusValidator` does not raise its own exception type — it uses `DataValidatorBuilder` to attach the error `staff.cannot.be.deactivated.assigned.to.loans`, surfaced as a `PlatformApiDataValidationException` (`400`).
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_STAFF` | List/retrieve |
+| `CREATE_STAFF`, `CREATE_STAFF_CHECKER` | Create + maker–checker |
+| `UPDATE_STAFF`, `UPDATE_STAFF_CHECKER` | Update + maker–checker |
+| `IMPORT_STAFF` | Bulk import (seeded with the bulk-import permission rows) |
+
+## How `Staff` plumbs into other modules
+
+- **AppUser**: `m_appuser.staff_id` is nullable but, when set, drives `organisationalRoleData()` shown above.
+- **Client / Group**: `m_client.staff_id` (a.k.a. *field officer*) and `m_group.staff_id` track the responsible field officer.
+- **Loan**: `m_loan.loan_officer_id` — the assignment trail is captured in `m_loan_officer_assignment_history`.
+- **Savings account**: `m_savings_account.field_officer_id` — same idea.
+- **Reports**: many `m_report_mailing_job` definitions filter by `staff_id` to email statements only to the responsible field officer.
+
+## See also
+
+- [Offices](/organisation/offices) — the branch tree `Staff.office` references.
+- [Organisation shared domain](/core/organisation-shared-domain) — full package map for `organisation/*`.
+- [Users domain](/users/users-domain) — `AppUser.staff` linkage and how the organisational role surfaces.
+- [Commands framework](/core/commands-framework) — typed `CommandPipeline.send(...)` and maker–checker.
+- [Organisation APIs](/api/organisation-apis) — Swagger schemas for `StaffData` and friends.
+- [Bulk import infrastructure](/core/bulkimport) — how `GlobalEntityType.STAFF` is processed.
+- [Security overview](/security/overview) — `STAFF` permission resource.

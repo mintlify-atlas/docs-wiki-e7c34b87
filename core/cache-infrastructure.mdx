@@ -1,0 +1,337 @@
+---
+title: "Cache Infrastructure: PlatformCache, RuntimeDelegatingCacheManager"
+sidebarTitle: "Cache"
+description: "Fineract's caching layer: persisted PlatformCache rows, RuntimeDelegatingCacheManager, the CacheApiResource and the CacheType enum."
+---
+
+Apache Fineract treats "what kind of cache am I using right now?" as
+persisted, switchable state — not a static `@EnableCaching` configuration.
+The `org.apache.fineract.infrastructure.cache` package owns the persisted
+`PlatformCache` row, the `RuntimeDelegatingCacheManager` that proxies the
+real Spring `CacheManager`, and the `CacheApiResource` that lets operators
+switch caches at runtime. This page is the reference for that package.
+
+## Layout
+
+```text
+infrastructure/cache/
+├── CacheApiConstants.java
+├── CacheEnumerations.java
+├── PlatformCacheConfiguration.java
+├── api/
+│   └── CacheApiResource.java
+├── command/
+│   └── CacheSwitchCommand.java
+├── data/
+│   ├── CacheData.java
+│   ├── CacheSwitchRequest.java
+│   └── CacheSwitchResponse.java
+├── domain/
+│   ├── CacheType.java
+│   ├── PlatformCache.java
+│   └── PlatformCacheRepository.java
+├── handler/
+│   └── CacheSwitchCommandHandler.java
+└── service/
+    ├── CacheWritePlatformService.java
+    ├── CacheWritePlatformServiceJpaRepositoryImpl.java
+    └── RuntimeDelegatingCacheManager.java
+```
+
+## `CacheType` — the enum
+
+```java
+@Getter
+public enum CacheType {
+
+    INVALID    (0, "cacheType.invalid"),
+    NO_CACHE   (1, "cacheType.noCache"),
+    SINGLE_NODE(2, "cacheType.singleNode"),
+    MULTI_NODE (3, "cacheType.multiNode");
+
+    private final Integer value;
+    private final String  code;
+
+    public boolean isNoCache()          { return NO_CACHE.getValue().equals(this.value); }
+    public boolean isEhcache()          { return SINGLE_NODE.getValue().equals(this.value); }
+    public boolean isDistributedCache() { return MULTI_NODE.getValue().equals(this.value); }
+
+    public static CacheType fromInt(final Integer value) { … }
+}
+```
+
+| Enum | Persisted as | Meaning |
+| --- | --- | --- |
+| `INVALID` | `0` | Sentinel returned by `fromInt` for unknown values. |
+| `NO_CACHE` | `1` | Spring's `NoOpCacheManager` — every call delegates straight to the underlying read. |
+| `SINGLE_NODE` | `2` | Ehcache, in‑process. The default tuned configuration for single‑instance deployments (still works with multiple tenants but only one JVM). |
+| `MULTI_NODE` | `3` | Slot reserved for distributed caches. Wired manually by deployments that integrate Hazelcast/Redis. |
+
+`CacheEnumerations.cacheType(...)` produces the
+`EnumOptionData {id, code, value}` triplet used by template endpoints.
+
+## `PlatformCache` — the entity
+
+`PlatformCache` persists the *current* cache type, so it survives JVM
+restarts and lets operators flip caches via the REST API without redeploying.
+
+```java
+@Entity
+@Table(name = "c_cache")
+public class PlatformCache extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "cache_type_enum")
+    private Integer cacheType;
+
+    public boolean isNoCachedEnabled()       { return CacheType.fromInt(cacheType).isNoCache(); }
+    public boolean isEhcacheEnabled()        { return CacheType.fromInt(cacheType).isEhcache(); }
+    public boolean isDistributedCacheEnabled() { return CacheType.fromInt(cacheType).isDistributedCache(); }
+}
+```
+
+There is normally **one row** in `c_cache` per tenant database. The row's
+`cache_type_enum` field is read at JVM startup (and after every switch) to
+choose the delegate `CacheManager`.
+
+`PlatformCacheRepository` is a thin `JpaRepository<PlatformCache, Long>`
+exposed via Spring Data; it adds no extra finder methods because the
+domain only ever needs the single row.
+
+## `RuntimeDelegatingCacheManager` — the switchable delegate
+
+This `@Component("runtimeDelegatingCacheManager")` is the
+`org.springframework.cache.CacheManager` the rest of the platform receives
+when it injects one. Internally it delegates to either the Ehcache‑backed
+manager or `NoOpCacheManager`:
+
+```java
+@Component(value = "runtimeDelegatingCacheManager")
+@RequiredArgsConstructor
+public class RuntimeDelegatingCacheManager implements CacheManager, InitializingBean {
+
+    @Qualifier("ehCacheManager")
+    private final CacheManager ehCacheManager;
+    @Qualifier("defaultCacheManager")
+    private final CacheManager defaultCacheManager;
+
+    private CacheManager currentCacheManager;
+
+    @Override
+    public void afterPropertiesSet() {
+        currentCacheManager = defaultCacheManager;     // NoOpCacheManager
+    }
+
+    // delegates getCache / getCacheNames to currentCacheManager …
+    // exposes switchToCache(CacheType) for the API to flip it
+}
+```
+
+The class implements `InitializingBean` so it initialises to the no‑op
+manager at startup. The `CacheWritePlatformService` flips it later by
+reading the persisted `PlatformCache.cacheType` and calling
+`switchToCache(...)`.
+
+### Wiring
+
+The Spring caching machinery is plugged into the delegate by
+`PlatformCacheConfiguration`:
+
+```java
+@Configuration
+@EnableCaching
+public class PlatformCacheConfiguration implements CachingConfigurer {
+
+    @Autowired
+    private RuntimeDelegatingCacheManager delegatingCacheManager;
+
+    @Bean
+    @Override
+    public CacheManager cacheManager() {
+        return this.delegatingCacheManager;
+    }
+}
+```
+
+Result: every `@Cacheable`/`@CacheEvict` annotation in the platform (the
+`tenantsById` cache on `JdbcTenantDetailsService`, code‑value caches,
+configuration property caches, etc.) is routed through the delegating
+manager. Switching to `NO_CACHE` immediately makes every annotation a
+no‑op until it is switched back.
+
+## `CacheApiResource` — runtime switching
+
+```java
+@Path("/v1/caches")
+@Component
+public class CacheApiResource {
+
+    @Qualifier("runtimeDelegatingCacheManager")
+    private final RuntimeDelegatingCacheManager cacheService;
+    private final CommandPipeline               commandPipeline;
+
+    @GET
+    @Operation(summary = "Retrieve Cache Types")
+    public Collection<CacheData> retrieveAll() {
+        return cacheService.retrieveAll();
+    }
+
+    @PUT
+    @Operation(summary = "Switch Cache")
+    public CacheSwitchResponse switchCache(@Valid CacheSwitchRequest request) {
+        final var command = new CacheSwitchCommand();
+        command.setPayload(request);
+        return commandPipeline.execute(command);
+    }
+}
+```
+
+| Method | Path | Behaviour |
+| --- | --- | --- |
+| `GET` | `/v1/caches` | Returns the list of available caches as `CacheData[]`, with the currently selected one flagged. |
+| `PUT` | `/v1/caches` | Accepts a `CacheSwitchRequest` (`{"cacheType": N}`) and pushes a `CacheSwitchCommand` through the command pipeline. |
+
+The `PUT` payload is validated with Jakarta bean validation on
+`CacheSwitchRequest`. The command pipeline dispatches to
+`CacheSwitchCommandHandler`, which calls
+`CacheWritePlatformService.switchToCache(...)`. The write service updates
+the `c_cache` row and asks `RuntimeDelegatingCacheManager` to flip its
+internal pointer. The previous cache is cleared as part of the switch — the
+class‑level Swagger description on `CacheApiResource` explicitly notes:
+"Switching between caches results in the cache being cleared, e.g. from
+single node to no cache and back again would clear down the single node
+cache."
+
+## Cache types in detail
+
+### `NO_CACHE` — Spring `NoOpCacheManager`
+
+Every cache name resolves to a no‑op `Cache`. `get` always returns `null`,
+`put` is a no‑op. Use this in environments where caches cause confusion
+(active development against a shared DB) or where strict freshness is
+required.
+
+### `SINGLE_NODE` — Ehcache
+
+Backed by an `ehCacheManager` bean. Caches that exist on this manager
+include (non‑exhaustive):
+
+| Cache name | Used by | TTL |
+| --- | --- | --- |
+| `tenantsById` | `JdbcTenantDetailsService.loadTenantById` | Until evicted by tenant provisioning |
+| `codes` | `CodeReadPlatformService` | Long — codes change rarely |
+| `codeValues` | `CodeValueReadPlatformService` | Long — system‑defined values |
+| `globalConfiguration` | `ConfigurationDomainService` | Until next write via `GlobalConfigurationApiResource` |
+| `permissions`, `users`, `usersByUsername` | Security read services | Long |
+
+Exact configuration lives in `fineract-provider`'s Ehcache XML (the
+`ehCacheManager` bean). The relevant fact for `fineract-core` is that
+**which** cache backs `@Cacheable` is determined at runtime by the
+delegating manager.
+
+### `MULTI_NODE` — distributed
+
+The slot exists in the enum (`CacheType.MULTI_NODE`) and in the helper
+predicates (`isDistributedCache`). Deployments that wire a distributed
+implementation (Hazelcast, Redis, etc.) configure the additional
+`CacheManager` and have `RuntimeDelegatingCacheManager` swap to it when the
+persisted value is `3`.
+
+## End‑to‑end: switching the cache
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant API as CacheApiResource
+    participant Pipe as CommandPipeline
+    participant Handler as CacheSwitchCommandHandler
+    participant Write as CacheWritePlatformService
+    participant Repo as PlatformCacheRepository
+    participant Mgr as RuntimeDelegatingCacheManager
+
+    Op->>API: PUT /v1/caches {"cacheType":2}
+    API->>Pipe: execute(CacheSwitchCommand{cacheType:2})
+    Pipe->>Handler: handle
+    Handler->>Write: switchToCache(SINGLE_NODE)
+    Write->>Repo: findOne(); update row
+    Write->>Mgr: switchToCache(SINGLE_NODE)
+    Mgr->>Mgr: currentCacheManager = ehCacheManager
+    Mgr-->>Write: previous CacheManager cleared
+    Write-->>Handler: changes map
+    Handler-->>Pipe: CacheSwitchResponse
+    Pipe-->>API: CacheSwitchResponse
+    API-->>Op: {"changes":{"cacheType":2}}
+```
+
+## `CacheData` — the read DTO
+
+`CacheData` describes each available `CacheType` to the UI:
+
+| Field | Source |
+| --- | --- |
+| `cacheType` | `EnumOptionData` built by `CacheEnumerations.cacheType(...)` |
+| `selected` | `true` for the row that matches the persisted `PlatformCache.cacheType` |
+
+The `retrieveAll()` call enumerates `CacheType.values()` (skipping `INVALID`),
+maps each to a `CacheData`, and flags the active one.
+
+## Cache eviction patterns elsewhere
+
+`@CacheEvict(value = "tenantsById", allEntries = true)` is used on the
+tenant provisioning service so adding a tenant invalidates the cache.
+Configuration writes use `@CacheEvict(value = "globalConfiguration",
+allEntries = true)` on
+`GlobalConfigurationWritePlatformService`. Code/code‑value writes evict
+`codes`/`codeValues`. Because these go through the same delegating manager,
+they are no‑ops when the cache type is `NO_CACHE` — which is exactly the
+desired behaviour.
+
+## When to use which cache
+
+<AccordionGroup>
+  <Accordion title="NO_CACHE (1)">
+    Use during development, integration tests, or when chasing a
+    consistency bug. Every annotated method becomes a passthrough. Maximum
+    correctness, zero memory.
+  </Accordion>
+  <Accordion title="SINGLE_NODE (2)">
+    Default for single‑JVM production deployments. Big speed‑up for the
+    hot read paths (`tenantsById`, codes, configuration). Cache is cleared
+    by the API when switching away and is invalidated by write services on
+    related entities.
+  </Accordion>
+  <Accordion title="MULTI_NODE (3)">
+    Multi‑JVM clusters where the same tenant is served by more than one
+    Fineract instance. Requires you to plug in the distributed
+    `CacheManager` bean and tune eviction/replication. The persisted row
+    flip itself remains the same — the delegating manager just points at a
+    different backend.
+  </Accordion>
+</AccordionGroup>
+
+## Edge cases
+
+| Situation | Behaviour |
+| --- | --- |
+| `c_cache` row is missing (fresh DB) | The write service inserts a `NO_CACHE` row on first read. |
+| Persisted value is `0` (`INVALID`) | `CacheType.fromInt(0)` returns `INVALID`; `RuntimeDelegatingCacheManager` falls back to the no‑op manager. |
+| Switching to the same type | The write service is a no‑op (idempotent). The cache is **not** cleared in this case. |
+| Operator hits `PUT /v1/caches` during a request | The flip is atomic for the JVM that received it. Other JVMs only learn at their next read cycle. |
+| Eviction during processing | `RuntimeDelegatingCacheManager` does not block waiting for in‑flight `@Cacheable` calls to finish — newly cached entries against the previous backend are lost. |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Configuration properties" href="/core/configuration-properties">
+    The other piece of cluster-wide switchable state, persisted similarly.
+  </Card>
+  <Card title="DataSource & tenant routing" href="/core/datasource-tenant-routing">
+    `tenantsById` cache annotated on `JdbcTenantDetailsService` flows through this manager.
+  </Card>
+  <Card title="Command pipeline" href="/command/overview">
+    How `CacheSwitchCommand` is dispatched.
+  </Card>
+  <Card title="Infrastructure core inventory" href="/core/infrastructure-core">
+    The wider class map this page fits into.
+  </Card>
+</CardGroup>

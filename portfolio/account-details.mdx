@@ -1,0 +1,317 @@
+---
+title: "Account Details: Client and Group Account Summaries"
+sidebarTitle: "Account Details"
+description: "Reference for AccountDetailsReadPlatformService and the clients/{id}/accounts and groups/{id}/accounts endpoints that aggregate loans, savings and shares."
+---
+
+Apache Fineract surfaces a per-customer "what does this client/group own?" summary through a single read-only API that fans out across loans, savings, shares, GLIM/GSIM groupings, guarantor obligations, and working‑capital loans. The aggregation lives in `org.apache.fineract.portfolio.accountdetails` (provider module): a small package of immutable DTOs in `data/` and a JDBC-backed implementation in `service/`. The REST surface is **not** an `AccountDetailsApiResource` of its own — it is bolted onto `ClientsApiResource` (`/v1/clients/{clientId}/accounts`) and the corresponding group/center resources, which simply delegate to `AccountDetailsReadPlatformService`.
+
+This page is the canonical reference for engineers and coding agents touching that summary: where each collection comes from, what SQL drives it, how GLIM/GSIM are folded in, and what JSON the API produces. Pair it with [/loan/overview](/loan/overview), [/savings/overview](/savings/overview) and [/portfolio/share-accounts](/portfolio/share-accounts) for the per-portfolio detail.
+
+## Package layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `AccountSummaryCollectionData` (top-level aggregate DTO) | `fineract-provider` | `org.apache.fineract.portfolio.accountdetails.data` |
+| `LoanAccountSummaryData`, `SavingsAccountSummaryData`, `ShareAccountSummaryData`, `GuarantorAccountSummaryData`, `WorkingCapitalLoanAccountSummaryData` | `fineract-provider` | `org.apache.fineract.portfolio.accountdetails.data` |
+| `AccountDetailsReadPlatformService` (interface) | `fineract-provider` | `org.apache.fineract.portfolio.accountdetails.service` |
+| `AccountDetailsReadPlatformServiceJpaRepositoryImpl` (JDBC impl) | `fineract-provider` | `org.apache.fineract.portfolio.accountdetails.service` |
+| REST mounting on `/v1/clients/{clientId}/accounts` | `fineract-provider` | `org.apache.fineract.portfolio.client.api.ClientsApiResource` |
+| REST mounting on `/v1/groups/{groupId}/accounts`, `/v1/centers/{centerId}/accounts` | `fineract-provider` | `org.apache.fineract.portfolio.group.api.GroupsApiResource`, `CentersApiResource` |
+
+Because the package only exposes read services, there are no command handlers, no `@CommandType` enrollments, and no exception types of its own — every "not found" comes from the underlying `ClientReadPlatformService.retrieveOne(...)` / `GroupReadPlatformService` calls that guard the queries.
+
+## Service contract
+
+`AccountDetailsReadPlatformService` is a thin interface fanning out to the four sub-portfolios:
+
+```java
+// fineract-provider/.../accountdetails/service/AccountDetailsReadPlatformService.java
+public interface AccountDetailsReadPlatformService {
+
+    AccountSummaryCollectionData retrieveClientAccountDetails(Long clientId);
+
+    AccountSummaryCollectionData retrieveGroupAccountDetails(Long groupId);
+
+    Collection<LoanAccountSummaryData> retrieveClientLoanAccountsByLoanOfficerId(Long clientId, Long loanOfficerId);
+
+    Collection<LoanAccountSummaryData> retrieveGroupLoanAccountsByLoanOfficerId(Long groupId, Long loanOfficerId);
+
+    Collection<LoanAccountSummaryData> retrieveClientActiveLoanAccountSummary(Long clientId);
+
+    List<LoanAccountSummaryData> retrieveLoanAccountDetailsByGroupIdAndGlimAccountNumber(Long groupId, String glimAccount);
+
+    Collection<LoanAccountSummaryData> retrieveGroupActiveLoanAccountSummary(Long groupId);
+
+    AccountSummaryCollectionData retrieveGroupAccountDetails(Long groupId, Long gsimId);
+}
+```
+
+The first two methods build a full `AccountSummaryCollectionData`. The remaining methods exist so that:
+
+- staff-transfer screens can list a single officer's portfolio (`retrieve…ByLoanOfficerId`);
+- COB jobs and reschedule flows can grab only active loans (`retrieve…ActiveLoanAccountSummary`);
+- GLIM (Group Loan / Individual Monitoring) accounts can be drilled by GLIM account number;
+- GSIM (Group Savings / Individual Monitoring) details can be re-scoped to one parent savings account.
+
+## `AccountSummaryCollectionData`
+
+The DTO is a plain immutable record. The "primary" buckets describe the entity in question; the "member" buckets only fill in when the entity is a group/center and you want roll-ups of its client members.
+
+```java
+// fineract-provider/.../accountdetails/data/AccountSummaryCollectionData.java
+public class AccountSummaryCollectionData {
+    private final Collection<LoanAccountSummaryData> loanAccounts;
+    private final Collection<LoanAccountSummaryData> groupLoanIndividualMonitoringAccounts;
+    private final Collection<SavingsAccountSummaryData> savingsAccounts;
+    private final Collection<ShareAccountSummaryData> shareAccounts;
+    private final Collection<GuarantorAccountSummaryData> guarantorAccounts;
+
+    private final Collection<LoanAccountSummaryData> memberLoanAccounts;
+    private final Collection<SavingsAccountSummaryData> memberSavingsAccounts;
+    private final Collection<GuarantorAccountSummaryData> memberGuarantorAccounts;
+    private final Collection<WorkingCapitalLoanAccountSummaryData> workingCapitalLoanAccounts;
+    // ...
+}
+```
+
+Three constructors exist:
+
+1. **Client + working-capital flavour** — populates `loanAccounts`, `groupLoanIndividualMonitoringAccounts`, `savingsAccounts`, `shareAccounts`, `guarantorAccounts`, `workingCapitalLoanAccounts`.
+2. **Group flavour without GSIM** — populates the group's own loans/savings plus the `member*` collections for each client.
+3. **Group with GSIM** — adds the `groupLoanIndividualMonitoringAccounts` slot for shared schedules.
+
+A private helper, `defaultLoanAccountsIfEmpty`, returns `null` when there is nothing to serialize so the JSON stays compact:
+
+```java
+private Collection<LoanAccountSummaryData> defaultLoanAccountsIfEmpty(final Collection<LoanAccountSummaryData> collection) {
+    Collection<LoanAccountSummaryData> returnCollection = null;
+    if (collection != null && !collection.isEmpty()) {
+        returnCollection = collection;
+    }
+    return returnCollection;
+}
+```
+
+This matters when consuming `clients/{id}/accounts?fields=loanAccounts,savingsAccounts` — empty buckets are omitted, not serialized as `[]`.
+
+## JPA / JDBC implementation
+
+`AccountDetailsReadPlatformServiceJpaRepositoryImpl` is `@Service`-annotated and constructor-injected with a small toolbox:
+
+```java
+// fineract-provider/.../accountdetails/service/AccountDetailsReadPlatformServiceJpaRepositoryImpl.java
+@Service
+@AllArgsConstructor
+public class AccountDetailsReadPlatformServiceJpaRepositoryImpl implements AccountDetailsReadPlatformService {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final ClientReadPlatformService clientReadPlatformService;
+    private final GroupReadPlatformService groupReadPlatformService;
+    private final ColumnValidator columnValidator;
+    private final WorkingCapitalLoanApplicationReadPlatformService workingCapitalLoanApplicationReadPlatformService;
+```
+
+### Client summary
+
+`retrieveClientAccountDetails` first asserts the client exists, then fans out four queries (loans, GLIM loans, savings, active guarantor links):
+
+```java
+@Override
+public AccountSummaryCollectionData retrieveClientAccountDetails(final Long clientId) {
+    this.clientReadPlatformService.retrieveOne(clientId);
+    final String loanwhereClause = " where l.client_id = ?";
+    final String glimLoanClause  = " where l.client_id = ? and l.loan_type_enum=4";
+    final String savingswhereClause = " where sa.client_id = ? order by sa.status_enum ASC, sa.account_no ASC";
+    final String guarantorWhereClause = " where g.entity_id = ? and g.is_active = true order by l.account_no ASC";
+
+    final List<LoanAccountSummaryData> glimAccounts = retrieveLoanAccountDetails(glimLoanClause, new Object[] { clientId });
+    final List<LoanAccountSummaryData> loanAccounts = retrieveLoanAccountDetails(loanwhereClause, new Object[] { clientId });
+    // ... savings, shares, guarantors, working-capital loans
+}
+```
+
+Note the `loan_type_enum=4` filter for GLIM — that magic number maps to `AccountType.GLIM` in `fineract-core`.
+
+### Group summary
+
+`retrieveGroupAccountDetails(Long groupId)` performs the same fan-out for the group itself, plus a second pass over each client member to populate `memberLoanAccounts`, `memberSavingsAccounts`, `memberGuarantorAccounts`. The GSIM overload only swaps in the savings query so it scopes to a single parent GSIM id.
+
+### Row mappers
+
+Each "bucket" has a private `RowMapper<…SummaryData>` defined inline. The loan mapper hydrates a rich record covering status, timeline, currency, principal, in-arrears flag, original loan amount and product reference:
+
+```java
+final class LoanAccountSummaryDataMapper implements RowMapper<LoanAccountSummaryData> {
+    public String loanAccountSummarySchema() {
+        return "l.id as id, l.account_no as accountNo, l.external_id as externalId, "
+             + "l.product_id as productId, lp.name as productName, lp.short_name as shortProductName, "
+             + "l.loan_status_id as statusId, l.loan_type_enum as loanType, "
+             + "l.principal_amount as originalLoan, l.total_outstanding_derived as loanBalance, "
+             + "l.total_repayment_derived as amountPaid, l.loan_product_counter as loanCycle, "
+             + "l.submittedon_date as submittedOnDate, l.approvedon_date as approvedOnDate, "
+             + "l.expected_disbursedon_date as expectedDisbursementDate, l.disbursedon_date as actualDisbursementDate, "
+             + "l.expected_maturedon_date as expectedMaturityDate, l.closedon_date as closedOnDate, "
+             + "l.in_arrears_tolerance as inArrearsTolerance, lo.display_name as loanOfficerName, "
+             + "...";
+    }
+    // ...
+}
+```
+
+The savings and share mappers follow the same pattern. They reuse the public enumerations from the relevant subsystems (`LoanEnumerations`, `SavingsEnumerations`, `SharesEnumerations`) for status decoding so the response is consistent with calls into those subsystems directly.
+
+## REST surface
+
+There is no standalone `AccountDetailsApiResource`. The endpoints are mounted on the client and group resources:
+
+```java
+// fineract-provider/.../portfolio/client/api/ClientsApiResource.java
+@GET
+@Path("{clientId}/accounts")
+@Operation(summary = "Retrieve client accounts overview",
+           operationId = "retrieveAllClientAccounts",
+           description = "An example of how a loan portfolio summary can be provided. "
+                       + "This is requested in a specific use case of the community application.\n"
+                       + "It is quite reasonable to add resources like this to simplify User Interface development.\n"
+                       + "Example Requests:\n\n clients/1/accounts\n\n clients/1/accounts?fields=loanAccounts,savingsAccounts")
+@ApiResponse(responseCode = "200",
+             content = @Content(schema = @Schema(implementation = ClientsApiResourceSwagger.GetClientsClientIdAccountsResponse.class)))
+public String retrieveAssociatedAccounts(@PathParam("clientId") final Long clientId,
+                                         @Context final UriInfo uriInfo) {
+    return retrieveClientAccounts(clientId, null, uriInfo);
+}
+```
+
+An identical handler exists for `/v1/clients/external-id/{externalId}/accounts`. `retrieveClientAccounts(...)` resolves the user and delegates to `AccountDetailsReadPlatformService.retrieveClientAccountDetails(clientId)`, then serializes via `DefaultToApiJsonSerializer`. The `?fields=` query parameter is honoured by `ApiRequestParameterHelper` and causes the serializer to emit only the requested top-level buckets.
+
+The group/center side exposes:
+
+- `GET /v1/groups/{groupId}/accounts`
+- `GET /v1/groups/{groupId}/accounts?gsimId={id}`
+- `GET /v1/centers/{centerId}/accounts`
+
+All three resolve to the same service interface.
+
+## Sample response shape
+
+A successful `GET /v1/clients/1/accounts` returns a structure like:
+
+```json
+{
+  "loanAccounts": [
+    {
+      "id": 12,
+      "accountNo": "000000012",
+      "externalId": "LN-12",
+      "productId": 1,
+      "productName": "Standard Loan",
+      "status": { "id": 300, "code": "loanStatusType.active",  "value": "Active",  "active": true },
+      "loanType": { "id": 1, "code": "loanType.individual", "value": "Individual" },
+      "loanCycle": 1,
+      "timeline": { "submittedOnDate": [2024, 7, 1], "approvedOnDate": [2024, 7, 2], "actualDisbursementDate": [2024, 7, 3] },
+      "originalLoan": 1000.00,
+      "loanBalance": 750.00,
+      "amountPaid": 250.00,
+      "inArrears": false
+    }
+  ],
+  "savingsAccounts": [ ... ],
+  "shareAccounts": [ ... ],
+  "guarantorAccounts": [ ... ]
+}
+```
+
+Fields with no data are omitted thanks to the `defaultLoanAccountsIfEmpty` helper. Embedded enumerations (`status`, `loanType`, `depositType`, `currency`) follow the conventional `EnumOptionData`-style triple used everywhere in Fineract.
+
+## Filtering helpers
+
+Two helpers are used by the loan-officer reassignment flows in `loanaccount/service`:
+
+```java
+Collection<LoanAccountSummaryData> retrieveClientLoanAccountsByLoanOfficerId(Long clientId, Long loanOfficerId);
+Collection<LoanAccountSummaryData> retrieveGroupLoanAccountsByLoanOfficerId(Long groupId, Long loanOfficerId);
+```
+
+They produce `LoanAccountSummaryData` rows filtered by the assigned `loan_officer_id`, used when reassigning a loan officer to make sure the new officer is shown the loans that just landed in their book.
+
+`retrieveClientActiveLoanAccountSummary(clientId)` and `retrieveGroupActiveLoanAccountSummary(groupId)` restrict to `loan_status_id = 300` (active). These power the inputs into the [collection sheet](/portfolio/collection-sheet) generator and the [transfers](/portfolio/transfers) "what would we be moving?" preview.
+
+`retrieveLoanAccountDetailsByGroupIdAndGlimAccountNumber(groupId, glimAccount)` lists every individual sub-loan that hangs off a single GLIM parent account number — used by GLIM disbursement / repayment screens to show what the parent payment will be split into.
+
+## GLIM / GSIM in the summary
+
+The response shape changes when the entity is part of GLIM/GSIM:
+
+- **Client** — `loanAccounts` lists ordinary loans for the client, while `groupLoanIndividualMonitoringAccounts` exposes the GLIM child loans of any group(s) the client belongs to.
+- **Group** — the group constructor populates `memberLoanAccounts`, `memberSavingsAccounts`, `memberGuarantorAccounts` so the UI can render a "members and their books" table.
+- **Group + `gsimId`** — `retrieveGroupAccountDetails(groupId, gsimId)` restricts the savings list to a single GSIM parent.
+
+See [/loan/glim-group-loans](/loan/glim-group-loans) for the GLIM domain model and [/savings/overview](/savings/overview) for GSIM.
+
+## Working‑capital loans
+
+`AccountSummaryCollectionData` reserves a slot for `workingCapitalLoanAccounts`. The implementation calls `workingCapitalLoanApplicationReadPlatformService.findByClient(clientId)` and the result is exposed under the `workingCapitalLoanAccounts` JSON key. See [/working-capital-loan](/working-capital-loan) for the dedicated module.
+
+## Performance characteristics
+
+Every "summary" call performs roughly five JDBC `query` invocations against indexed columns (`m_loan.client_id`, `m_savings_account.client_id`, `m_share_account.client_id`, `m_guarantor.entity_id`, `m_working_capital_loan.client_id`). There is no caching layer — the implementation is intentionally light because:
+
+- the summary is the entry page for a client/group, so it must reflect the latest writes;
+- the per-bucket queries are bounded by the number of accounts a client has, which rarely exceeds tens of rows;
+- transactional reads happen under the user's office hierarchy (validated higher up in the security filter), so no extra `WHERE` clauses are needed here.
+
+If you add a sixth account type to the summary, follow the same pattern:
+
+1. Add a `…SummaryData` DTO in `accountdetails/data/`.
+2. Add a private `RowMapper` and a `retrieve…ForXxx` helper in the JPA impl.
+3. Add a field and constructor parameter to `AccountSummaryCollectionData` (apply `defaultIfEmpty` for consistent JSON omission).
+4. Wire it through `retrieveClientAccountDetails(...)` / `retrieveGroupAccountDetails(...)`.
+5. Update the JSON serializer keys allowed by `ApiRequestParameterHelper`'s `fields=` mechanism if you want the bucket to be opt-in.
+
+## Walkthrough: rendering a client profile page
+
+Concrete sequence used by the reference UI when an operator opens a client profile:
+
+1. `GET /v1/clients/{id}` — header fields (display name, status, office). Served by `ClientsApiResource.retrieveOne`.
+2. `GET /v1/clients/{id}/accounts` — fan-out summary. Served by `ClientsApiResource.retrieveAssociatedAccounts` → `AccountDetailsReadPlatformService.retrieveClientAccountDetails`.
+3. The UI uses `?fields=loanAccounts` (or any subset) when the operator only opens a specific tab to keep payload small.
+4. When the operator drills into a loan or savings row, the UI pivots to the dedicated `/v1/loans/{id}` or `/v1/savingsaccounts/{id}` calls — `AccountDetails` is only the index, not the source of truth for any individual account.
+
+When debugging a "missing account" complaint, the canonical script is to call this endpoint with no `?fields` filter, then compare the bucket contents against direct `SELECT` results on the underlying tables — the most common cause is an `office_hierarchy` scope mismatch on the calling user.
+
+## Performance tuning checklist
+
+If profiling shows this endpoint is hot:
+
+- Index `m_loan(client_id)`, `m_savings_account(client_id)`, `m_share_account(client_id)`, `m_guarantor(entity_id)` — these are present by default but verify after a custom migration.
+- The savings query carries an explicit `ORDER BY` on `status_enum`, `account_no` — make sure the composite index is in place.
+- For very large groups (1000+ members), the group flavour's per-member fan-out can dominate; consider caching at the API gateway level when the data is short-lived.
+
+## Extension example: adding `workingCapitalLoanAccounts`
+
+When working-capital loans were added, the code path expanded to look like this:
+
+```java
+final Collection<WorkingCapitalLoanAccountSummaryData> workingCapitalLoanAccounts =
+        this.workingCapitalLoanApplicationReadPlatformService.findByClient(clientId);
+return new AccountSummaryCollectionData(
+        loanAccounts,
+        glimAccounts,
+        savingsAccounts,
+        shareAccounts,
+        guarantorAccounts,
+        workingCapitalLoanAccounts);
+```
+
+The `AccountSummaryCollectionData` constructor was extended to carry the new field with a `defaultIfEmpty` helper so the bucket is omitted from JSON when empty — preserving wire compatibility for older callers that didn't request the new field.
+
+## Cross-references
+
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — shared `Office`, `Client`, `Group` references.
+- [/loan/loan-read-service](/loan/loan-read-service) — the canonical loan detail (this page only summarises).
+- [/savings/savings-read-service](/savings/savings-read-service) — the canonical savings detail.
+- [/portfolio/share-accounts](/portfolio/share-accounts) — the share-account summary fields here.
+- [/portfolio/collection-sheet](/portfolio/collection-sheet) — uses the active-loan helpers.
+- [/portfolio/transfers](/portfolio/transfers) — uses the by-officer helpers when reassigning books.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST view of the client/group accounts endpoints.

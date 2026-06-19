@@ -1,0 +1,374 @@
+---
+title: "Two-Factor Authentication Flow: Basic Auth, OTP, TFA Token"
+sidebarTitle: "2FA Login Flow"
+description: "Trace the Fineract twofactor profile login: HTTP Basic → /v1/twofactor delivery → POST /v1/twofactor (request OTP) → POST /v1/twofactor/validate → TFAccessToken on every subsequent call."
+---
+
+Apache Fineract's `twofactor` Spring profile enables a second authentication factor on top of regular HTTP Basic. After the user authenticates with username + password, every subsequent request must carry a `Fineract-Platform-TFA-Token` HTTP header whose value is a one-time TOTP-style code derived from an OTP that Fineract delivered to the user via SMS, email, or another channel. The enforcement is done by `TwoFactorAuthenticationFilter`, which sits in the Spring Security filter chain between the basic-auth filter and the application; OTP issuance and validation are done by `TwoFactorService` and the `/v1/twofactor*` REST endpoints. This page traces the entire login dance through the actual code.
+
+Source map:
+
+- `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/filter/TwoFactorAuthenticationFilter.java`
+- `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/service/TwoFactorService.java`
+- `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/api/TwoFactorApiResource.java`
+- `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/domain/TFAccessToken.java`
+- `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/constants/TwoFactorConstants.java`
+
+<Note>
+The 2FA filter is only added to the security filter chain when the `twofactor` Spring profile is active. With the default profile, every reference on this page is dormant — the filter is not constructed, the bean is not autowired, the `/v1/twofactor` endpoints are not routed. See [Two-Factor Auth](/security/two-factor-auth) for the configuration.
+</Note>
+
+## End-to-end sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant TBF as TenantAwareBasic<br/>AuthenticationFilter
+    participant DAP as DaoAuthentication<br/>Provider
+    participant T2F as TwoFactorAuthentication<br/>Filter
+    participant API as TwoFactorApiResource<br/>(@Path /v1/twofactor)
+    participant SVC as TwoFactorService
+    participant DEL as OTP delivery channel<br/>(SMS, email)
+    participant DB as m_twofactor_*<br/>tables
+    participant APP as Protected resource
+
+    Note over C,APP: ===== Step 1: Basic auth login =====
+    C->>TBF: POST /api/v1/authentication<br/>Authorization: Basic <user:pw><br/>Fineract-Platform-TenantId: default
+    TBF->>DAP: authenticate(UsernamePasswordToken)
+    DAP-->>TBF: AppUser (authenticated)
+    TBF->>T2F: chain.doFilter
+    T2F->>T2F: user.hasSpecificPermissionTo(BYPASS_TWOFACTOR)?<br/>true → skip (admin)
+    T2F->>T2F: header "Fineract-Platform-TFA-Token" present?<br/>no → chain.doFilter
+    T2F-->>C: 200 OK (with role+permissions)
+
+    Note over C,APP: ===== Step 2: List delivery methods =====
+    C->>TBF: GET /api/v1/twofactor<br/>Authorization: Basic <user:pw>
+    TBF->>DAP: authenticate
+    DAP-->>TBF: AppUser
+    TBF->>T2F: chain.doFilter
+    T2F->>T2F: no TFA token header → chain.doFilter (this URL is /v1/twofactor; no auth needed yet)
+    T2F->>API: getOTPDeliveryMethods(uriInfo)
+    API->>SVC: getDeliveryMethodsForUser(user)
+    SVC->>DB: SELECT m_twofactor_user_config<br/>JOIN m_email/m_mobile<br/>WHERE app_user_id = ?
+    SVC-->>API: List<OTPDeliveryMethod>
+    API-->>C: [{ name: "email", target: "u@bank" }, { name: "sms", target: "+254…" }]
+
+    Note over C,APP: ===== Step 3: Request OTP =====
+    C->>TBF: POST /api/v1/twofactor?deliveryMethod=email&extendedToken=false
+    TBF->>DAP: authenticate
+    TBF->>T2F: chain.doFilter
+    T2F->>T2F: no TFA token → chain.doFilter
+    T2F->>API: requestToken("email", false, uriInfo)
+    API->>SVC: createNewOTPToken(user, "email", false)
+    SVC->>SVC: generate random OTP, persist
+    SVC->>DB: INSERT INTO m_twofactor_access_token (user, otp_hash, valid_from, valid_to)
+    SVC->>DEL: send OTP to user's email
+    SVC-->>API: OTPRequest { metadata: { deliveryTarget, validForSeconds } }
+    API-->>C: 200 { deliveryTarget: "u@b…", validForSeconds: 300 }
+
+    Note over C,APP: ===== Step 4: Validate OTP, receive TFAccessToken =====
+    C->>TBF: POST /api/v1/twofactor/validate?token=123456
+    TBF->>DAP: authenticate
+    TBF->>T2F: chain.doFilter
+    T2F->>T2F: no TFA token → chain.doFilter
+    T2F->>API: validate("123456")
+    API->>SVC: createAccessTokenFromOTP(user, "123456")
+    SVC->>DB: verify OTP, derive TFAccessToken
+    SVC->>DB: UPDATE row: persist token, valid_from/valid_to (24h or extended)
+    SVC-->>API: TFAccessToken
+    API-->>C: { token: "eyJh…", validFrom, validTo }
+
+    Note over C,APP: ===== Step 5: Use TFA token =====
+    C->>TBF: GET /api/v1/loans/1<br/>Authorization: Basic <user:pw><br/>Fineract-Platform-TFA-Token: eyJh…
+    TBF->>DAP: authenticate
+    TBF->>T2F: chain.doFilter
+    T2F->>T2F: header present → fetchAccessTokenForUser(user, "eyJh…")
+    T2F->>SVC: fetchAccessTokenForUser(user, token)
+    SVC->>DB: SELECT m_twofactor_access_token WHERE token=? AND user=?
+    SVC-->>T2F: TFAccessToken (valid=true)
+    T2F->>T2F: add "TWOFACTOR_AUTHENTICATED" authority
+    T2F->>APP: chain.doFilter (with augmented Authentication)
+    APP-->>C: 200 OK
+```
+
+## Filter implementation
+
+`TwoFactorAuthenticationFilter` is the gate. Its full `doFilter`:
+
+```java
+public class TwoFactorAuthenticationFilter extends GenericFilterBean {
+
+    private final TwoFactorService twoFactorService;
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+
+        final HttpServletRequest  request  = (HttpServletRequest)  req;
+        final HttpServletResponse response = (HttpServletResponse) res;
+
+        SecurityContext context = SecurityContextHolder.getContext();
+        Authentication authentication = (context != null) ? context.getAuthentication() : null;
+
+        // Process two-factor only when user is authenticated
+        if (authentication != null && authentication.isAuthenticated()
+                && authentication.getPrincipal() instanceof AppUser) {
+            AppUser user = (AppUser) authentication.getPrincipal();
+            if (user == null) return;
+
+            if (!user.hasSpecificPermissionTo(TwoFactorConstants.BYPASS_TWO_FACTOR_PERMISSION)) {
+                // User can't bypass two-factor auth, check two-factor access token
+                String token = request.getHeader("Fineract-Platform-TFA-Token");
+                if (token != null) {
+                    TFAccessToken accessToken = twoFactorService.fetchAccessTokenForUser(user, token);
+                    if (accessToken == null || !accessToken.isValid()) {
+                        response.addHeader("WWW-Authenticate",
+                                "Basic realm=\"Fineract Platform API Two Factor\"");
+                        response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
+                                "Invalid two-factor access token provided");
+                        return;
+                    }
+                } else {
+                    // No token provided — let the request through (the application
+                    // layer enforces TWOFACTOR_AUTHENTICATED via @PreAuthorize where needed)
+                    chain.doFilter(req, res);
+                    return;
+                }
+            }
+
+            List<GrantedAuthority> updatedAuthorities = new ArrayList<>(authentication.getAuthorities());
+            updatedAuthorities.add(new SimpleGrantedAuthority("TWOFACTOR_AUTHENTICATED"));
+            context.setAuthentication(createUpdatedAuthentication(authentication, updatedAuthorities));
+        }
+        chain.doFilter(req, res);
+    }
+}
+```
+
+Decision table:
+
+| Condition                                                          | Branch                                                                                            | Result                                                                |
+|--------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `authentication` is null or not authenticated                      | Skip — leave to upstream filters / let the request through (it will 401 if it hits a secured URL) | No 2FA evaluation                                                     |
+| User has `BYPASS_TWOFACTOR` permission                              | Add `TWOFACTOR_AUTHENTICATED` immediately                                                         | Admin path                                                            |
+| No `Fineract-Platform-TFA-Token` header                            | `chain.doFilter` without adding `TWOFACTOR_AUTHENTICATED`                                          | Request reaches the resource but without the 2FA authority — protected resources will 403 |
+| Header present, `fetchAccessTokenForUser` returns null              | 401 with `WWW-Authenticate` realm                                                                  | Bad token                                                              |
+| Header present, token retrieved but `accessToken.isValid() == false`| 401                                                                                                | Expired / invalidated                                                  |
+| Header present, token valid                                         | Add `TWOFACTOR_AUTHENTICATED` to authorities, then `chain.doFilter`                                | Happy path                                                            |
+
+The filter rewraps the `Authentication`:
+
+```java
+private Authentication createUpdatedAuthentication(final Authentication currentAuthentication,
+                                                   final List<GrantedAuthority> updatedAuthorities)
+        throws ServletException {
+    if (currentAuthentication instanceof UsernamePasswordAuthenticationToken) {
+        return new UsernamePasswordAuthenticationToken(
+                currentAuthentication.getPrincipal(),
+                currentAuthentication.getCredentials(),
+                updatedAuthorities);
+    } else if (currentAuthentication instanceof FineractJwtAuthenticationToken) {
+        FineractJwtAuthenticationToken jwt = (FineractJwtAuthenticationToken) currentAuthentication;
+        return new FineractJwtAuthenticationToken(jwt.getToken(), updatedAuthorities,
+                (UserDetails) currentAuthentication.getPrincipal());
+    } else {
+        throw new ServletException("Unknown authentication type: " + currentAuthentication.getClass().getName());
+    }
+}
+```
+
+So the filter supports two authentication shapes:
+
+1. `UsernamePasswordAuthenticationToken` — the result of HTTP Basic via `TenantAwareBasicAuthenticationFilter`.
+2. `FineractJwtAuthenticationToken` — the OAuth2 path.
+
+Both get a new `TWOFACTOR_AUTHENTICATED` authority added.
+
+## REST endpoints (TwoFactorApiResource)
+
+The endpoints are all under `/v1/twofactor` and require an authenticated `AppUser` (the basic-auth filter must have populated the SecurityContext). They do **not** themselves require the `TWOFACTOR_AUTHENTICATED` authority — otherwise you'd have a chicken-and-egg problem getting the first token.
+
+```java
+@Path("/v1/twofactor")
+@Component
+public class TwoFactorApiResource {
+
+    @GET
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String getOTPDeliveryMethods(@Context final UriInfo uriInfo) {
+        AppUser user = context.authenticatedUser();
+        List<OTPDeliveryMethod> otpDeliveryMethods = twoFactorService.getDeliveryMethodsForUser(user);
+        return this.otpDeliveryMethodSerializer.serialize(otpDeliveryMethods);
+    }
+
+    @POST
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String requestToken(@QueryParam("deliveryMethod") final String deliveryMethod,
+            @QueryParam("extendedToken") @DefaultValue("false") boolean extendedAccessToken,
+            @Context final UriInfo uriInfo) {
+        final AppUser user = context.authenticatedUser();
+        final OTPRequest request = twoFactorService.createNewOTPToken(user, deliveryMethod, extendedAccessToken);
+        return this.otpRequestSerializer.serialize(request.getMetadata());
+    }
+
+    @Path("validate")
+    @POST
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String validate(@QueryParam("token") final String token) {
+        final AppUser user = context.authenticatedUser();
+        TFAccessToken accessToken = twoFactorService.createAccessTokenFromOTP(user, token);
+        return accessTokenSerializer.serialize(accessToken.toTokenData());
+    }
+
+    @Path("invalidate")
+    @POST
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String updateConfiguration(final String apiRequestBodyAsJson) {
+        final CommandWrapper commandRequest = new CommandWrapperBuilder()
+                .invalidateTwoFactorAccessToken().withJson(apiRequestBodyAsJson).build();
+        final CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+        return this.toApiJsonSerializer.serialize(result);
+    }
+}
+```
+
+| Method            | URL                                                | Purpose                                                                              |
+|-------------------|----------------------------------------------------|--------------------------------------------------------------------------------------|
+| `GET`             | `/api/v1/twofactor`                                | List delivery methods configured for the current user.                                |
+| `POST`            | `/api/v1/twofactor?deliveryMethod=email`           | Generate an OTP, deliver via the chosen channel; respond with non-sensitive metadata. |
+| `POST`            | `/api/v1/twofactor/validate?token=<otp>`           | Exchange OTP for `TFAccessToken`.                                                     |
+| `POST`            | `/api/v1/twofactor/invalidate`                     | Revoke the current `TFAccessToken` (logout-style).                                    |
+
+`extendedToken=true` extends the validity of the eventual `TFAccessToken` (configured by `twofactor.access-token-validity-time-extended`; default usually a week vs the regular 24h).
+
+## Service interface
+
+```java
+public interface TwoFactorService {
+
+    List<OTPDeliveryMethod> getDeliveryMethodsForUser(AppUser user);
+
+    OTPRequest createNewOTPToken(AppUser user, String deliveryMethodName, boolean extendedAccessToken);
+
+    TFAccessToken createAccessTokenFromOTP(AppUser user, String otpToken);
+
+    void validateTwoFactorAccessToken(AppUser user, String token);
+
+    TFAccessToken fetchAccessTokenForUser(AppUser user, String token);
+
+    TFAccessToken invalidateAccessToken(AppUser user, JsonCommand command);
+}
+```
+
+The default implementation is wired against:
+
+- `TwoFactorConfigurationService` — reads `c_configuration` for OTP length, OTP TTL, token TTL, extended token TTL, and the SMTP/SMS provider beans.
+- An `EmailOTPDeliveryService` and an `SMSOTPDeliveryService` (both implement `OTPDeliveryService` keyed by name).
+- `TwoFactorAccessTokenRepository` for persistence.
+
+The OTP and the eventual `TFAccessToken` are two different objects:
+
+| Concept             | Lifetime                       | Where stored                                                | Where surfaced                                |
+|---------------------|--------------------------------|-------------------------------------------------------------|-----------------------------------------------|
+| **OTP**             | seconds–minutes (e.g. 300s)    | `m_twofactor_access_token.token` (raw or hashed)             | Delivered via SMS/email to the user            |
+| **TFAccessToken**   | hours–days (24h or extended)   | Same table, separate row (or same row updated post-validate) | Returned by `POST /validate`; carried in header |
+
+`TFAccessToken.isValid()` returns `validFrom <= now <= validTo && !invalidated`.
+
+## The bypass permission
+
+`TwoFactorConstants.BYPASS_TWO_FACTOR_PERMISSION` is a `m_permission.code` value (typically `BYPASS_TWOFACTOR`). Any user role that includes this permission skips OTP entirely — the filter grants `TWOFACTOR_AUTHENTICATED` automatically. Typical use:
+
+- A super-admin role for emergency operations.
+- A "system" technical user for service-to-service calls within the trusted network.
+
+Inspect:
+
+```sql
+SELECT r.name, p.code
+  FROM m_role_permission rp
+  JOIN m_role r       ON rp.role_id = r.id
+  JOIN m_permission p ON rp.permission_id = p.id
+ WHERE p.code = 'BYPASS_TWOFACTOR';
+```
+
+## Tying it to URL security
+
+The filter only **adds** the `TWOFACTOR_AUTHENTICATED` authority — it does not by itself reject requests that lack it. URL-level enforcement is done in the security config (typically `SecurityConfig`) with rules like:
+
+```java
+http.authorizeHttpRequests(reg -> reg
+    .requestMatchers("/api/v1/authentication", "/api/v1/self/authentication").permitAll()
+    .requestMatchers("/api/v1/twofactor",      "/api/v1/twofactor/*").authenticated()    // only basic auth
+    .anyRequest().hasAuthority("TWOFACTOR_AUTHENTICATED"));                              // everything else
+```
+
+So the `/v1/twofactor*` endpoints accept a basic-auth-only Authentication, but every other URL requires the `TWOFACTOR_AUTHENTICATED` authority that only the filter can add — and only when a valid `Fineract-Platform-TFA-Token` is present (or the user has `BYPASS_TWOFACTOR`). See [Security Config](/security/security-config) and [Two-Factor Auth](/security/two-factor-auth) for the rule list.
+
+## Practical curl session
+
+```bash
+# 1. Sanity check that you can authenticate
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     https://localhost:8443/fineract-provider/api/v1/authentication \
+     -X POST -H "Content-Type: application/json" \
+     -d '{"username":"mifos","password":"password"}'
+
+# 2. List delivery methods configured for the user
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     https://localhost:8443/fineract-provider/api/v1/twofactor
+
+# 3. Request OTP via email
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     -X POST \
+     "https://localhost:8443/fineract-provider/api/v1/twofactor?deliveryMethod=email"
+# → {"deliveryMethod":"email","tokenLiveTimeInSec":300,"extendedAccessToken":false}
+
+# 4. Fetch OTP from the email inbox, then validate
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     -X POST \
+     "https://localhost:8443/fineract-provider/api/v1/twofactor/validate?token=987654"
+# → {"token":"…long opaque string…","validFrom":"…","validTo":"…"}
+
+# 5. Use the TFA token in every subsequent call
+TFA=…the token from step 4…
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     -H "Fineract-Platform-TFA-Token: $TFA" \
+     https://localhost:8443/fineract-provider/api/v1/clients
+
+# 6. (Optional) Invalidate the TFA token on logout
+curl -s -k -u mifos:password \
+     -H "Fineract-Platform-TenantId: default" \
+     -H "Fineract-Platform-TFA-Token: $TFA" \
+     -X POST \
+     -H "Content-Type: application/json" -d '{"token":"'"$TFA"'"}' \
+     https://localhost:8443/fineract-provider/api/v1/twofactor/invalidate
+```
+
+## Common pitfalls
+
+| Symptom                                                                                | Cause                                                                                              | Fix                                                                                  |
+|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| 401 on every authenticated call even with a token                                       | `twofactor` profile not active; the filter that adds the authority was never registered           | Restart with `SPRING_PROFILES_ACTIVE=twofactor`                                       |
+| 403 on `/api/v1/clients` even after `POST /v1/twofactor/validate` returned 200          | Header not forwarded; check capitalization (the filter calls `request.getHeader("Fineract-Platform-TFA-Token")` which is case-insensitive per Servlet spec, but proxies sometimes strip it) | Add the header at every hop; confirm with `tcpdump`/`mitmproxy`                       |
+| `getDeliveryMethodsForUser` returns empty                                               | User has no email or mobile populated in `m_appuser` and no `m_email`/`m_mobile` rows               | Add contact data; verify `OTPDeliveryService` providers are wired                     |
+| OTP email never arrives                                                                | SMTP not configured; `email.smtp.*` properties missing or invalid; provider returned silent failure| Inspect `external-services` config and SMTP logs                                      |
+| `Invalid two-factor access token provided` after a server restart                       | Token store is in-memory only; persisted token survives but signing/encoding key changed            | Persist tokens (the default repo does), but verify no in-memory cache is involved     |
+| Logged-in admin still hit by OTP prompt                                                 | Their role does not include `BYPASS_TWOFACTOR`                                                      | Assign the permission to the admin role: `INSERT INTO m_role_permission …`            |
+
+## Where the rate limiting / lockout lives
+
+The default `TwoFactorService` implementation enforces OTP retry limits and lockout via configuration in `c_configuration` (e.g. `twoFactor.otpRequestLimit`, `twoFactor.otpRequestLimitTimeRangeInMin`). Exceeding the limit returns a `TwoFactorAuthFailureException` translated to HTTP 400 with a problem-detail body. See [Two-Factor Auth](/security/two-factor-auth) for the configuration keys.
+
+## Cross-references
+
+- [Authentication Flow](/flows/authentication-flow) — the basic-auth login that precedes 2FA
+- [Two-Factor Auth](/security/two-factor-auth) — configuration of `c_configuration` settings
+- [Security Config](/security/security-config) — where the filter is registered in the chain
+- [Basic & Tenant Filters](/security/basic-and-tenant-filters) — the upstream filter that authenticates the user

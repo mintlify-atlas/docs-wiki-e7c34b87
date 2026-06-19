@@ -1,0 +1,389 @@
+---
+title: "Accounting Rules: Templated Manual Journal Entries"
+sidebarTitle: "Accounting Rules"
+description: "Templated manual JE postings in Apache Fineract — AccountingRule, AccountingTagRule, allowed debit/credit tags, validator, and write service."
+---
+
+Accounting rules are an abstraction layer on top of manual journal entries. An MFI's branch staff are not always accountants; instead of remembering which GL account to debit and which to credit for "End-of-day cash deposit to bank", they pick the named rule "EOD Cash Deposit" and just supply the amount. The rule fills in the rest. This page documents the `AccountingRule` and `AccountingTagRule` entities, the four configuration shapes a rule can take, the validator, the write service, the API resource, and how a rule is consumed at posting time.
+
+## Conceptual rule shapes
+
+A rule has two sides — debit and credit — and each side independently can be:
+
+1. **Pinned to a single GL account** (the user has no choice on this side).
+2. **Constrained to a tag (code-value)** — the user picks from any GL account carrying that tag. Optionally multiple tags can be allowed.
+
+That gives four combinations:
+
+| Debit side | Credit side | Use case |
+| --- | --- | --- |
+| Pinned account | Pinned account | "Branch closes a cash drawer to vault" — both sides are fixed. |
+| Pinned account | Tag-constrained | "Cash receipt from any of these income sources". |
+| Tag-constrained | Pinned account | "Disburse cash from main bank to any pre-approved expense category". |
+| Tag-constrained | Tag-constrained | Most flexible — both sides chosen from constrained sets. |
+
+Additional flags `allowMultipleCreditEntries` and `allowMultipleDebitEntries` permit *several* tag-constrained entries on each side, enabling compound journal entries.
+
+## Entity — `AccountingRule`
+
+```java
+@Entity
+@Table(name = "acc_accounting_rule", uniqueConstraints = {
+        @UniqueConstraint(columnNames = { "name" }, name = "accounting_rule_name_unique") })
+public class AccountingRule extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "name", nullable = false, length = 500)
+    private String name;
+
+    @ManyToOne
+    @JoinColumn(name = "office_id", nullable = true)
+    private Office office;
+
+    @ManyToOne
+    @JoinColumn(name = "debit_account_id", nullable = true)
+    private GLAccount accountToDebit;
+
+    @ManyToOne
+    @JoinColumn(name = "credit_account_id", nullable = true)
+    private GLAccount accountToCredit;
+
+    @Column(name = "description", nullable = true, length = 500)
+    private String description;
+
+    @Column(name = "system_defined", nullable = false)
+    private Boolean systemDefined;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "accountingRule",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    private List<AccountingTagRule> accountingTagRules = new ArrayList<>();
+
+    @Column(name = "allow_multiple_credits", nullable = false)
+    private boolean allowMultipleCreditEntries;
+
+    @Column(name = "allow_multiple_debits", nullable = false)
+    private boolean allowMultipleDebitEntries;
+    ...
+}
+```
+
+### Field reference
+
+| Field | Column | Notes |
+| --- | --- | --- |
+| `name` | `name` | Unique. Displayed in the rule picker. |
+| `office` | `office_id` | Optional — when set, only users belonging to that branch may use the rule. |
+| `accountToDebit` | `debit_account_id` | Pinned debit account or null. |
+| `accountToCredit` | `credit_account_id` | Pinned credit account or null. |
+| `description` | `description` | Free text. |
+| `systemDefined` | `system_defined` | Migration-installed rules cannot be edited or deleted. |
+| `accountingTagRules` | (`acc_rule_tags`) | The set of allowed tags per side. |
+| `allowMultipleCreditEntries` | `allow_multiple_credits` | Permits a compound credit. Only meaningful when the credit side is tag-constrained. |
+| `allowMultipleDebitEntries` | `allow_multiple_debits` | Same for debit side. |
+
+The entity exposes helpers used by the write service:
+
+```java
+public Set<AccountingTagRule> getAccountingTagRulesByType(final JournalEntryType type) {
+    final Set<AccountingTagRule> existedTags = new HashSet<>();
+    for (final AccountingTagRule accountingTagRule : this.accountingTagRules) {
+        if (accountingTagRule.getAccountType().equals(type.getValue())) {
+            existedTags.add(accountingTagRule);
+        }
+    }
+    return existedTags;
+}
+```
+
+## Entity — `AccountingTagRule`
+
+```java
+@Getter @Setter @NoArgsConstructor @Accessors(chain = true)
+@Entity
+@Table(name = "acc_rule_tags", uniqueConstraints = {
+        @UniqueConstraint(columnNames = { "acc_rule_id", "tag_id", "acc_type_enum" },
+                          name = "UNIQUE_ACCOUNT_RULE_TAGS") })
+public class AccountingTagRule extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "acc_rule_id", nullable = false)
+    private AccountingRule accountingRule;
+
+    @ManyToOne
+    @JoinColumn(name = "tag_id", nullable = false)
+    private CodeValue tagId;
+
+    @Column(name = "acc_type_enum", nullable = false)
+    private Integer accountType;
+
+    public static AccountingTagRule create(final CodeValue tagId, final Integer accountType) {
+        return new AccountingTagRule().setTagId(tagId).setAccountType(accountType);
+    }
+}
+```
+
+The `accountType` column holds `JournalEntryType.value()` — `1` for CREDIT, `2` for DEBIT. So `acc_rule_tags` stores triples `(rule, tag, side)`; the unique constraint forbids the same triple twice.
+
+The referenced `tag_id` is a `CodeValue` from one of the five tag code-lists: `AssetAccountTags`, `LiabilityAccountTags`, `EquityAccountTags`, `IncomeAccountTags`, `ExpenseAccountTags`. At posting time, the user picks any `GLAccount` whose `tag_id` is in the rule's allowed tag set for that side.
+
+## JSON input parameters
+
+`AccountingRuleJsonInputParams`:
+
+| Param | Notes |
+| --- | --- |
+| `name` | Required, max 100 chars. |
+| `officeId` | Required. |
+| `description` | Optional, max 500. |
+| `accountToDebit` | Optional FK to `acc_gl_account`. Mutually exclusive with `debitTags`. |
+| `accountToCredit` | Optional FK. Mutually exclusive with `creditTags`. |
+| `debitTags` | Optional array of `tag_id` longs. |
+| `creditTags` | Optional array. |
+| `allowMultipleDebitEntries` | Bool. Forced false when `accountToDebit` set. |
+| `allowMultipleCreditEntries` | Bool. Forced false when `accountToCredit` set. |
+| `systemDefined` | Set by migration only. |
+
+## Validator — `AccountingRuleCommandFromApiJsonDeserializer`
+
+The validator enforces the cardinality rules:
+
+```java
+public void validateForCreate(final String json) {
+    ...
+    final Long accountToDebitId = this.fromApiJsonHelper
+            .extractLongNamed(AccountingRuleJsonInputParams.ACCOUNT_TO_DEBIT.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.ACCOUNT_TO_DEBIT.getValue())
+            .value(accountToDebitId).ignoreIfNull().integerGreaterThanZero();
+
+    final Long accountToCreditId = this.fromApiJsonHelper
+            .extractLongNamed(AccountingRuleJsonInputParams.ACCOUNT_TO_CREDIT.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.ACCOUNT_TO_CREDIT.getValue())
+            .value(accountToCreditId).ignoreIfNull().integerGreaterThanZero();
+
+    final Long officeId = this.fromApiJsonHelper
+            .extractLongNamed(AccountingRuleJsonInputParams.OFFICE_ID.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.OFFICE_ID.getValue())
+            .value(officeId).notNull().integerGreaterThanZero();
+
+    final String name = this.fromApiJsonHelper.extractStringNamed(
+            AccountingRuleJsonInputParams.NAME.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.NAME.getValue())
+            .value(name).notBlank().notExceedingLengthOf(100);
+
+    ...
+    final String[] creditTags = this.fromApiJsonHelper
+            .extractArrayNamed(AccountingRuleJsonInputParams.CREDIT_ACCOUNT_TAGS.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.CREDIT_ACCOUNT_TAGS.getValue())
+            .value(creditTags).ignoreIfNull().arrayNotEmpty();
+    validateCreditOrDebitTagArray(creditTags, baseDataValidator,
+            AccountingRuleJsonInputParams.CREDIT_ACCOUNT_TAGS.getValue());
+
+    final String[] debitTags = this.fromApiJsonHelper
+            .extractArrayNamed(AccountingRuleJsonInputParams.DEBIT_ACCOUNT_TAGS.getValue(), element);
+    baseDataValidator.reset().parameter(AccountingRuleJsonInputParams.DEBIT_ACCOUNT_TAGS.getValue())
+            .value(debitTags).ignoreIfNull().arrayNotEmpty();
+    validateCreditOrDebitTagArray(debitTags, baseDataValidator,
+            AccountingRuleJsonInputParams.DEBIT_ACCOUNT_TAGS.getValue());
+
+    if (creditTags == null && accountToCreditId == null) {
+        // ... error: one of {creditTags, accountToCredit} required
+    }
+    if (debitTags == null && accountToDebitId == null) {
+        // ... error: one of {debitTags, accountToDebit} required
+    }
+}
+```
+
+Key constraints:
+
+- **Every side must be configured** — either by pinning an account or by supplying at least one tag.
+- **A tag array, if present, must be non-empty.**
+- **Office is required.**
+
+The mutual exclusion *pinned account XOR tags* is also enforced by the write service so that a stored rule never has both set on the same side.
+
+## Update behaviour
+
+`AccountingRule.update(JsonCommand)` is selective:
+
+```java
+} else if (paramName.equals(AccountingRuleJsonInputParams.ALLOW_MULTIPLE_CREDIT_ENTRIES.getValue())) {
+    if (this.accountToCredit == null) {
+        this.allowMultipleCreditEntries = newValue;
+    }
+} else if (paramName.equals(AccountingRuleJsonInputParams.ALLOW_MULTIPLE_DEBIT_ENTRIES.getValue())
+        && this.accountToDebit == null) {
+    this.allowMultipleDebitEntries = newValue;
+}
+```
+
+The "allow multiple" flags can only change when the side is *not* pinned to a single account — a pinned account by definition has exactly one entry.
+
+```java
+public void updateTags(final JournalEntryType type) {
+    final Set<AccountingTagRule> existedCreditTags = new HashSet<>();
+    final Set<AccountingTagRule> existedDebitTags = new HashSet<>();
+    for (final AccountingTagRule accountingTagRule : this.accountingTagRules) {
+        if (JournalEntryType.fromInt(accountingTagRule.getAccountType()).isCreditType()) {
+            existedCreditTags.add(accountingTagRule);
+        } else if (JournalEntryType.fromInt(accountingTagRule.getAccountType()).isDebitType()) {
+            existedDebitTags.add(accountingTagRule);
+        }
+    }
+
+    if (type.isCreditType()) {
+        this.accountingTagRules.retainAll(existedCreditTags);
+    } else if (type.isDebitType()) {
+        this.accountingTagRules.retainAll(existedDebitTags);
+    }
+}
+```
+
+`updateTags` is called before installing a new tag set for one side: it retains only the rules on the *other* side, ready for the new side's rules to be appended via `updateAccountingRuleForTags(...)`.
+
+## Repositories
+
+```java
+public interface AccountingRuleRepository
+        extends JpaRepository<AccountingRule, Long>,
+                JpaSpecificationExecutor<AccountingRule> { }
+```
+
+`AccountingRuleRepositoryWrapper` adds `findOneWithNotFoundDetection(Long)`.
+
+## Write service
+
+`AccountingRuleWritePlatformServiceJpaRepositoryImpl` (in `fineract-accounting`):
+
+- `createAccountingRule(JsonCommand)` — runs the validator, resolves `accountToDebit`, `accountToCredit`, `officeId`, builds `AccountingRule.fromJson(...)`, then walks `debitTags` and `creditTags` arrays creating `AccountingTagRule` rows.
+- `updateAccountingRule(Long, JsonCommand)` — partial update with the `updateTags` logic above.
+- `deleteAccountingRule(Long)` — refuses if `systemDefined`. Cascades to `AccountingTagRule` via JPA cascade.
+
+### Consumption at JE posting time
+
+The journal-entry write service handles a rule as follows (from `JournalEntryWritePlatformServiceJpaRepositoryImpl.createJournalEntry`):
+
+```java
+if (accountRuleId != null) {
+
+    final AccountingRule accountingRule = this.accountingRuleRepository.findById(accountRuleId)
+            .orElseThrow(() -> new AccountingRuleNotFoundException(accountRuleId));
+
+    if (accountingRule.getAccountToCredit() == null) {
+        if (journalEntryCommand.getCredits() == null) {
+            throw new JournalEntryInvalidException(GlJournalEntryInvalidReason.NO_DEBITS_OR_CREDITS, null, null, null);
+        }
+        if (journalEntryCommand.getDebits() != null) {
+            checkDebitOrCreditAccountsAreValid(accountingRule, journalEntryCommand.getCredits(),
+                    journalEntryCommand.getDebits());
+            checkDebitAndCreditAmounts(journalEntryCommand.getCredits(), journalEntryCommand.getDebits());
+        }
+
+        saveAllDebitOrCreditEntries(journalEntryCommand, office, paymentDetail, currencyCode, transactionDate,
+                journalEntryCommand.getCredits(), transactionId, JournalEntryType.CREDIT, referenceNumber,
+                externalAssetOwner);
+    } else {
+        final GLAccount creditAccountHead = accountingRule.getAccountToCredit();
+        validateGLAccountForTransaction(creditAccountHead);
+        validateDebitOrCreditArrayForExistingGLAccount(creditAccountHead, journalEntryCommand.getCredits());
+        saveAllDebitOrCreditEntries(journalEntryCommand, office, paymentDetail, currencyCode, transactionDate,
+                journalEntryCommand.getCredits(), transactionId, JournalEntryType.CREDIT, referenceNumber,
+                externalAssetOwner);
+    }
+
+    if (accountingRule.getAccountToDebit() == null) {
+        // symmetrically – tag-constrained debit side
+    } else {
+        final GLAccount debitAccountHead = accountingRule.getAccountToDebit();
+        validateGLAccountForTransaction(debitAccountHead);
+        validateDebitOrCreditArrayForExistingGLAccount(debitAccountHead, journalEntryCommand.getDebits());
+        saveAllDebitOrCreditEntries(...);
+    }
+}
+```
+
+The two checks:
+
+- `validateDebitOrCreditArrayForExistingGLAccount(GLAccount pinned, SingleDebitOrCreditEntryCommand[] entries)` — if the rule pins an account, the array must contain exactly one entry whose `glAccountId` matches. The user cannot route around the pinned side.
+- `checkDebitOrCreditAccountsAreValid(rule, credits, debits)` — if the side is tag-constrained, every entry's `glAccountId` must resolve to a GL account whose `tagId` is one of the allowed tags for that side.
+
+`checkDebitAndCreditAmounts` enforces total debits == total credits.
+
+## REST resource — `/v1/accountingrules`
+
+`AccountingRuleApiResource` (in `fineract-accounting`):
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/v1/accountingrules/template` | Returns offices, GL accounts grouped by type, and the tag code-lists. |
+| `GET` | `/v1/accountingrules` | List, scoped to user's offices. |
+| `GET` | `/v1/accountingrules/{accountingRuleId}` | Single. |
+| `POST` | `/v1/accountingrules` | Create. |
+| `PUT` | `/v1/accountingrules/{accountingRuleId}` | Update. |
+| `DELETE` | `/v1/accountingrules/{accountingRuleId}` | Delete (only non-system-defined). |
+
+The resource description sums up the use case verbatim:
+
+> It is typical scenario in MFI's that non accountants pass journal entries on a regular basis. […] An accounting rule can define any of the following abstractions:
+>
+> - A Simple journal entry where both the credit and debit account have been preselected
+> - A Simple journal entry where either credit or debit accounts have been limited to a pre-selected list of accounts
+> - A Compound journal entry where multiple debits and / or multiple credits may be made amongst a set of preselected list of accounts
+>
+> An accounting rule can also be optionally associated with a branch, so that only a particular Branch's users have access to the rule.
+
+## Command handlers
+
+| Handler | CommandType |
+| --- | --- |
+| `CreateAccountingRuleCommandHandler` | `ACCOUNTINGRULE` / `CREATE` |
+| `UpdateAccountingRuleCommandHandler` | `ACCOUNTINGRULE` / `UPDATE` |
+| `DeleteAccountingRuleCommandHandler` | `ACCOUNTINGRULE` / `DELETE` |
+
+## Read service
+
+`AccountingRuleReadPlatformServiceImpl.retrieveAllAccountingRules()` returns `Collection<AccountingRuleData>`, each carrying `id`, `officeId`, `officeName`, `name`, `description`, the two optional pinned account `GLAccountData` blocks, and lists of `AccountingTagRuleData` for credit and debit sides. Scope-filtering by user's permitted offices is applied at the query layer.
+
+`AccountingRuleData` is the DTO; `AccountingTagRuleData` holds `id`, `tag`, `transactionType`.
+
+## Exceptions
+
+| Class | Condition |
+| --- | --- |
+| `AccountingRuleNotFoundException` | 404 |
+| `AccountingRuleDuplicateException` | Name collision (unique constraint). |
+| `AccountingRuleInvalidException` | Validator-style data problem. |
+| `AccountingRuleDataException` | Inconsistent debit/credit configuration (both pinned and tagged). |
+| `AccountingRuleInvalidDeleteException` | Tried to delete a system-defined rule. |
+
+## Rule types — `AccountingRuleType` enum
+
+Not strictly tied to `AccountingRule` (these classify *products'* accounting modes), but worth listing for completeness because the API surfaces both:
+
+```java
+public enum AccountingRuleType {
+
+    NONE(1,             "accountingRuleType.none",            "No accounting"),
+    CASH_BASED(2,       "accountingRuleType.cash",            "Cash based accounting"),
+    ACCRUAL_PERIODIC(3, "accountingRuleType.accrual.periodic","Periodic accrual accounting"),
+    ACCRUAL_UPFRONT(4,  "accountingRuleType.accrual.upfront", "Upfront accrual accounting");
+}
+```
+
+This determines which slot set a loan / savings product's mappings draw from (cash vs accrual slot enum). See [Product to account mapping](/accounting/product-to-account-mapping#slot-enums-per-product-type).
+
+## Cross references
+
+<CardGroup cols={2}>
+  <Card title="Journal entries" icon="pen-to-square" href="/accounting/journal-entries">
+    Where rules are consumed at posting time.
+  </Card>
+  <Card title="GL accounts" icon="book" href="/accounting/gl-accounts">
+    Tag code-lists per GL account type.
+  </Card>
+  <Card title="Codes" icon="hashtag" href="/core/accounting-shared-domain">
+    `CodeValue` semantics — tags live in code-lists.
+  </Card>
+  <Card title="Accounting APIs" icon="terminal" href="/api/accounting-apis">
+    REST surface and example payloads.
+  </Card>
+</CardGroup>

@@ -1,0 +1,293 @@
+---
+title: "Loan Collateral Management Entities, REST and Release Lifecycle"
+sidebarTitle: "Collateral"
+description: "LoanCollateralManagement entity, ClientCollateralManagement, LoanCollateralManagement REST/services and the release-on-payment lifecycle in Fineract."
+---
+
+Fineract pledges client-owned assets (cattle, vehicles, land titles, machinery) against loans via a two-level model: **client collateral** describes the asset and stays attached to the client; **loan collateral** is a quantity-of-asset assignment pinned to one loan. The model lives in `fineract-loan` (loan side) and `fineract-core`/`fineract-loan` (client side). REST entry is `/v1/loan-collateral-management` (a small resource focused on read + delete); creation and update flow through the loan application command (`LOAN/CREATE`, `LOAN/UPDATE`) because collateral is supplied in the loan application body.
+
+Cross references: client-side collateral catalog and templates are in [Collateral management](/portfolio/collateral-management); guarantor-held funds (a related but distinct concept) are in [Guarantors](/loan/guarantors); loan REST handlers are in [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| `LoanCollateralManagement` entity | `portfolio/loanaccount/domain/LoanCollateralManagement.java` | `fineract-loan` |
+| Repo | `portfolio/loanaccount/domain/LoanCollateralManagementRepository.java` | `fineract-loan` |
+| `ClientCollateralManagement` entity | `portfolio/collateralmanagement/domain/ClientCollateralManagement.java` | `fineract-loan` |
+| `CollateralManagementDomain` (catalog) | `portfolio/collateralmanagement/domain/CollateralManagementDomain.java` | `fineract-loan` |
+| Loan-side DTO | `portfolio/loanaccount/data/LoanCollateralManagementData.java` | `fineract-loan` |
+| Client-side DTO | `portfolio/collateralmanagement/data/...` | `fineract-core` |
+| Mapper | `portfolio/loanaccount/mapper/LoanCollateralManagementMapper.java` | `fineract-loan` |
+| Input param names | `portfolio/collateralmanagement/api/CollateralManagementJsonInputParams.java` | `fineract-loan` |
+| REST resource | `portfolio/collateralmanagement/api/LoanCollateralManagementApiResource.java` | `fineract-provider` |
+| Write service | `portfolio/collateralmanagement/service/LoanCollateralManagementWritePlatformService(Impl)` | `fineract-provider` |
+| Read service | `portfolio/collateralmanagement/service/LoanCollateralManagementReadPlatformService(Impl)` | `fineract-provider` |
+| Not-found exception | `portfolio/collateralmanagement/exception/LoanCollateralManagementNotFoundException.java` | `fineract-provider` |
+
+## Domain model
+
+### `ClientCollateralManagement`
+
+Stored in `m_client_collateral_management`. Tracks what a client owns and the available quantity to pledge:
+
+```java
+@Entity @Table(name = "m_client_collateral_management")
+public class ClientCollateralManagement extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "quantity", nullable = false, scale = 5, precision = 20)
+    private BigDecimal quantity;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "client_id", nullable = false)
+    private Client client;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "collateral_id", nullable = false)
+    private CollateralManagementDomain collaterals;
+
+    @OneToMany(mappedBy = "clientCollateralManagement",
+               cascade = CascadeType.ALL, fetch = FetchType.LAZY)
+    private Set<LoanCollateralManagement> loanCollateralManagementSet = new HashSet<>();
+}
+```
+
+The `CollateralManagementDomain` row (in `m_collateral_management`) is the **catalog entry** — a tenant-defined collateral *type* (e.g. "Bull cattle", "Title deed") with `name`, `quality`, `unitPrice`, `pctToBase` (loan-to-value ratio) and `currency`. See [Collateral management](/portfolio/collateral-management) for catalog admin.
+
+### `LoanCollateralManagement`
+
+Stored in `m_loan_collateral_management`:
+
+```java
+@Entity @Table(name = "m_loan_collateral_management")
+public class LoanCollateralManagement extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "quantity", nullable = false, scale = 5, precision = 20)
+    private BigDecimal quantity;
+
+    @ManyToOne()
+    @JoinColumn(name = "transaction_id")
+    private LoanTransaction loanTransaction = null;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "loan_id", referencedColumnName = "id", nullable = false)
+    private Loan loan;
+
+    @Column(name = "is_released", nullable = false)
+    private boolean isReleased = false;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "client_collateral_id", nullable = false)
+    private ClientCollateralManagement clientCollateralManagement;
+}
+```
+
+Three lifecycle states emerge from these flags:
+
+| State | `isReleased` | `loanTransaction` |
+| --- | --- | --- |
+| Pledged (active) | `false` | `null` |
+| Released on payoff | `true` | `LoanTransaction` of type `REPAYMENT` / `CLOSE` |
+| Released on write-off / undo | `true` | `null` (or the relevant transaction) |
+
+Factory methods:
+
+```java
+public static LoanCollateralManagement from(final ClientCollateralManagement clientCollateralManagement,
+        final BigDecimal quantity) { ... }
+
+public static LoanCollateralManagement fromExisting(final ClientCollateralManagement clientCollateralManagement,
+        final BigDecimal quantity, final Loan loan, final LoanTransaction transaction, final Long id) { ... }
+```
+
+`fromExisting` re-hydrates an existing row when reapplying a previously-deleted row during loan modification undo flows.
+
+## Quantity invariants
+
+For each `ClientCollateralManagement c`:
+
+```text
+c.quantity ≥ sum over c.loanCollateralManagementSet of (lcm.quantity)  where lcm.isReleased = false
+```
+
+The `LoanApplicationValidator` enforces this when accepting a loan creation/modification body that includes a `collateral[]` array. Allocating more than is available raises `InsufficientCollateralQuantityException`.
+
+## REST surface
+
+The `LoanCollateralManagementApiResource` mounts at `/v1/loan-collateral-management` and only exposes **read** and **delete** — *creation* happens implicitly when a loan is created with a `collateral` array, and *update* happens on loan modification.
+
+```java
+@Path("/v1/loan-collateral-management")
+@Component
+@Tag(name = "Loan Collateral Management", ...)
+@RequiredArgsConstructor
+public class LoanCollateralManagementApiResource {
+
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final LoanCollateralManagementReadPlatformService loanCollateralManagementReadPlatformService;
+
+    @DELETE @Path("{id}")
+    public CommandProcessingResult deleteLoanCollateral(
+            @PathParam("loanId") final Long loanId,
+            @PathParam("id") final Long id) {
+        final CommandWrapper commandWrapper = new CommandWrapperBuilder()
+                .deleteLoanCollateral(loanId, id).build();
+        return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+    }
+
+    @GET @Path("{collateralId}")
+    public LoanCollateralResponseData getLoanCollateral(
+            @PathParam("collateralId") final Long collateralId) {
+        return this.loanCollateralManagementReadPlatformService
+                .getLoanCollateralResponseData(collateralId);
+    }
+}
+```
+
+<Note>
+The `loanId` parameter on `DELETE` is declared as a `@PathParam` but the `@Path` only contains `{id}` — in practice the loanId is required by `CommandWrapperBuilder.deleteLoanCollateral(loanId, id)` and the JAX-RS resource is invoked through a sub-resource locator on `LoansApiResource` (`/v1/loans/{loanId}/loan-collateral-management/{id}`) that supplies the loanId.
+</Note>
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/loan-collateral-management/{collateralId}` | Read one | `READ_LOAN_COLLATERAL` |
+| `DELETE` | `/loans/{loanId}/loan-collateral-management/{id}` | Delete (mark released) | `DELETE_LOAN_COLLATERAL` |
+
+Create / update come in via:
+
+```json
+POST /v1/loans
+{
+  ...
+  "collateral": [
+    { "clientCollateralId": 7, "quantity": 2.0 }
+  ]
+}
+```
+
+The loan application validator binds these rows into `Loan.loanCollateralManagement`, decrements the client collateral availability and persists.
+
+## `LoanCollateralManagementWritePlatformService`
+
+```java
+public interface LoanCollateralManagementWritePlatformService {
+    CommandProcessingResult deleteLoanCollateral(JsonCommand command);
+}
+```
+
+Implementation flow (`LoanCollateralManagementWritePlatformServiceImpl`):
+
+1. Resolve loan id and collateral id from `command.getLoanId()` / `command.entityId()`.
+2. Validate loan status — only `Submitted and pending approval` or `Approved` (pre-disbursement) allow deletion. After disbursement, removal goes through the loan modification command instead.
+3. Load `LoanCollateralManagement`; throw `LoanCollateralManagementNotFoundException` if missing.
+4. Restore the quantity to the parent `ClientCollateralManagement`.
+5. Delete the row.
+6. Fire a `LoanCollateralRemovedBusinessEvent` if registered.
+
+## `LoanCollateralManagementReadPlatformService`
+
+```java
+public interface LoanCollateralManagementReadPlatformService {
+    List<LoanCollateralManagement> getLoanCollaterals(Long loanId);
+    LoanCollateralResponseData getLoanCollateralResponseData(Long collateralId);
+    List<LoanCollateralResponseData> getLoanCollateralResponseDataList(Long loanId);
+}
+```
+
+`LoanCollateralResponseData` aggregates:
+
+| Field | Source |
+| --- | --- |
+| `id` | `LoanCollateralManagement.id` |
+| `quantity` | `LoanCollateralManagement.quantity` |
+| `client.id`, `client.displayName` | through `clientCollateralManagement.client` |
+| `collateral.id`, `collateral.name`, `collateral.basePrice` | through `clientCollateralManagement.collaterals` |
+| `total` | `quantity * basePrice` |
+| `totalCollateral` | `total * pctToBase / 100` (loan-to-value adjusted) |
+| `loanTransactionId` | non-null when released |
+
+The mapper `LoanCollateralManagementMapper` produces the first four; the read service computes `total` and `totalCollateral` after MapStruct returns.
+
+## Release lifecycle
+
+<Steps>
+<Step title="Pledge at submission">
+The loan application sends `collateral[]`. The application validator subtracts the quantity from `ClientCollateralManagement.quantity` and inserts a `LoanCollateralManagement` row with `is_released=false`, `transaction_id=null`.
+</Step>
+<Step title="Active loan">
+While the loan is active, the collateral row stays pledged; the client cannot pledge the same quantity against another loan.
+</Step>
+<Step title="Loan closure / write-off / undo">
+On `CLOSE`, `WRITEOFF` or `FORECLOSURE`, the loan domain service iterates `loan.loanCollateralManagement` and:
+
+- Sets `is_released = true`.
+- Optionally links the closing `LoanTransaction` for audit.
+- Restores availability on the parent `ClientCollateralManagement` (so the client can re-pledge).
+</Step>
+<Step title="Pre-disbursement deletion">
+While the loan is in `Submitted` or `Approved` state, calling `DELETE /v1/loans/{loanId}/loan-collateral-management/{id}` reverses the pledge entirely (deletes the row, restores quantity).
+</Step>
+</Steps>
+
+## Input parameter constants
+
+```java
+public enum CollateralManagementJsonInputParams {
+    NAME("name"), QUALITY("quality"), UNIT_PRICE("unitPrice"),
+    BASE_PRICE("basePrice"), PCT_TO_BASE("pctToBase"),
+    CURRENCY("currency"), QUANTITY("quantity"), CLIENT_COLLATERAL_ID("clientCollateralId"), ...
+}
+```
+
+These are referenced by both `ClientCollateralManagementWritePlatformServiceImpl` (for the catalog) and `LoanApplicationValidator` (for the loan's `collateral` array).
+
+## Comparison with the older "loan collateral" concept
+
+`Loan` also has a legacy `Set<LoanCollateral>` (`m_loan_collateral`) used by older Fineract installs. The newer `LoanCollateralManagement` model — backed by `ClientCollateralManagement` and the catalog — is the preferred path because it:
+
+- Tracks **availability** at the client level.
+- Lets the same physical asset be partially pledged across loans.
+- Provides a loan-to-value (`pctToBase`) used in collateral-coverage reporting.
+
+If both columns are populated, the newer model wins. Validation rejects mixing the two on the same loan.
+
+## Permissions
+
+| Operation | Permission |
+| --- | --- |
+| Read | `READ_LOAN_COLLATERAL` |
+| Create (via loan POST) | `CREATE_LOAN` (collateral validated alongside loan) |
+| Update (via loan PUT) | `UPDATE_LOAN` |
+| Delete | `DELETE_LOAN_COLLATERAL` |
+
+## Worked example
+
+1. Catalog setup ([Collateral management](/portfolio/collateral-management)):
+
+   ```bash
+   POST /v1/collateral-management {"name":"Bull","quality":"A","basePrice":1200,"pctToBase":70,"currency":"USD","unitPrice":1200}
+   ```
+
+2. Client pledges 4 head:
+
+   ```bash
+   POST /v1/clients/47/collaterals {"collateralId":3,"quantity":4.0}
+   ```
+
+3. Loan submitted with 2 of those head pledged:
+
+   ```bash
+   POST /v1/loans { ..., "collateral": [ {"clientCollateralId": 9, "quantity": 2.0} ] }
+   ```
+
+4. After approval, client's available quantity for `collateralId=3` is now 2.0 (4 - 2 pledged).
+5. Loan closes — `LoanCollateralManagement.isReleased` becomes true; client's available quantity goes back to 4.0.
+
+## Related pages
+
+- [Collateral management (catalog)](/portfolio/collateral-management)
+- [Loan overview](/loan/overview)
+- [Loan product API](/loan/loan-product-api)
+- [Guarantors](/loan/guarantors)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

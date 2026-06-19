@@ -1,0 +1,334 @@
+---
+title: "Dirty Jobs Drain: EXECUTE_DIRTY_JOBS and Mismatched Node Recovery"
+sidebarTitle: "Dirty Jobs"
+description: "How Fineract drains mismatched scheduled jobs with EXECUTE_DIRTY_JOBS, plus the broader pattern of recovery cron jobs that re-run rows the wrong node missed."
+---
+
+# Dirty Jobs
+
+In **Apache Fineract** terminology, a *dirty* job is a scheduled job whose run was attempted on the wrong node — i.e. a Spring Batch / Quartz job whose `ScheduledJobDetail.node_id` does not match the JVM's `fineract.node-id` and was therefore deliberately *not* executed when its trigger fired. The platform exposes a dedicated cron, **`EXECUTE_DIRTY_JOBS`**, that scans for these stranded rows and re‑queues them on the correct node. This page documents that drain job in detail and surveys the related "recovery" patterns in the codebase.
+
+The implementation lives in `org.apache.fineract.infrastructure.jobs.service.executealldirtyjobs` in `fineract-provider`.
+
+## How a job becomes "dirty"
+
+Every `ScheduledJobDetail` row carries a `node_id`. When a Quartz trigger fires on JVM A but the row's `node_id` is B (and not `0` which means "any"), `JobRegisterServiceImpl` refuses to run the job and flags the row:
+
+```java
+final String nodeIdStored = scheduledJobDetail.getNodeId().toString();
+if (nodeIdStored.equals(fineractProperties.getNodeId()) || nodeIdStored.equals("0")) {
+    // proceed
+} else {
+    scheduledJobDetail.setMismatchedJob(true);
+    this.schedularWritePlatformService.saveOrUpdate(scheduledJobDetail);
+    throw new JobNodeIdMismatchingException(nodeIdStored, fineractProperties.getNodeId());
+}
+```
+
+Two outcomes:
+
+1. `is_mismatched_job` is set to `true` in the `job` table.
+2. `JobNodeIdMismatchingException` is raised — Quartz records a failed run history row, but the business work is *not* performed.
+
+Mismatched rows accumulate when a cluster's job ownership is reassigned (e.g. after a pod failover) or when the operator manually re‑pins a row to a different node via `PUT /jobs/{jobId}` without updating the trigger. Left untouched they would silently skip their cron tick forever. `EXECUTE_DIRTY_JOBS` is the drain.
+
+## `EXECUTE_DIRTY_JOBS` — the drain cron
+
+```mermaid
+flowchart LR
+  Cron[Quartz fires<br/>EXECUTE_DIRTY_JOBS<br/>cron: 0 1 0 1/1 * ? *] --> Tasklet[ExecuteAllDirtyJobsTasklet]
+  Tasklet --> Repo[ScheduledJobDetailRepository.findAllMismatchedJobs(true)]
+  Repo --> List[List of dirty ScheduledJobDetail]
+  List --> Loop{For each row}
+  Loop --> Check{node_id == fineract.node-id?}
+  Check -- no --> Skip[skip — let the right node drain it]
+  Check -- yes --> Run[jobRegisterService.executeJobWithParameters(jobId, null)]
+  Run --> Reset[On success → is_mismatched_job=false<br/>via JobRegisterServiceImpl.executeJob path]
+  Skip --> Loop
+  Reset --> Loop
+  Loop --> Done([RepeatStatus.FINISHED])
+```
+
+### Implementation
+
+```java
+@Configuration
+public class ExecuteAllDirtyJobsConfig {
+
+    @Bean
+    protected Step executeAllDirtyJobsStep(ExecuteAllDirtyJobsTasklet executeAllDirtyJobsTasklet) {
+        return new StepBuilder(JobName.EXECUTE_DIRTY_JOBS.name(), jobRepository)
+                .tasklet(executeAllDirtyJobsTasklet, transactionManager).build();
+    }
+
+    @Bean
+    public Job executeAllDirtyJobsJob(ExecuteAllDirtyJobsTasklet executeAllDirtyJobsTasklet) {
+        return new JobBuilder(JobName.EXECUTE_DIRTY_JOBS.name(), jobRepository)
+                .start(executeAllDirtyJobsStep(executeAllDirtyJobsTasklet))
+                .incrementer(new RunIdIncrementer()).build();
+    }
+}
+```
+
+```java
+@RequiredArgsConstructor
+@Component
+public class ExecuteAllDirtyJobsTasklet implements Tasklet {
+
+    private final JobRegisterService jobRegisterService;
+    private final ScheduledJobDetailRepository scheduledJobDetailsRepository;
+    private final FineractProperties fineractProperties;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        List<ScheduledJobDetail> jobDetails = scheduledJobDetailsRepository.findAllMismatchedJobs(true);
+
+        for (ScheduledJobDetail scheduledJobDetail : jobDetails) {
+            if (scheduledJobDetail.getNodeId().toString().equals(fineractProperties.getNodeId())) {
+                jobRegisterService.executeJobWithParameters(scheduledJobDetail.getId(), null);
+            }
+        }
+        return RepeatStatus.FINISHED;
+    }
+}
+```
+
+Walk‑through:
+
+1. The tasklet asks the JPA repository for every job row with `is_mismatched_job = true`:
+
+   ```java
+   @Query("select jobDetail from ScheduledJobDetail jobDetail where jobDetail.isMismatchedJob = :isMismatchedJob")
+   List<ScheduledJobDetail> findAllMismatchedJobs(@Param("isMismatchedJob") boolean isMismatchedJob);
+   ```
+
+2. For each row, it checks whether the *current* JVM is the owner. The current JVM only drains its own rows; other nodes' rows are left for those nodes' `EXECUTE_DIRTY_JOBS` to pick up.
+
+3. Owned rows are re‑executed via `JobRegisterServiceImpl.executeJobWithParameters(jobId, null)` — the same path used by the manual `POST /jobs/{jobId}` API. That method:
+   - Re‑validates the node id (defence in depth).
+   - Builds the Quartz `JobDetail` and `JobDataMap`.
+   - Triggers a one‑off run on a temporary scheduler if needed (see [`/jobs/job-registry-and-stuck-jobs`](/jobs/job-registry-and-stuck-jobs)).
+   - On success, the calling flow within `JobRegisterServiceImpl` resets `setMismatchedJob(false)` when the job actually runs (the `startScheduler` resume path does the same for misfire flags).
+
+4. The tasklet always returns `RepeatStatus.FINISHED` — it's a one‑shot drain.
+
+### Default cron
+
+The `EXECUTE_DIRTY_JOBS` row is seeded with cron `0 1 0 1/1 * ? *` (every day at 00:01:00), placing it one minute after most of the daily back‑office work. Operators with multi‑node deployments often shorten this to `0 */30 * * * ?` (every 30 minutes) so failovers re‑converge faster.
+
+## The "is dirty?" lifecycle of a row
+
+| Event | `is_mismatched_job` | `next_run_time` |
+| --- | --- | --- |
+| Row created (Liquibase seed) | `false` | computed from cron |
+| Cron fires on wrong node | `true` | unchanged (Quartz already advanced it) |
+| `EXECUTE_DIRTY_JOBS` runs on owning node, successful drain | `false` | advanced by `executeJobWithParameters` and the next cron tick |
+| Operator reassigns `node_id` to a node where the job has never been registered | `true` (next time the cron fires) | unchanged |
+| Job remains stuck after retry threshold | `true` | unchanged — operator intervention needed |
+
+There is no automatic "give up" counter on dirty rows — `EXECUTE_DIRTY_JOBS` tries every owned mismatched job on every run. The cost is bounded: it is N JDBC reads plus N Quartz fires, where N is small in practice.
+
+## Related recovery patterns
+
+Beyond `EXECUTE_DIRTY_JOBS`, several other jobs and code paths repair "dirty" state:
+
+| Mechanism | Trigger | What it fixes |
+| --- | --- | --- |
+| `EXECUTE_DIRTY_JOBS` (this page) | Daily cron `0 1 0 1/1 * ? *` | `ScheduledJobDetail.is_mismatched_job=true` after node mismatch |
+| `StuckJobListener` + `StuckJobExecutorServiceImpl` | `ContextRefreshedEvent` on JVMs with `fineract.mode.batch-manager-enabled=true` | Spring Batch `BATCH_JOB_EXECUTION.status='STARTED'` rows left behind by a crash |
+| `JobRegisterServiceImpl.startScheduler()` misfire catch‑up | Operator resumes scheduler via `PUT /scheduler/start` | `ScheduledJobDetail.is_misfired=true` rows produced by `SchedulerTriggerListener.triggerMisfired` while suspended |
+| `UPDATE_NPA` | Daily cron | Loan rows whose `is_npa` flag drifted out of sync with their arrears state (see [`/jobs/npa-job`](/jobs/npa-job)) |
+| `ACCOUNTING_RUNNING_BALANCE_UPDATE` | Daily cron | Stale running‑balance columns on GL accounts |
+| `UPDATE_LOAN_ARREARS_AGEING` | Daily cron | Reconciles `m_loan_arrears_aging` to current dues |
+| `LOAN_DELINQUENCY_CLASSIFICATION` | Daily cron | Re‑tags loans whose delinquency bucket changed |
+
+The first three are *meta‑level* dirty drains — they repair the scheduler subsystem itself. The remaining four are *domain‑level* dirty drains: each is a back‑office cron whose entire purpose is to reconcile a derived/cached column with its source of truth.
+
+A useful mental model: **every Fineract cron job is either a `forward-progress` job (it computes new state) or a `reconciliation` job (it makes derived state agree with primary state).** `EXECUTE_DIRTY_JOBS` reconciles *the scheduler itself*.
+
+## Why the node id check is doubled
+
+Note the apparent redundancy:
+
+- The tasklet skips rows whose `node_id` is not the local node.
+- Yet `JobRegisterServiceImpl.executeJobWithParameters` *also* does the same check and throws `JobNodeIdMismatchingException` if it fails.
+
+The cheap pre‑check in the tasklet avoids spamming the exception path and the run history with `JobNodeIdMismatchingException` rows that would otherwise be generated when the drain hits a row owned by a different node. The defensive check inside `JobRegisterServiceImpl` remains because that method is also called from the inline job API where input validation can't be skipped.
+
+## Multi‑node deployment recipe
+
+A typical cluster of N Fineract pods would:
+
+1. Use `fineract.node-id` per pod (`node-id=1`, `node-id=2`, …) or `node-id=0` to mark a pod as a "fallback" that runs everything.
+2. Seed each `job` row with `node_id` matching the pod that should own it.
+3. Set `EXECUTE_DIRTY_JOBS.node_id = 0` so *every* pod runs the drain. Because each pod only re‑executes rows it owns, this is safe and self‑load‑balancing.
+4. Optionally shorten the drain cron to 30 minutes for faster reconvergence.
+
+If a pod whose owned jobs include `LOAN_COB` dies:
+
+- The other pods will start to record `is_mismatched_job=true` rows as triggers fire on them.
+- When the dead pod returns, its first `EXECUTE_DIRTY_JOBS` tick will drain everything it owns that was marked dirty in the interim.
+
+## Caveats
+
+- **No retry budget.** Unlike `StuckJobExecutorServiceImpl`, `EXECUTE_DIRTY_JOBS` does not cap retries. A deterministically failing job will be tried again on every drain.
+- **Cron timing race.** If `EXECUTE_DIRTY_JOBS` is scheduled before all daily jobs have fired, the daily jobs that haven't yet attempted a run won't be marked dirty yet. The default 00:01 setting is *after* most jobs, which is correct.
+- **Dirty drain is itself node‑pinned.** If `EXECUTE_DIRTY_JOBS.node_id` is pinned to a dead node, *no* drain runs anywhere. Always use `node_id=0` for this row in multi‑node setups.
+- **No business effect on cron mismatch.** The drain re‑runs jobs but does not re‑seat them in their owning scheduler; the underlying mismatch (e.g. wrong cron expression) must be fixed via `PUT /jobs/{jobId}` first.
+
+## Why no `STUCK_JOBS_RECOVERY` enum value?
+
+Historical Mifos‑era code paths exposed a `STUCK_JOBS_RECOVERY` cron job. The modern `JobName` enum does **not** include such a value — stuck Spring Batch jobs are recovered exclusively at JVM startup by `StuckJobListener`. The two patterns differ in scope:
+
+| Concern | Mechanism | Cron? |
+| --- | --- | --- |
+| Mismatched node ownership | `EXECUTE_DIRTY_JOBS` | Yes (daily) |
+| Stuck `BATCH_JOB_EXECUTION` (manager step `STARTED`) | `StuckJobListener` + `StuckJobExecutorServiceImpl` | No (startup‑only) |
+| Misfired Quartz triggers during pause | `JobRegisterServiceImpl.startScheduler()` | On resume |
+
+Operators who want continuous stuck‑job recovery (without restarting the JVM) typically run a periodic Kubernetes restart of one pod at a time. See [`/jobs/job-registry-and-stuck-jobs`](/jobs/job-registry-and-stuck-jobs).
+
+## Audit trail
+
+Each `EXECUTE_DIRTY_JOBS` run creates a regular `ScheduledJobRunHistory` row, plus one `BATCH_JOB_EXECUTION` row per re‑queued underlying job. The downstream jobs also generate their own history when they actually run. This means a clean operator audit looks like:
+
+1. `EXECUTE_DIRTY_JOBS` row at 00:01:00, status `Completed`.
+2. Several `UPDATE_NPA`, `POST_INTEREST_FOR_SAVINGS`, etc. rows at ~00:01:01 with `triggered_by = 'application'` (since the drain went through the application path, not Quartz cron).
+
+If a drain produces no downstream rows, all dirty jobs were on other nodes — confirm by querying `select * from job where is_mismatched_job = true`.
+
+## Domain‑level "dirty‑state" cron jobs
+
+The platform contains a number of reconciliation jobs that are not formally tagged "dirty" but which exist for the same reason: to repair derived state that has drifted from a source of truth. They are not under the `EXECUTE_DIRTY_JOBS` umbrella but understanding them as a category helps when triaging operational issues.
+
+### `UPDATE_LOAN_ARREARS_AGEING`
+
+Recomputes the `m_loan_arrears_aging` cache from the live schedule rows in `m_loan_repayment_schedule`. The cache is what `UPDATE_NPA`, the dashboards, and the reporting GL feeds read — if it is stale, every downstream computation is stale. The job is a single tasklet driven by raw SQL similar in spirit to `UPDATE_NPA` and lives in `fineract-loan/.../portfolio/loanaccount/jobs/updateloanarrearsageing`. Cron: `0 1 0 1/1 * ? *`.
+
+### `UPDATE_NPA`
+
+Reconciles `m_loan.is_npa` (see [`/jobs/npa-job`](/jobs/npa-job)). Depends on the arrears ageing being current.
+
+### `ACCOUNTING_RUNNING_BALANCE_UPDATE`
+
+Walks every GL account and recomputes the cached "running balance" column from the immutable journal entries. Useful as a cross‑check against the [`journal-entry-aggregation`](/jobs/aggregation-job) job which produces a different rollup.
+
+### `LOAN_DELINQUENCY_CLASSIFICATION`
+
+Re‑evaluates which delinquency bucket each loan belongs to. The buckets themselves can change (e.g. the operator adds a "60‑90 days" bucket), at which point this cron re‑classifies everything.
+
+### `UPDATE_TRIAL_BALANCE_DETAILS`
+
+Maintains the `acc_trial_balance` table from journal entries — same shape, different table.
+
+### `EXECUTE_DIRTY_JOBS` itself
+
+Reconciles the *scheduler* — the meta layer above all of the above.
+
+Together these jobs form Fineract's "nightly reconciliation tier". A useful operational dashboard tile is *"oldest BATCH_JOB_EXECUTION end_time across the reconciliation jobs"* — any value older than 24 hours indicates the tier is degraded.
+
+## Implementing a custom dirty drain
+
+A common extension is to introduce additional flags on `ScheduledJobDetail` (e.g. `is_long_running`) and write a tasklet similar to `ExecuteAllDirtyJobsTasklet` that drains rows with those flags. The pattern:
+
+```java
+@RequiredArgsConstructor
+@Component
+public class ExecuteAllLongRunningJobsTasklet implements Tasklet {
+
+    private final JobRegisterService jobRegisterService;
+    private final ScheduledJobDetailRepository scheduledJobDetailsRepository;
+    private final FineractProperties fineractProperties;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        List<ScheduledJobDetail> jobDetails = scheduledJobDetailsRepository.findAllByCriterion(...);
+        for (ScheduledJobDetail scheduledJobDetail : jobDetails) {
+            if (scheduledJobDetail.getNodeId().toString().equals(fineractProperties.getNodeId())) {
+                jobRegisterService.executeJobWithParameters(scheduledJobDetail.getId(), null);
+            }
+        }
+        return RepeatStatus.FINISHED;
+    }
+}
+```
+
+Pair it with:
+
+- A new `JobName` enum constant (e.g. `EXECUTE_LONG_RUNNING_JOBS`).
+- A `@Configuration` declaring the `Job` bean.
+- A Liquibase changeset inserting a row in `job` with `node_id = 0`.
+- A custom repository finder method returning the candidate `ScheduledJobDetail` rows.
+
+The key design discipline is the same as `EXECUTE_DIRTY_JOBS`: only the owning node may re‑execute a row, and each re‑execution flows through `JobRegisterServiceImpl.executeJobWithParameters` so audit and security context are correctly populated.
+
+## Comparison summary
+
+| Aspect | `EXECUTE_DIRTY_JOBS` | `StuckJobListener` | Misfire catch‑up |
+| --- | --- | --- | --- |
+| Lives in | Cron tasklet | Spring `ApplicationListener` | `JobRegisterServiceImpl.startScheduler` |
+| Triggered by | Quartz cron (daily) | `ContextRefreshedEvent` (boot) | Operator `PUT /scheduler/start` |
+| Target | `ScheduledJobDetail.is_mismatched_job=true` | `BATCH_JOB_EXECUTION.status='STARTED'` | `ScheduledJobDetail.is_misfired=true` |
+| Retry cap | None | `fineract.job.stuck-retry-threshold` | None |
+| Mode‑gated | No | Yes (`fineract.mode.batch-manager-enabled`) | No |
+| Cluster awareness | Yes (per‑node ownership) | Per‑tenant, single node | Per‑node ownership |
+| Multi‑tenant | Per‑tenant scheduler | Iterates all tenants | Per‑tenant |
+
+The three together form a defence‑in‑depth model: misfire catch‑up handles the *suspended* case, stuck recovery handles the *crashed* case, and dirty drain handles the *misrouted* case. Each can run while the others are also running without conflict.
+
+## Worked example
+
+A cluster has nodes `1`, `2`, `3`. The `ScheduledJobDetail` rows for `UPDATE_NPA` is `node_id=2`. Node `2` crashes at 23:59:30, just before the midnight crons.
+
+1. **00:00:00**. Quartz on nodes `1` and `3` fires their copies of the `UPDATE_NPA` trigger.
+2. `JobRegisterServiceImpl.executeJob` on each node checks `node_id`; node `1` sees `2` (mismatch) and node `3` sees `2` (mismatch).
+3. Both nodes mark `is_mismatched_job = true` on the row and throw `JobNodeIdMismatchingException`. Quartz logs a failed run.
+4. **00:01:00**. `EXECUTE_DIRTY_JOBS` fires on nodes `1`, `3`. It reads `findAllMismatchedJobs(true)`, sees the row, but skips it because `node_id != fineract.node-id`.
+5. **00:15:00**. Node `2` restarts. `StuckJobListener` runs (no stuck Spring Batch jobs because the previous run never started). Quartz wakes; `JobRegisterServiceImpl.scheduleJob` registers the row.
+6. **01:01:00** (next day's drain cron is 24 hours away, but operators can run an inline trigger). An admin calls `POST /v1/jobs/<EXECUTE_DIRTY_JOBS id>/inline` on node `2`. The tasklet finds the row, sees `node_id == 2`, calls `executeJobWithParameters`, which runs `UPDATE_NPA` synchronously. The row is unflagged.
+7. The same admin could equivalently wait until the next 00:01:00 cron and let it drain automatically.
+
+This is why dirty drains are a *passive* recovery: they need the right pod to come back online before they can do their work. Pair with a Kubernetes liveness probe that restarts the pod on crash to keep MTTR low.
+
+## Quick SQL to triage
+
+```sql
+-- Which rows are dirty right now?
+SELECT id, name, node_id, currently_running, next_run_time, error_log
+FROM job
+WHERE is_mismatched_job = true;
+
+-- Distribution by node
+SELECT node_id, COUNT(*)
+FROM job
+WHERE is_mismatched_job = true
+GROUP BY node_id;
+
+-- Recent dirty-drain run history
+SELECT j.name, h.start_time, h.end_time, h.status, h.trigger_type
+FROM job_run_history h
+JOIN job j ON j.id = h.job_id
+WHERE j.name = 'Execute All Dirty Jobs'
+ORDER BY h.start_time DESC
+LIMIT 10;
+```
+
+The first query identifies what needs cleaning; the second tells you which node should run when it next comes online; the third confirms the drain ran on schedule.
+
+## Anti‑patterns
+
+- **Disabling `EXECUTE_DIRTY_JOBS` permanently.** Removes the recovery for node mismatches; dirty rows accumulate silently. If you don't want it firing daily, set `node_id=0` and shorten the cron rather than disabling the row.
+- **Pinning `EXECUTE_DIRTY_JOBS` to one node.** Reduces fan‑out resilience — if that node is down, no drain runs anywhere. Always `node_id=0`.
+- **Bypassing the drain by manually calling `JobRegisterService.executeJobWithParameters` from a sidecar script.** Works but bypasses the audit trail (`BATCH_JOB_EXECUTION` rows from inline triggers still carry `triggered_by` correctly, but you lose the structured `EXECUTE_DIRTY_JOBS` run history entry that a SRE dashboard might rely on).
+- **Treating "dirty" as a failure state.** It isn't — it's an *unrouted* state. The cron itself didn't fail; it just fired on the wrong host. The drain is the recovery path.
+
+## See also
+
+- [`/jobs/overview`](/jobs/overview).
+- [`/jobs/job-registry-and-stuck-jobs`](/jobs/job-registry-and-stuck-jobs) — the parallel startup recovery for Spring Batch executions.
+- [`/jobs/scheduler-and-quartz`](/jobs/scheduler-and-quartz) — misfire handling, scheduler suspend/resume.
+- [`/jobs/scheduler-job-api`](/jobs/scheduler-job-api) — manual `PUT /jobs/{jobId}` and `POST /jobs/{jobId}` that drive ownership/cron changes.
+- [`/jobs/job-names-enumeration`](/jobs/job-names-enumeration) — row for `EXECUTE_DIRTY_JOBS`.
+- [`/jobs/npa-job`](/jobs/npa-job) — example of a domain‑level dirty drain.
+- [`/jobs/aggregation-job`](/jobs/aggregation-job) — another reconciliation cron with idempotency built in.
+- [`/core/jobs-domain`](/core/jobs-domain) — `ScheduledJobDetail` schema (`is_mismatched_job`, `is_misfired`, `node_id`).

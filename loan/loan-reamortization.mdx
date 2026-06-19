@@ -1,0 +1,380 @@
+---
+title: "Loan Re-Amortization Service, Preview and Undo"
+sidebarTitle: "Re-amortize"
+description: "LoanReAmortizationService, reAmortize / undoReAmortize commands, validator rules and the progressive-loan-only constraint in Fineract."
+---
+
+Re-amortization is Fineract's curative action for **progressive** loans (loans using `LoanScheduleType.PROGRESSIVE` with the `AdvancedPaymentScheduleTransactionProcessor`). Where re-aging rewrites the *tail* of the schedule by collapsing overdue installments into a new sequence, **re-amortize** redistributes the *outstanding balance* across the remaining future installments, optionally absorbing or waiving outstanding interest. This page documents the service (`LoanReAmortizationService`), the validator (`LoanReAmortizationValidator`), the preview endpoint, the command handlers and the eligibility rules.
+
+Cross references: re-aging is at [Re-aging and arrears](/loan/loan-arrears-and-reaging); the schedule API is at [Schedule API](/loan/loan-schedule-api); the loan REST handlers table is at [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| Service | `portfolio/loanaccount/service/reamortization/LoanReAmortizationService.java` | `fineract-provider` |
+| Validator | `portfolio/loanaccount/service/reamortization/LoanReAmortizationValidator.java` | `fineract-provider` |
+| Validator tests | `LoanReAmortizationValidatorTest.java` | `fineract-provider` |
+| Parameter entity | `portfolio/loanaccount/domain/reamortization/LoanReAmortizationParameter.java` | `fineract-loan` |
+| Interest-handling enum | `domain/reamortization/LoanReAmortizationInterestHandlingType.java` | `fineract-loan` |
+| API constants | `portfolio/loanaccount/api/LoanReAmortizationApiConstants.java` | `fineract-loan` |
+| Preview request DTO | `portfolio/loanaccount/api/request/ReAmortizationPreviewRequest.java` | `fineract-provider` |
+| Apply handler | `portfolio/loanaccount/handler/loan/reamortization/LoanReAmortizationCommandHandler.java` | `fineract-provider` |
+| Undo handler | `portfolio/loanaccount/handler/loan/reamortization/LoanUndoReAmortizationCommandHandler.java` | `fineract-provider` |
+| Business events | `infrastructure/event/business/domain/loan/reamortization/*` | `fineract-loan` |
+
+## Domain model
+
+### `LoanReAmortizationParameter`
+
+```java
+@Entity @Table(name = "m_loan_reamortization_parameter")
+public class LoanReAmortizationParameter extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @OneToOne @JoinColumn(name = "loan_transaction_id", nullable = false)
+    private LoanTransaction loanTransaction;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "interest_handling_type")
+    private LoanReAmortizationInterestHandlingType interestHandlingType;
+
+    @ManyToOne @JoinColumn(name = "reamortization_reason_cv_id")
+    private CodeValue reamortizationReason;
+}
+```
+
+One row per `LoanTransaction` of type `REAMORTIZE` — the transaction acts as the "anchor" and the parameter row stores the operator's intent.
+
+### `LoanReAmortizationInterestHandlingType`
+
+```java
+public enum LoanReAmortizationInterestHandlingType {
+    DEFAULT,
+    WAIVE_INTEREST,
+    EQUAL_AMORTIZATION_INTEREST_SPLIT,
+}
+```
+
+| Value | Behaviour |
+| --- | --- |
+| `DEFAULT` | Outstanding interest stays on the schedule's current period |
+| `WAIVE_INTEREST` | Outstanding payable interest waived; `WAIVE_INTEREST` transaction posted alongside |
+| `EQUAL_AMORTIZATION_INTEREST_SPLIT` | Outstanding interest is distributed evenly across all remaining future installments |
+
+## REST surface — `LoanTransactionsApiResource`
+
+Re-amortize and undo are routed through the generic transactions endpoint:
+
+```java
+public static final String REAMORTIZE = "reAmortize";
+public static final String UNDO_REAMORTIZE = "undoReAmortize";
+```
+
+```java
+} else if (CommandParameterUtil.is(commandParam, REAMORTIZE)) {
+    commandRequest = builder.reAmortize(resolvedLoanId).build();
+} else if (CommandParameterUtil.is(commandParam, UNDO_REAMORTIZE)) {
+    commandRequest = builder.undoReAmortize(resolvedLoanId).build();
+}
+```
+
+Endpoints:
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `POST` | `/v1/loans/{loanId}/transactions?command=reAmortize` | Apply re-amortization |
+| `POST` | `/v1/loans/{loanId}/transactions?command=undoReAmortize` | Undo last re-amortization |
+| `GET` | `/v1/loans/{loanId}/transactions/reamortization-preview` | Preview |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/transactions/reamortization-preview` | Preview by external id |
+
+### Preview
+
+```java
+@GET
+@Path("{loanId}/transactions/reamortization-preview")
+public LoanScheduleData previewReAmortizationSchedule(
+        @PathParam("loanId") final Long loanId,
+        @Valid @BeanParam final ReAmortizationPreviewRequest reAmortizationPreviewRequest) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return loanReAmortizationService.previewReAmortization(loanId, null, reAmortizationPreviewRequest);
+}
+
+@GET
+@Path("external-id/{loanExternalId}/transactions/reamortization-preview")
+public LoanScheduleData previewReAmortizationSchedule(
+        @PathParam("loanExternalId") final String loanExternalId,
+        @Valid @BeanParam final ReAmortizationPreviewRequest reAmortizationPreviewRequest) {
+    return loanReAmortizationService.previewReAmortization(null, loanExternalId, reAmortizationPreviewRequest);
+}
+```
+
+`ReAmortizationPreviewRequest` query parameters:
+
+| Parameter | Notes |
+| --- | --- |
+| `reAmortizationInterestHandling` | Enum value (see above), defaults to `DEFAULT` |
+| `locale`, `dateFormat` | for any date parsing (no dates in current API; reserved for future) |
+
+## `LoanReAmortizationService`
+
+```java
+@Service @RequiredArgsConstructor @Transactional
+public class LoanReAmortizationService {
+
+    public CommandProcessingResult reAmortize(final Long loanId, final JsonCommand command);
+    public CommandProcessingResult undoReAmortize(Long loanId, JsonCommand command);
+    public LoanScheduleData previewReAmortization(final Long loanId, final String loanExternalId,
+            final ReAmortizationPreviewRequest reAmortizationPreviewRequest);
+}
+```
+
+### `reAmortize` flow
+
+1. `reAmortizationValidator.validateReAmortize(command, loan)` — full rule check (see below).
+2. Snapshot the schedule into `LoanScheduleHistory`.
+3. Insert a `LoanTransaction(type = REAMORTIZE, date = today, amount = 0)`.
+4. Insert a `LoanReAmortizationParameter` row keyed to the transaction.
+5. Recompute the remaining schedule: divide the outstanding principal by `remaining installments`. Honour `interestHandlingType`:
+   - `DEFAULT` — interest already accrued stays as-is; new schedule uses interest by re-projecting against the regenerated principal flow.
+   - `WAIVE_INTEREST` — outstanding payable interest is waived first; the new schedule has zero outstanding interest on past installments.
+   - `EQUAL_AMORTIZATION_INTEREST_SPLIT` — interest distributed evenly across remaining installments.
+6. Fire `LoanReAmortizeBusinessEvent` + `LoanReAmortizeTransactionBusinessEvent`.
+
+### `undoReAmortize` flow
+
+1. Locate the most recent unreversed `REAMORTIZE` `LoanTransaction`.
+2. Validate that no later mutating transactions block the undo.
+3. Reverse the transaction (`LoanTransaction.reverse()`).
+4. Restore the schedule from `LoanScheduleHistory`.
+5. Fire `LoanUndoReAmortizeBusinessEvent` + `LoanUndoReAmortizeTransactionBusinessEvent`.
+
+## `LoanReAmortizationValidator`
+
+The validator's eligibility checks are the most distinctive part of this feature. Below are the exact rules excerpted from the source:
+
+### Schedule type must be progressive + advanced payment processor
+
+```java
+LoanScheduleType loanScheduleType = LoanScheduleType.valueOf(
+        loan.getLoanProductRelatedDetail().getLoanScheduleType().name());
+boolean isProgressiveSchedule = LoanScheduleType.PROGRESSIVE.equals(loanScheduleType);
+
+boolean isAdvancedPaymentSchedule = AdvancedPaymentScheduleTransactionProcessor.STRATEGY_CODE
+        .equals(loan.getTransactionProcessingStrategyCode());
+
+if (!(isProgressiveSchedule && isAdvancedPaymentSchedule)) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.supported.only.for.progressive.loan.schedule.type",
+        "Re-amortize is supported only for progressive loan schedule type and advanced payment allocation strategy");
+}
+```
+
+Re-amortization is **only** available for loans whose product uses the **progressive** schedule generator and the **advanced payment allocation** transaction processor. The cumulative-balance / declining-balance + standard processor paths use re-aging instead.
+
+### Date / maturity check
+
+```java
+if (DateUtils.isBefore(loan.getMaturityDate(), getBusinessLocalDate())) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.cannot.be.submitted.after.maturity",
+        "Re-amortize cannot be submitted after loan maturity date");
+}
+```
+
+### Loan status
+
+```java
+if (!loan.getStatus().isActive()) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.supported.only.for.active.loans",
+        "Re-amortize is supported only for active loans");
+}
+```
+
+### No same-day duplicate
+
+```java
+boolean reAmortizationAlreadyExistsForToday = loan.getLoanTransactions().stream()
+        .filter(LoanTransaction::isNotReversed)
+        .filter(t -> t.getTypeOf() == LoanTransactionType.REAMORTIZE)
+        .anyMatch(t -> DateUtils.isEqualBusinessDate(t.getTransactionDate()));
+if (reAmortizationAlreadyExistsForToday) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.reamortize.transaction.already.present.for.today",
+        "Re-amortize transaction already present for today");
+}
+```
+
+### Status guards
+
+```java
+if (loan.isChargedOff()) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.not.allowed.on.charged.off",
+        "Re-amortize is not allowed on charged-off loans");
+}
+
+if (loan.isContractTerminated()) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.not.allowed.on.contract.terminated",
+        "Re-amortize is not allowed on contract-terminated loans");
+}
+```
+
+### Must have an overdue amount
+
+```java
+if (overdueAmount.compareTo(ZERO) <= 0) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.no.overdue.amount",
+        "Re-amortize requires the loan to have an overdue amount");
+}
+```
+
+### Undo guards
+
+```java
+LoanTransaction lastReAmortize = ... ; // most recent REAMORTIZE not reversed
+if (lastReAmortize == null) {
+    throw new GeneralPlatformDomainRuleException(
+        "error.msg.loan.reamortize.reamortization.transaction.missing",
+        "No re-amortize transaction to undo");
+}
+```
+
+Plus standard JSON body parameter checks via `DataValidatorBuilder` (locale, dateFormat, optional reason, interest handling enum membership).
+
+### Combined validation entry points
+
+```java
+public void validateReAmortize(JsonCommand command, Loan loan);
+public void validateReAmortizePreview(Loan loan);
+public void validateUndoReAmortize(Loan loan);
+```
+
+`validateReAmortizePreview` runs the eligibility subset that does not require a JSON command (no `interestHandlingType` body), so previews can answer "would this loan even qualify?" before showing the form.
+
+## Command handlers
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "REAMORTIZE")
+public class LoanReAmortizationCommandHandler implements NewCommandSourceHandler {
+
+    private final LoanReAmortizationService loanReAmortizationService;
+    private final DataIntegrityErrorHandler dataIntegrityErrorHandler;
+
+    @Override
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        try {
+            return loanReAmortizationService.reAmortize(command.getLoanId(), command);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve,
+                    "loan.reAmortize", "Error while handling re-amortizing");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "LOAN", action = "UNDO_REAMORTIZE")
+public class LoanUndoReAmortizationCommandHandler implements NewCommandSourceHandler {
+    private final LoanReAmortizationService loanReAmortizationService;
+    @Override public CommandProcessingResult processCommand(JsonCommand command) {
+        return loanReAmortizationService.undoReAmortize(command.getLoanId(), command);
+    }
+}
+```
+
+## Request body shapes
+
+### Apply
+
+```json
+{
+  "reAmortizationInterestHandling": "EQUAL_AMORTIZATION_INTEREST_SPLIT",
+  "reasonCodeValueId": 27,
+  "note": "Customer hardship - distribute interest across future installments",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+### Undo
+
+```json
+{ "note": "Reversal requested by operations", "locale": "en", "dateFormat": "dd MMMM yyyy" }
+```
+
+### Preview
+
+`GET /v1/loans/{loanId}/transactions/reamortization-preview?reAmortizationInterestHandling=EQUAL_AMORTIZATION_INTEREST_SPLIT&locale=en&dateFormat=dd MMMM yyyy`
+
+Response is a `LoanScheduleData` showing the projected schedule with all rules applied. No transaction, no schedule history, no business event.
+
+## Permissions
+
+| Operation | Permission |
+| --- | --- |
+| Preview | `READ_LOAN` |
+| Apply | `CREATE_LOAN_REAMORTIZE` |
+| Undo | `CREATE_LOAN_UNDO_REAMORTIZE` |
+
+## Business events
+
+| Event | When |
+| --- | --- |
+| `LoanReAmortizeBusinessEvent` | After successful `reAmortize` (loan-level) |
+| `LoanReAmortizeTransactionBusinessEvent` | Same, per-transaction |
+| `LoanUndoReAmortizeBusinessEvent` | After successful `undoReAmortize` (loan-level) |
+| `LoanUndoReAmortizeTransactionBusinessEvent` | Same, per-transaction |
+
+## Worked example
+
+<Steps>
+<Step title="Confirm eligibility">
+The loan must be on a product configured with **progressive schedule** + **advanced payment allocation**. Confirm via `GET /v1/loans/{id}/transactions/reamortization-preview` — a non-eligible loan returns an error like `error.msg.loan.reamortize.supported.only.for.progressive.loan.schedule.type`.
+</Step>
+<Step title="Preview">
+```bash
+curl 'http://host/fineract-provider/api/v1/loans/123/transactions/reamortization-preview?reAmortizationInterestHandling=DEFAULT&locale=en&dateFormat=dd MMMM yyyy'
+```
+Inspect the resulting `LoanScheduleData` to make sure the new installments are acceptable.
+</Step>
+<Step title="Apply">
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"reAmortizationInterestHandling":"DEFAULT","locale":"en","dateFormat":"dd MMMM yyyy"}' \
+  'http://host/fineract-provider/api/v1/loans/123/transactions?command=reAmortize'
+```
+A `REAMORTIZE` `LoanTransaction` is inserted with amount 0; the schedule is rewritten.
+</Step>
+<Step title="Optionally undo">
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"locale":"en","dateFormat":"dd MMMM yyyy"}' \
+  'http://host/fineract-provider/api/v1/loans/123/transactions?command=undoReAmortize'
+```
+</Step>
+</Steps>
+
+## Comparison with re-aging
+
+| Aspect | Re-amortize | Re-age |
+| --- | --- | --- |
+| Required product | Progressive + advanced payment allocation | Any (subject to product policy) |
+| What changes | Distribution of outstanding balance across remaining installments | Length and start date of new sequence |
+| Inputs | Interest-handling enum only | Start date, frequency, # of installments, interest handling |
+| New schedule shape | Same number of remaining installments | Operator-chosen # installments |
+| Same-day duplicate | Forbidden | Forbidden |
+| Undo | `undoReAmortize` reverses transaction | `undoReAge` reverses transaction |
+
+## Related pages
+
+- [Re-aging and arrears](/loan/loan-arrears-and-reaging)
+- [Schedule API](/loan/loan-schedule-api)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan overview](/loan/overview)
+- [Loan APIs index](/api/loan-apis)

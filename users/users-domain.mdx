@@ -1,0 +1,480 @@
+---
+title: "Users Domain — AppUser, AppUserRepository and UserDomainService"
+sidebarTitle: "Users Domain"
+description: "Apache Fineract AppUser entity reference: every column, role aggregation, permission helpers, soft delete, password update, UsersApiResource endpoints and the JpaUserDomainService bootstrap flow."
+---
+
+In Apache Fineract the **`AppUser`** entity is the authentication subject — it is what `BasicAuthTenantDetailsFilter` resolves on every request, what `PlatformSecurityContext.authenticatedUser()` returns, and what every command handler interrogates with `validateHasPermissionTo(...)` before mutating state. `AppUser` belongs to exactly one `Office`, optionally references a `Staff` record, and holds a set of `Role`s whose aggregated `Permission` codes power Spring Security's `getAuthorities()`. This page documents the entity end-to-end (45+ columns and helpers), the slim `UserDomainService` contract, the `AppUserRepositoryWrapper`, and the seven `/v1/users` endpoints.
+
+<Note>
+The entity lives in `fineract-core/.../useradministration/domain/AppUser.java`. Repositories, the domain service and the JAX-RS resource live in `fineract-provider`. For the broader package map see [user administration domain](/core/useradministration-domain) and the [users overview](/users/overview).
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `AppUser` | `fineract-core` |
+| DTO | `AppUserData` | `fineract-core` |
+| Constants | `AppUserConstants` | `fineract-core` |
+| Repository | `AppUserRepository`, `AppUserRepositoryWrapper` | `fineract-provider` |
+| Domain service | `UserDomainService` / `JpaUserDomainService` | `fineract-provider` |
+| Read service | `AppUserReadPlatformService` / `…Impl` | `fineract-provider` |
+| Write service | `AppUserWritePlatformService` / `…JpaRepositoryImpl` | `fineract-provider` |
+| Validator | `UserDataValidator` | `fineract-provider` |
+| JAX-RS | `UsersApiResource` (`/v1/users`) | `fineract-provider` |
+| Handlers | `CreateUserCommandHandler`, `UpdateUserCommandHandler`, `DeleteUserCommandHandler`, `ChangeUserPasswordCommandHandler` | `fineract-provider` |
+| Exceptions | `UserNotFoundException`, `UsernameAlreadyExistsException`, `UsernameMustBeDifferentException` | `fineract-provider` |
+
+## `AppUser` entity
+
+```java
+// fineract-core/.../useradministration/domain/AppUser.java
+@Entity
+@Table(name = "m_appuser",
+       uniqueConstraints = @UniqueConstraint(columnNames = {"username"}, name = "username_org"))
+public class AppUser extends AbstractPersistableCustom<Long> implements PlatformUser {
+
+    @Column(name = "email",       nullable = false, length = 100) private String  email;
+    @Column(name = "username",    nullable = false, length = 100) private String  username;
+    @Column(name = "firstname",   nullable = false, length = 100) private String  firstname;
+    @Column(name = "lastname",    nullable = false, length = 100) private String  lastname;
+    @Column(name = "password",    nullable = false)                private String  password;
+    @Column(name = "nonexpired",  nullable = false)                private boolean accountNonExpired;
+    @Column(name = "nonlocked",   nullable = false)                private boolean accountNonLocked;
+    @Column(name = "failed_login_attempts", nullable = false)      private int     failedLoginAttempts;
+    @Column(name = "is_login_retries_enabled", nullable = false)   private boolean loginRetryLimitEnabled;
+    @Column(name = "nonexpired_credentials", nullable = false)     private boolean credentialsNonExpired;
+    @Column(name = "enabled",     nullable = false)                private boolean enabled;
+    @Column(name = "firsttime_login_remaining", nullable = false)  private boolean firstTimeLoginRemaining;
+    @Column(name = "is_deleted",  nullable = false)                private boolean deleted;
+
+    @ManyToOne @JoinColumn(name = "office_id", nullable = false)   private Office  office;
+    @ManyToOne @JoinColumn(name = "staff_id",  nullable = true)    private Staff   staff;
+
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(name = "m_appuser_role",
+        joinColumns        = @JoinColumn(name = "appuser_id"),
+        inverseJoinColumns = @JoinColumn(name = "role_id"))
+    private Set<Role> roles;
+
+    @Column(name = "last_time_password_updated")                   private LocalDate lastTimePasswordUpdated;
+    @Column(name = "password_never_expires", nullable = false)     private boolean   passwordNeverExpires;
+    @Column(name = "cannot_change_password")                       private Boolean   cannotChangePassword;
+    @Column(name = "password_reset_required", nullable = false)    private boolean   passwordResetRequired;
+}
+```
+
+### Column inventory
+
+| Column | Field | Type | Purpose |
+| --- | --- | --- | --- |
+| `username` | `username` | unique | Login identifier |
+| `password` | `password` | encoded BCrypt | Encoded by `PlatformPasswordEncoder` — see [password encoding](/security/password-encoding) |
+| `email` | `email` | `NOT NULL` | Used by the auto-generated-password mailer |
+| `firstname`, `lastname` | first/last name | `NOT NULL` | Combined with optional `staff.displayName` for UI |
+| `enabled` | `enabled` | bool | Standard Spring Security flag |
+| `nonexpired`, `nonlocked`, `nonexpired_credentials` | three booleans | bool | Spring Security `UserDetails` flags |
+| `failed_login_attempts` | `failedLoginAttempts` | int | Counter incremented by `registerFailedLoginAttempt(...)` |
+| `is_login_retries_enabled` | `loginRetryLimitEnabled` | bool | Whether the counter actually locks the account |
+| `firsttime_login_remaining` | `firstTimeLoginRemaining` | bool | Set to true on create; cleared on first password update |
+| `is_deleted` | `deleted` | bool | Soft delete marker |
+| `office_id` | `office` | FK | Mandatory home office — drives row-level scope |
+| `staff_id` | `staff` | FK | Optional link to a `Staff` row |
+| `m_appuser_role` join table | `roles` | `Set<Role>` | EAGER loaded — feeds `getAuthorities()` |
+| `last_time_password_updated` | `lastTimePasswordUpdated` | date | Drives expiry policy in the password module |
+| `password_never_expires` | `passwordNeverExpires` | bool | Skip expiry checks for service accounts |
+| `cannot_change_password` | `cannotChangePassword` | bool? | Disables `/v1/users/{id}/pwd` for managed identities |
+| `password_reset_required` | `passwordResetRequired` | bool | Forces a password change at next login |
+
+### Construction (`fromJson`)
+
+The static factory consumed by `CreateUserCommandHandler`:
+
+```java
+public static AppUser fromJson(final Office userOffice, final Staff linkedStaff,
+                               final Set<Role> allRoles, final JsonCommand command) {
+    final String username = command.stringValueOfParameterNamed("username");
+    String password       = command.stringValueOfParameterNamed("password");
+    final Boolean sendPasswordToEmail = command.booleanObjectValueOfParameterNamed("sendPasswordToEmail");
+
+    if (sendPasswordToEmail) {
+        password = new RandomPasswordGenerator(13).generate();
+    }
+
+    boolean passwordNeverExpire = false;
+    if (command.parameterExists(AppUserConstants.PASSWORD_NEVER_EXPIRES)) {
+        passwordNeverExpire = command.booleanPrimitiveValueOfParameterNamed(AppUserConstants.PASSWORD_NEVER_EXPIRES);
+    }
+
+    final boolean userEnabled               = true;
+    final boolean userAccountNonExpired     = true;
+    final boolean userCredentialsNonExpired = true;
+    final boolean userAccountNonLocked      = true;
+    final boolean cannotChangePassword      = false;
+    boolean loginRetryLimitEnabled          = false;
+    if (command.parameterExists(AppUserConstants.IS_LOGIN_RETRIES_ENABLED)) {
+        loginRetryLimitEnabled = command.booleanPrimitiveValueOfParameterNamed(AppUserConstants.IS_LOGIN_RETRIES_ENABLED);
+    }
+
+    // dummy-authority Spring Security User used only to carry the encoded password forward
+    final Collection<SimpleGrantedAuthority> authorities = new ArrayList<>();
+    authorities.add(new SimpleGrantedAuthority("DUMMY_ROLE_NOT_USED_OR_PERSISTED_TO_AVOID_EXCEPTION"));
+    final User user = new User(username, password, userEnabled, userAccountNonExpired,
+                               userCredentialsNonExpired, userAccountNonLocked, authorities);
+
+    final String email     = command.stringValueOfParameterNamed("email");
+    final String firstname = command.stringValueOfParameterNamed("firstname");
+    final String lastname  = command.stringValueOfParameterNamed("lastname");
+
+    final AppUser appUser = new AppUser(userOffice, user, allRoles, email, firstname, lastname,
+                                        linkedStaff, passwordNeverExpire, cannotChangePassword);
+    appUser.updateLoginRetryLimitEnabled(resolveLoginRetryLimitEnabled(username, loginRetryLimitEnabled));
+    return appUser;
+}
+```
+
+Key points:
+
+- When `sendPasswordToEmail = true` the body's `password` is discarded and a `RandomPasswordGenerator(13)` value is used — that value flows through `JpaUserDomainService` and is e-mailed before being encoded.
+- The dummy `User` instance is a side-effect of the Spring Security 5 `UserBuilder` API requiring at least one authority on construction; the dummy is never persisted.
+- `firstTimeLoginRemaining` is initialised to `true` and only cleared in `updatePassword(String)`.
+
+### Update flow
+
+`update(JsonCommand, PlatformPasswordEncoder)` diffs every editable field. The method refuses to rename the **system user**:
+
+```java
+if (command.isChangeInStringParameterNamed("username", this.username)) {
+    if (isSystemUser()) {
+        throw new NoAuthorizationException("User name of current system user may not be modified");
+    }
+    // …
+}
+
+public boolean isSystemUser() {
+    // TODO Determine system user by ID not by user name
+    return this.username.equals(AppUserConstants.SYSTEM_USER_NAME); // "system"
+}
+```
+
+`AppUserConstants` exposes the magic ids:
+
+```java
+public static final String SYSTEM_USER_NAME = "system";
+public static final Long   ADMIN_USER_ID    = 1L;
+public static final Long   SYSTEM_USER_ID   = 2L;
+```
+
+### Password change
+
+There are two paths into a password write — both end in `updatePassword(String encoded)`:
+
+```java
+public Map<String, Object> changePassword(final JsonCommand command, final PlatformPasswordEncoder encoder) {
+    final Map<String, Object> actualChanges = new LinkedHashMap<>(1);
+    updatePassword(command, encoder, actualChanges);
+    return actualChanges;
+}
+
+public void updatePassword(final String encodePassword) {
+    if (Boolean.TRUE.equals(cannotChangePassword)) {
+        throw new NoAuthorizationException("Password of this user may not be modified");
+    }
+    this.password = encodePassword;
+    this.firstTimeLoginRemaining = false;
+    this.lastTimePasswordUpdated = DateUtils.getBusinessLocalDate();
+}
+```
+
+The `command`-flavoured variant uses `JsonCommand.isChangeInPasswordParameterNamed(...)` which delegates back to the encoder so the comparison happens **after** salting — see [password policy](/users/password-policy).
+
+### Soft delete
+
+```java
+public void delete() {
+    if (isSystemUser()) {
+        throw new NoAuthorizationException("User configured as the system user cannot be deleted");
+    }
+    this.deleted = true;
+    this.enabled = false;
+    this.accountNonExpired = false;
+    this.firstTimeLoginRemaining = true;
+    this.username = getId() + "_DELETED_" + this.username; // free up the unique constraint
+    this.roles.clear();
+}
+```
+
+The username is prefixed with `<id>_DELETED_` so the unique constraint is released and a new user can re-use the original username.
+
+### Login retry counter
+
+```java
+public void registerFailedLoginAttempt(int maxRetries) {
+    if (!this.loginRetryLimitEnabled) return;
+    this.failedLoginAttempts = this.failedLoginAttempts + 1;
+    if (maxRetries > 0 && this.failedLoginAttempts >= maxRetries) {
+        this.accountNonLocked = false;
+    }
+}
+
+public void resetFailedLoginAttempts() { this.failedLoginAttempts = 0; }
+```
+
+Called by `BasicAuthTenantDetailsFilter` on a 401 and again with success to reset. The `maxRetries` ceiling is read from global configuration `login-attempt-frequency` (see [configuration properties](/core/configuration-properties)).
+
+### Permission helpers
+
+`AppUser` exposes a hierarchy of validation methods that every JAX-RS resource calls. The base is `validateHasPermission(prefix, resourceType)`:
+
+```java
+private void validateHasPermission(final String prefix, final String resourceType) {
+    final String authorizationMessage = "User has no authority to " + prefix + " " + resourceType.toLowerCase() + "s";
+    final String matchPermission = prefix + "_" + resourceType.toUpperCase();
+
+    if (!hasNotPermissionForAnyOf("ALL_FUNCTIONS", "ALL_FUNCTIONS_READ", matchPermission)) {
+        return;
+    }
+    throw new NoAuthorizationException(authorizationMessage);
+}
+```
+
+Notice the **always-allow** roles: `ALL_FUNCTIONS` (super-admin) and `ALL_FUNCTIONS_READ` (read-only super-admin). These short-circuit every permission check.
+
+| Public method | Effective check |
+| --- | --- |
+| `validateHasReadPermission(resource)` | `READ_<RESOURCE>` |
+| `validateHasCreatePermission(resource)` | `CREATE_<RESOURCE>` |
+| `validateHasUpdatePermission(resource)` | `UPDATE_<RESOURCE>` |
+| `validateHasDeletePermission(resource)` | `DELETE_<RESOURCE>` |
+| `validateHasPermissionTo(code)` | Any specific code |
+| `validateHasPermissionTo(function, allowedPermissions)` | At least one of a list |
+| `validateHasCheckerPermissionTo(function)` | `<FUNCTION>_CHECKER` or `CHECKER_SUPER_USER` |
+| `validateHasReadPermission(function, userId)` | Self-read exempted from `READ_USER` if `userId == self` |
+
+The self-read carve-out lets every user read their own `/v1/users/{self}` row without holding `READ_USER`.
+
+### `getAuthorities()` and `PlatformUser`
+
+```java
+@Override
+public Collection<GrantedAuthority> getAuthorities() {
+    final List<GrantedAuthority> grantedAuthorities = new ArrayList<>();
+    for (final Role role : this.roles) {
+        for (final Permission permission : role.getPermissions()) {
+            grantedAuthorities.add(new SimpleGrantedAuthority(permission.getCode()));
+        }
+    }
+    return grantedAuthorities;
+}
+```
+
+Implementing `PlatformUser` from `infrastructure.security.domain` is what lets Spring Security inject the entity directly into the security context — no DTO mapping at the security layer.
+
+### Office hierarchy helpers (used by row-level filters)
+
+```java
+public boolean officeInHierarchy(Long officeId)        { … }   // ".1.5.12." LIKE ".1.5.%"
+public String  officeHierarchy()                       { return this.office.getHierarchy(); }
+public boolean validateAccessToReportingHierarchy(...) { … }
+```
+
+These pass through to `Office.hierarchy` — see [offices](/organisation/offices).
+
+## `AppUserRepositoryWrapper`
+
+```java
+@Service
+public class AppUserRepositoryWrapper {
+    public AppUser findOneWithNotFoundDetection(final Long id) {
+        return this.repository.findById(id).orElseThrow(() -> new UserNotFoundException(id));
+    }
+
+    public AppUser fetchSystemUser() {
+        return this.repository.findById(AppUserConstants.SYSTEM_USER_ID)
+            .orElseThrow(() -> new UserNotFoundException(AppUserConstants.SYSTEM_USER_ID));
+    }
+}
+```
+
+The system user (id `2L`) is what the COB jobs run as — every scheduled job sets the security context to this user before invoking handlers so audit trails carry a non-null `createdby_id`.
+
+## `UserDomainService` / `JpaUserDomainService`
+
+```java
+public interface UserDomainService {
+    void create(AppUser appUser, Boolean sendPasswordToEmail);
+}
+```
+
+The single-method contract is implemented by `JpaUserDomainService`:
+
+```java
+@Transactional
+@Override
+public void create(final AppUser appUser, final Boolean sendPasswordToEmail) {
+    generateKeyUsedForPasswordSalting(appUser);          // first save → assigns id
+
+    final String unencodedPassword = appUser.getPassword();
+    final String encodePassword    = this.applicationPasswordEncoder.encode(appUser);
+    appUser.updatePassword(encodePassword);
+
+    this.userRepository.saveAndFlush(appUser);
+
+    if (sendPasswordToEmail.booleanValue()) {
+        this.emailService.sendToUserAccount(appUser.getOffice().getName(), appUser.getFirstname(),
+            appUser.getEmail(), appUser.getUsername(), unencodedPassword);
+    }
+}
+
+private void generateKeyUsedForPasswordSalting(final AppUser appUser) {
+    this.userRepository.save(appUser);                   // SAVE pass 1 — get id (used as salt)
+}
+```
+
+The two-pass save is intentional: `PlatformPasswordEncoder` mixes the **user id** into the salt, so the entity must be persisted **once** (to receive an id) before its encoded password can be computed. See [password encoding](/security/password-encoding).
+
+## `UsersApiResource` — `/v1/users`
+
+```java
+@Path("/v1/users")
+@Component
+@Tag(name = "Users", description = "An API capability to support administration of application users.")
+@RequiredArgsConstructor
+public class UsersApiResource {
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "USER";
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = Set.of(
+        "id", "officeId", "officeName", "username", "firstname", "lastname",
+        "email", "allowedOffices", "availableRoles", "selectedRoles", "staff");
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Permission |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/users` | `retrieveAll` | — | `READ_USER` |
+| GET | `/v1/users/{userId}` | `retrieveOne` | — | `READ_USER` (self exempt) |
+| GET | `/v1/users/template` | `template` | — | `READ_USER` |
+| POST | `/v1/users` | `create` | `CREATE_USER` | `CREATE_USER` (+`_CHECKER`) |
+| PUT | `/v1/users/{userId}` | `update` | `UPDATE_USER` | `UPDATE_USER` |
+| POST | `/v1/users/{userId}/pwd` | `changePassword` | `CHANGE_USER_PASSWORD` | `UPDATE_USER` (with the `cannotChangePassword` gate) |
+| DELETE | `/v1/users/{userId}` | `delete` | `DELETE_USER` | `DELETE_USER` |
+| GET | `/v1/users/downloadtemplate` | `getUserTemplate` | — | `READ_USER` |
+| POST | `/v1/users/uploadtemplate` | `postUsersTemplate` | (bulk import) | `CREATE_USER` |
+
+### `POST /v1/users` — create
+
+```java
+public String create(@Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .createUser().withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Body shape (per `UserDataValidator`):
+
+```json
+{
+  "username":   "loan.officer.jdoe",
+  "firstname":  "Jane",
+  "lastname":   "Doe",
+  "email":      "jdoe@mfi.example",
+  "officeId":   1,
+  "staffId":    42,
+  "roles":      [ 3, 7 ],
+  "sendPasswordToEmail": true,
+  "passwordNeverExpires": false,
+  "isLoginRetriesEnabled": true
+}
+```
+
+- Mandatory: `username`, `firstname`, `lastname`, `email`, `officeId`, `roles`, `sendPasswordToEmail`.
+- Optional: `staffId`, `passwordNeverExpires`, `isLoginRetriesEnabled`, `password` (when `sendPasswordToEmail = false`).
+- The Swagger note says "*Password information is not required (or processed). Password details at present are auto-generated and then sent to the email account given*" — that holds when `sendPasswordToEmail = true`; otherwise the client-supplied `password` is honoured.
+
+### `PUT /v1/users/{userId}` — update
+
+Same validator class but in update mode — every field is optional, `username` is rejected if it would clash, system user cannot rename itself. Note the **`roles` array completely replaces** the previous set, not merge.
+
+### `POST /v1/users/{userId}/pwd` — change password
+
+```java
+public String changePassword(@PathParam("userId") final Long userId,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .changeUserPassword(userId).withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Body:
+
+```json
+{ "password": "N3wPa55w0rd!", "repeatPassword": "N3wPa55w0rd!" }
+```
+
+The handler `ChangeUserPasswordCommandHandler`:
+
+1. Loads the active `PasswordValidationPolicy` and validates the regex.
+2. Compares against the last *n* `AppUserPreviousPassword` rows — raises `PasswordPreviouslyUsedException` on reuse.
+3. Encodes the new password (mixing the user id as salt).
+4. Calls `AppUser.changePassword(...)` and saves.
+5. Inserts a new `AppUserPreviousPassword` row.
+
+For the policy details see [password policy](/users/password-policy).
+
+### `DELETE /v1/users/{userId}`
+
+Calls `AppUser.delete()` which sets `deleted = true`, prefixes the username, clears roles. The row stays — joins to it from audit tables continue to resolve.
+
+### `GET /v1/users/template`
+
+```java
+public String template(@Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    final AppUserData userData = readPlatformService.retrieveNewUserDetails();
+    final ApiRequestJsonSerializationSettings settings = apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, userData, RESPONSE_DATA_PARAMETERS);
+}
+```
+
+Returns `allowedOffices` + `availableRoles` so the create form can populate its dropdowns.
+
+### Bulk import
+
+`/v1/users/downloadtemplate` and `/v1/users/uploadtemplate` use `GlobalEntityType.USERS` — see [bulk import infrastructure](/core/bulkimport). Returns the import job id on success.
+
+## `AppUserData` DTO
+
+| Field | Notes |
+| --- | --- |
+| `id`, `username`, `firstname`, `lastname`, `email` | Basic identity |
+| `officeId`, `officeName` | Home office |
+| `staff` | Embedded `StaffData` when linked |
+| `selectedRoles` | Roles currently held by the user |
+| `availableRoles` | Roles not yet held (used by the edit screen) |
+| `allowedOffices` | List of offices the caller can reassign the user to |
+
+## Exceptions raised by this module
+
+| Exception | HTTP | Message key |
+| --- | --- | --- |
+| `UserNotFoundException` | 404 | `error.msg.user.id.invalid` |
+| `UsernameAlreadyExistsException` | 409 | `error.msg.user.username.exists` |
+| `UsernameMustBeDifferentException` | 400 | `error.msg.user.username.must.be.different` |
+| `NoAuthorizationException` | 403 | `error.msg.no.authorization` — system user rename/delete, `cannotChangePassword`, etc. |
+
+## See also
+
+- [Users overview](/users/overview) — module-wide map and command pipeline integration.
+- [Roles and permissions](/users/roles-and-permissions) — `Role` and `Permission` entities, the `/v1/roles` resource and the maker–checker matrix.
+- [Password policy](/users/password-policy) — `PasswordValidationPolicy`, `AppUserPreviousPassword` and the change-password flow.
+- [Self-service users](/users/self-service-users) — clarifies what does and does not exist for portal logins.
+- [User administration domain](/core/useradministration-domain) — package map from the `fineract-core` perspective.
+- [Security overview](/security/overview) — how `AppUser.getAuthorities()` flows into the filter chain.
+- [Password encoding](/security/password-encoding) — `PlatformPasswordEncoder` salt computation.
+- [Security APIs](/api/security-apis) — Swagger payloads.

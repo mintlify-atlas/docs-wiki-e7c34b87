@@ -1,0 +1,361 @@
+---
+title: "Loan Arrears Aging, Re-Aging Service and Preview"
+sidebarTitle: "Arrears & Re-age"
+description: "UpdateLoanArrearsAgingBusinessStep, LoanArrearsAgingService, LoanReAgingService and the reAge / undoReAge / preview commands in Fineract."
+---
+
+Fineract tracks loan arrears in two complementary ways: a **rolled-up arrears aging row** in `m_loan_arrears_aging` (refreshed daily by `UpdateLoanArrearsAgingBusinessStep` and `UPDATE_LOAN_ARREARS_AGEING`), and an operational **re-age** action that resets the schedule's "tail" by collapsing all overdue installments into a fresh sequence starting today. This page covers both flows: the aging job/step, the `LoanReAgingService` write path (`reAge` / `undoReAge`), and the preview endpoint (`GET /v1/loans/{loanId}/transactions/reage-preview`).
+
+Cross references: the standalone job is in [Loan jobs](/loan/loan-jobs); the COB step is in [Loan COB business steps](/cob/loan-cob-business-steps); a related but distinct flow — re-amortization — is at [Re-amortization](/loan/loan-reamortization); delinquency interactions are at [Delinquency](/loan/delinquency).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| Aging service interface | `portfolio/loanaccount/service/LoanArrearsAgingService.java` | `fineract-loan` |
+| Aging service impl | `LoanArrearsAgingServiceImpl.java` | `fineract-loan` |
+| Standalone job config | `portfolio/loanaccount/jobs/updateloanarrearsageing/UpdateLoanArrearsAgeingConfig.java` | `fineract-loan` |
+| Tasklet | `UpdateLoanArrearsAgeingTasklet.java` | `fineract-loan` |
+| Handler | `LoanArrearsAgeingUpdateHandler.java` | `fineract-loan` |
+| COB step | `cob/loan/UpdateLoanArrearsAgingBusinessStep.java` | `fineract-provider` |
+| ReAge parameter entity | `portfolio/loanaccount/domain/reaging/LoanReAgeParameter.java` | `fineract-loan` |
+| Repo | `domain/reaging/LoanReAgingParameterRepository.java` | `fineract-loan` |
+| Interest-handling enum | `domain/reaging/LoanReAgeInterestHandlingType.java` | `fineract-loan` |
+| ReAge constants | `portfolio/loanaccount/api/LoanReAgingApiConstants.java` | `fineract-loan` |
+| ReAge service | `portfolio/loanaccount/service/reaging/LoanReAgingService.java` | `fineract-provider` |
+| ReAge validator | `portfolio/loanaccount/service/reaging/LoanReAgingValidator.java` | `fineract-provider` |
+| Preview request | `portfolio/loanaccount/api/request/ReAgePreviewRequest.java` | `fineract-provider` |
+| ReAge handler | `portfolio/loanaccount/handler/loan/reaging/LoanReAgingCommandHandler.java` | `fineract-provider` |
+| Undo handler | `portfolio/loanaccount/handler/loan/reaging/LoanUndoReAgingCommandHandler.java` | `fineract-provider` |
+| Business events | `infrastructure/event/business/domain/loan/reaging/*` | `fineract-loan` |
+
+## Part 1 — Arrears aging
+
+### `m_loan_arrears_aging`
+
+Per active loan, the table holds:
+
+| Column | Meaning |
+| --- | --- |
+| `loan_id` | FK |
+| `principal_overdue_derived` | Sum of overdue principal |
+| `interest_overdue_derived` | Sum of overdue interest |
+| `fee_charges_overdue_derived` | |
+| `penalty_charges_overdue_derived` | |
+| `total_overdue_derived` | Sum of the above four |
+| `overdue_since_date_derived` | Earliest overdue installment due date |
+
+### `LoanArrearsAgingService`
+
+```java
+public interface LoanArrearsAgingService {
+    void updateLoanArrearsAgeingDetailsForAllLoans();
+    void updateLoanArrearsAgeingDetails(List<Long> loanIds);
+    void updateLoanArrearsAgeingDetails(Loan loan);
+}
+```
+
+The implementation:
+
+1. Loads the loan's repayment schedule (or the projection for not-yet-due installments).
+2. Walks installments whose `due_date < businessDate` and whose `obligations_met_on_date` is null.
+3. Sums each portion (principal / interest / fees / penalties) into the aggregate.
+4. Computes `overdue_since_date_derived` from the earliest unmet installment.
+5. Upserts into `m_loan_arrears_aging`. If the loan is no longer overdue, the row is deleted.
+
+### COB step — `UpdateLoanArrearsAgingBusinessStep`
+
+```java
+@Component
+@RequiredArgsConstructor
+public class UpdateLoanArrearsAgingBusinessStep implements LoanCOBBusinessStep {
+    private final LoanArrearsAgingService loanArrearsAgingService;
+
+    @Override
+    public Loan execute(Loan loan) {
+        loanArrearsAgingService.updateLoanArrearsAgeingDetails(loan);
+        return loan;
+    }
+
+    @Override
+    public String getEnumStyledName() { return "UPDATE_LOAN_ARREARS_AGING"; }
+    @Override
+    public String getHumanReadableName() { return "Update Loan Arrears Aging"; }
+}
+```
+
+This step is part of the default-seeded COB chain (order 5). See [Loan COB business steps](/cob/loan-cob-business-steps).
+
+### Standalone job — `UPDATE_LOAN_ARREARS_AGEING`
+
+For installations that do not run COB, `UpdateLoanArrearsAgeingTasklet` invokes `LoanArrearsAgeingUpdateHandler.updateLoanArrearsAgeingDetailsForAllLoans()`, which executes the same per-loan update across the whole portfolio. The handler also exposes:
+
+```java
+public void updateLoanArrearsAgeingDetails(List<Long> loanIdsForUpdate) { ... }
+```
+
+…used by ad-hoc operator workflows that touch a small set of loans.
+
+The tasklet itself is a thin wrapper:
+
+```java
+@Bean
+public Job updateLoanArrearsAgeingJob() {
+    return new JobBuilder(JobName.UPDATE_LOAN_ARREARS_AGEING.name(), jobRepository)
+            .start(updateLoanArrearsAgeingStep())
+            .incrementer(new RunIdIncrementer()).build();
+}
+```
+
+## Part 2 — Re-aging
+
+Re-aging is a curative action: **erase the schedule history of arrears** by replacing all unpaid installments (or a subset) with a fresh sequence starting on a new `startDate`. The loan is *not* paid down — it is rescheduled in a way that treats overdue installments as "current" again.
+
+### `LoanReAgeParameter`
+
+The per-transaction record of a re-age:
+
+```java
+@Entity @Table(name = "m_loan_reage_parameter")
+public class LoanReAgeParameter extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @OneToOne @JoinColumn(name = "loan_transaction_id", nullable = false)
+    private LoanTransaction loanTransaction;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "frequency_type", nullable = false)
+    private PeriodFrequencyType frequencyType;
+
+    @Column(name = "frequency_number", nullable = false)
+    private Integer frequencyNumber;
+
+    @Column(name = "start_date", nullable = false)
+    private LocalDate startDate;
+
+    @Column(name = "number_of_installments", nullable = false)
+    private Integer numberOfInstallments;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "interest_handling_type")
+    private LoanReAgeInterestHandlingType interestHandlingType;
+
+    @ManyToOne @JoinColumn(name = "reage_reason_cv_id")
+    private CodeValue reageReason;
+}
+```
+
+### `LoanReAgeInterestHandlingType`
+
+```java
+public enum LoanReAgeInterestHandlingType {
+    DEFAULT,
+    WAIVE_INTEREST,
+    EQUAL_AMORTIZATION_PAYABLE_INTEREST,
+    EQUAL_AMORTIZATION_FULL_INTEREST,
+}
+```
+
+| Value | Behaviour |
+| --- | --- |
+| `DEFAULT` | Outstanding interest carries to the first re-aged installment |
+| `WAIVE_INTEREST` | Outstanding interest is waived (zeroed); `LoanTransaction.WAIVE_INTEREST` is posted |
+| `EQUAL_AMORTIZATION_PAYABLE_INTEREST` | Outstanding *payable* interest spread evenly across all re-aged installments |
+| `EQUAL_AMORTIZATION_FULL_INTEREST` | All outstanding interest (including future) spread evenly |
+
+### REST endpoint — `reAge` command
+
+Exposed on `LoanTransactionsApiResource`:
+
+```java
+public static final String REAGE = "reAge";
+public static final String UNDO_REAGE = "undoReAge";
+public static final String REAMORTIZE = "reAmortize";
+public static final String UNDO_REAMORTIZE = "undoReAmortize";
+```
+
+In `POST /v1/loans/{loanId}/transactions?command=reAge`:
+
+```java
+} else if (CommandParameterUtil.is(commandParam, REAGE)) {
+    commandRequest = builder.reAge(resolvedLoanId).build();
+} else if (CommandParameterUtil.is(commandParam, UNDO_REAGE)) {
+    commandRequest = builder.undoReAge(resolvedLoanId).build();
+}
+```
+
+Request body:
+
+```json
+{
+  "frequencyType": "MONTHS",
+  "frequencyNumber": 1,
+  "startDate": "01 March 2024",
+  "numberOfInstallments": 12,
+  "reAgeInterestHandling": "DEFAULT",
+  "reasonCodeValueId": 42,
+  "transactionAmount": 0.00,
+  "note": "Customer requested 12-month restart",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+`transactionAmount` is always zero (re-aging does not post a payment); it exists for symmetry with other transaction commands.
+
+### `LoanReAgingService`
+
+```java
+@Service @RequiredArgsConstructor @Transactional
+public class LoanReAgingService {
+
+    public CommandProcessingResult reAge(final Long loanId, final JsonCommand command) { ... }
+    public LoanScheduleData previewReAge(final Long loanId, final String loanExternalId,
+            final ReAgePreviewRequest reAgePreviewRequest) { ... }
+    public CommandProcessingResult undoReAge(Long loanId, JsonCommand command) { ... }
+}
+```
+
+#### `reAge(loanId, command)` flow
+
+1. `reAgingValidator.validateReAge(command)` — parses + rule-checks.
+2. Load loan; assert status `Active`, not already re-aged, no future-dated transactions.
+3. Snapshot existing schedule into `LoanScheduleHistory`.
+4. Insert a single `LoanTransaction(type=REAGE, date=startDate, amount=0)`.
+5. Build a `LoanReAgeParameter` row keyed to that transaction.
+6. Replace remaining installments with `numberOfInstallments` periods of `frequencyNumber × frequencyType` starting `startDate`. The amortisation honours `interestHandlingType`.
+7. Recompute outstanding amounts.
+8. Fire `LoanReAgeBusinessEvent` and `LoanReAgeTransactionBusinessEvent`.
+9. Return `CommandProcessingResultBuilder.withLoanId(loanId).withTransactionId(txn.id).build()`.
+
+#### `undoReAge(loanId, command)`
+
+1. Find the most-recent unreversed `REAGE` transaction.
+2. Reverse it (`LoanTransaction.reverse()` — marks `is_reversed = true`).
+3. Restore the schedule from the matching `LoanScheduleHistory` archive.
+4. Fire `LoanUndoReAgeBusinessEvent`.
+
+### Preview — `GET /v1/loans/{loanId}/transactions/reage-preview`
+
+```java
+@GET
+@Path("{loanId}/transactions/reage-preview")
+public LoanScheduleData previewReAgeSchedule(
+        @PathParam("loanId") final Long loanId,
+        @Valid @BeanParam final ReAgePreviewRequest reAgePreviewRequest) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return loanReAgingService.previewReAge(loanId, null, reAgePreviewRequest);
+}
+
+@GET
+@Path("external-id/{loanExternalId}/transactions/reage-preview")
+public LoanScheduleData previewReAgeSchedule(
+        @PathParam("loanExternalId") final String loanExternalId,
+        @Valid @BeanParam final ReAgePreviewRequest reAgePreviewRequest) {
+    return loanReAgingService.previewReAge(null, loanExternalId, reAgePreviewRequest);
+}
+```
+
+`ReAgePreviewRequest` is a `@BeanParam` carrying:
+
+| Query parameter | Type | Notes |
+| --- | --- | --- |
+| `frequencyType` | enum | `DAYS`, `WEEKS`, `MONTHS`, `YEARS` |
+| `frequencyNumber` | Integer | Required, > 0 |
+| `startDate` | LocalDate | Required, on/after today |
+| `numberOfInstallments` | Integer | Required, > 0 |
+| `reAgeInterestHandling` | enum | `DEFAULT`, `WAIVE_INTEREST`, `EQUAL_AMORTIZATION_PAYABLE_INTEREST`, `EQUAL_AMORTIZATION_FULL_INTEREST` |
+| `locale`, `dateFormat` | String | for date parsing |
+
+Returns a fully-formed `LoanScheduleData` showing what the re-aged schedule would look like — **without** mutating the loan. No business event, no transaction, no schedule history archive.
+
+### Validator — `LoanReAgingValidator`
+
+```java
+public void validateReAge(JsonCommand command) {
+    final List<ApiParameterError> errors = new ArrayList<>();
+    final DataValidatorBuilder validator = new DataValidatorBuilder(errors).resource("loan.reage");
+
+    validator.parameter("frequencyType").value(frequencyType).notNull().isOneOfTheseStringValues(...);
+    validator.parameter("frequencyNumber").value(frequencyNumber).notNull().integerGreaterThanZero();
+    validator.parameter("startDate").value(startDate).notNull()
+             .validateDateAfter(DateUtils.getBusinessLocalDate().minusDays(1));
+    validator.parameter("numberOfInstallments").value(numberOfInstallments).notNull().integerGreaterThanZero();
+    validator.parameter("reAgeInterestHandling").value(...).ignoreIfNull()
+             .isOneOfTheseStringValues(LoanReAgeInterestHandlingType.values());
+    ...
+    throwExceptionIfValidationWarningsExist(errors);
+}
+```
+
+Cross-loan rule checks:
+
+| Rule | |
+| --- | --- |
+| Loan must be Active | |
+| Loan must have at least one overdue installment | |
+| Product allows re-aging (not all do — flag/feature-checked) | |
+| No future-dated transactions exist | |
+| `startDate >= today` | |
+| Resulting schedule does not collide with existing variations | |
+
+### Undo last re-age
+
+`LoanUndoReAgingCommandHandler` (entity `LOAN`, action `UNDO_REAGE`) invokes `LoanReAgingService.undoReAge(loanId, command)`. Symmetric with `reAge`: pops the most recent `REAGE` transaction and restores the archived schedule.
+
+### Business events
+
+| Event | When |
+| --- | --- |
+| `LoanReAgeBusinessEvent` | Loan-level event, fired on successful `reAge` |
+| `LoanReAgeTransactionBusinessEvent` | Per-transaction event |
+| `LoanUndoReAgeBusinessEvent` | On undo |
+| `LoanUndoReAgeTransactionBusinessEvent` | Per-transaction undo event |
+
+## Permissions
+
+| Operation | Permission |
+| --- | --- |
+| Preview | `READ_LOAN` |
+| Re-age | `CREATE_LOAN_REAGE` |
+| Undo re-age | `CREATE_LOAN_UNDO_REAGE` |
+
+## Worked example
+
+<Steps>
+<Step title="Inspect arrears">
+`GET /v1/loans/123?associations=delinquencyTags` — confirm the loan has overdue installments and a `total_overdue_derived` in `m_loan_arrears_aging`.
+</Step>
+<Step title="Preview a re-age">
+`GET /v1/loans/123/transactions/reage-preview?frequencyType=MONTHS&frequencyNumber=1&startDate=01 March 2024&numberOfInstallments=12&locale=en&dateFormat=dd MMMM yyyy`
+</Step>
+<Step title="Apply">
+`POST /v1/loans/123/transactions?command=reAge` with the same parameters in the body. A `REAGE` `LoanTransaction` is inserted with amount 0; the schedule rewrites to 12 monthly installments starting 1 March 2024.
+</Step>
+<Step title="Daily classification re-runs">
+The next COB run recomputes arrears against the new schedule. Because every prior overdue installment was rolled into the fresh sequence, `m_loan_arrears_aging` will be empty (zero overdue) until the first new installment falls past due.
+</Step>
+<Step title="Undo if necessary">
+`POST /v1/loans/123/transactions?command=undoReAge` reverses the action, restoring the original arrears.
+</Step>
+</Steps>
+
+## Comparison with `reschedule`
+
+| Aspect | Re-age | Reschedule |
+| --- | --- | --- |
+| Persistence | `m_loan_reage_parameter` + `LoanTransaction(REAGE)` | `m_loan_reschedule_request` + `LoanTermVariations` |
+| Maker-checker | Single command (`reAge`) | Two-step (`createLoanRescheduleRequest`, then `approve`/`reject`) |
+| Affects past arrears? | Yes — collapses arrears into the new schedule | No — rewrites tail of the schedule |
+| Term-level granularity | Replaces whole remaining schedule | Per-installment variations |
+| Undo | `undoReAge` reverses the transaction | New reschedule request needed |
+| Interest handling | `LoanReAgeInterestHandlingType` enum | Schedule generator applies term variations |
+
+## Related pages
+
+- [Loan jobs](/loan/loan-jobs)
+- [Loan COB business steps](/cob/loan-cob-business-steps)
+- [Delinquency](/loan/delinquency)
+- [Re-amortization](/loan/loan-reamortization)
+- [Reschedule loans](/loan/reschedule-loans)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

@@ -1,0 +1,393 @@
+---
+title: "Loan Product REST API, Entity Model and Validator"
+sidebarTitle: "Product API"
+description: "LoanProductsApiResource endpoints, the LoanProduct JPA entity, and LoanProductDataValidator for product creation, update and accounting setup in Fineract."
+---
+
+In Apache Fineract a **Loan Product** is the template that pre-populates and constrains every loan account opened against it: principal range, interest method, repayment frequency, amortization, charges, accounting rules, delinquency bucket and dozens of optional features (down payment, capitalized income, buy-down fee, floating rates, holds, write-off behaviour, charge-off behaviour). This page documents the REST surface (`LoanProductsApiResource`), the JPA entity (`LoanProduct`), the input validator (`LoanProductDataValidator`) and the write-platform service that persists changes.
+
+Cross references: schedule generation that consumes product settings is in [Schedule API](/loan/loan-schedule-api); delinquency buckets attached to products are in [Delinquency](/loan/delinquency); accounting rule mappings are in [Accounting overview](/accounting/overview); loan-level REST is in [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| REST | `portfolio/loanproduct/api/LoanProductsApiResource.java` | `fineract-provider` |
+| Entity | `portfolio/loanproduct/domain/LoanProduct.java` | `fineract-loan` |
+| Write service | `portfolio/loanproduct/service/LoanProductWritePlatformService.java` (interface, `fineract-loan`) and `LoanProductWritePlatformServiceJpaRepositoryImpl.java` (`fineract-provider`) | mixed |
+| Read service | `portfolio/loanproduct/service/LoanProductReadPlatformService.java` | `fineract-provider` |
+| Validator | `portfolio/loanproduct/serialization/LoanProductDataValidator.java` (3 018 lines) | `fineract-provider` |
+| Constants | `portfolio/loanproduct/LoanProductConstants.java` | `fineract-loan` |
+
+## REST surface — `/v1/loanproducts`
+
+```java
+@Path("/v1/loanproducts")
+@Component
+@Tag(name = "Loan Products", description = "A Loan product is a template that is used when creating a loan. ...")
+@RequiredArgsConstructor
+public class LoanProductsApiResource {
+
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "LOANPRODUCT";
+```
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `POST` | `/loanproducts` | `createLoanProduct` | `CREATE_LOANPRODUCT` |
+| `GET` | `/loanproducts` | `retrieveAllLoanProducts` | `READ_LOANPRODUCT` |
+| `GET` | `/loanproducts/template` | `retrieveTemplate` (dropdown options) | `READ_LOANPRODUCT` |
+| `GET` | `/loanproducts/{productId}` | `retrieveLoanProductDetails` | `READ_LOANPRODUCT` |
+| `PUT` | `/loanproducts/{productId}` | `updateLoanProduct` | `UPDATE_LOANPRODUCT` |
+| `GET` | `/loanproducts/external-id/{externalProductId}` | `retrieveLoanProductDetailsByExternalId` | `READ_LOANPRODUCT` |
+| `PUT` | `/loanproducts/external-id/{externalProductId}` | `updateLoanProductByExternalId` | `UPDATE_LOANPRODUCT` |
+
+Create example (parameters set is wide — the `LOAN_PRODUCT_DATA_PARAMETERS` `HashSet` enumerates around 120 keys; below is an excerpt):
+
+```java
+private static final Set<String> LOAN_PRODUCT_DATA_PARAMETERS = new HashSet<>(Arrays.asList(
+    "id", "name", "shortName", "description", "fundId", "fundName", "includeInBorrowerCycle",
+    "currency", "principal", "minPrincipal", "maxPrincipal", "numberOfRepayments",
+    "minNumberOfRepayments", "maxNumberOfRepayments", "repaymentEvery", "repaymentFrequencyType",
+    "graceOnPrincipalPayment", "recurringMoratoriumOnPrincipalPeriods", "graceOnInterestPayment",
+    "graceOnInterestCharged", "interestRatePerPeriod", "minInterestRatePerPeriod",
+    "maxInterestRatePerPeriod", "interestRateFrequencyType", "annualInterestRate",
+    "amortizationType", "interestType", "interestCalculationPeriodType",
+    LoanProductConstants.ALLOW_PARTIAL_PERIOD_INTEREST_CALCUALTION_PARAM_NAME,
+    "inArrearsTolerance", "transactionProcessingStrategyCode",
+    "charges", "accountingRule", "externalId", "accountingMappings",
+    "paymentChannelToFundSourceMappings", ...));
+```
+
+## Create handler flow
+
+`POST /loanproducts` calls:
+
+```java
+final CommandWrapper commandRequest = new CommandWrapperBuilder().createLoanProduct().withJson(apiRequestBodyAsJson).build();
+final CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+```
+
+This routes to `LoanProductCommandHandler` (entity `LOANPRODUCT`, action `CREATE`) in `fineract-provider`, which delegates to `LoanProductWritePlatformService.createLoanProduct(JsonCommand)`.
+
+## `LoanProduct` JPA entity
+
+Mapped to `m_product_loan`. The class extends `AbstractPersistableCustom<Long>` and aggregates many sub-collections (charges, rates, account mappings, payment allocation rules, credit allocation rules, capitalized income strategy fields, buy-down fee strategy fields). Below is a field-by-field walk of the most important columns; see source for the full 771-line entity.
+
+### Identification
+
+| Field | Column | Type | Notes |
+| --- | --- | --- | --- |
+| `name` | `name` | `String` not null, unique | Display name |
+| `shortName` | `short_name` | `String` not null, unique | Used in account number generation |
+| `description` | `description` | `String` | |
+| `externalId` | `external_id` | `String(100)` unique | Optional client-supplied id |
+| `startDate` | `start_date` | `LocalDate` | Product available from |
+| `closeDate` | `close_date` | `LocalDate` | After this no new loans can be created |
+
+### Money & terms
+
+| Field | Column | Meaning |
+| --- | --- | --- |
+| `loanProductRelatedDetail` | `m_product_loan` (embedded via fields below + `LoanProductRelatedDetail`) | Currency, principal range, repayment, interest |
+| `principal` / `minPrincipal` / `maxPrincipal` | `principal_amount` / `min_principal_amount` / `max_principal_amount` | Default and bounds |
+| `numberOfRepayments` / `minNumberOfRepayments` / `maxNumberOfRepayments` | columns of same name | |
+| `repaymentEvery` | `repay_every` | Repayment every N periods |
+| `repaymentPeriodFrequencyType` | `repayment_period_frequency_enum` | Days/Weeks/Months/Years |
+| `interestRatePerPeriod` / min / max | `nominal_interest_rate_per_period` etc | |
+| `interestPeriodFrequencyType` | `interest_period_frequency_enum` | Per-month, per-year, etc |
+| `annualNominalInterestRate` | `annual_nominal_interest_rate` | Derived/converted to annual |
+| `interestMethod` | `interest_method_enum` | Declining balance / flat |
+| `interestCalculationPeriodMethod` | `interest_calculated_in_period_enum` | Daily vs same as repayment |
+| `amortizationMethod` | `amortization_method_enum` | Equal installments / equal principal |
+| `allowPartialPeriodInterestCalculation` | `allow_partial_period_interest_calcualtion` | Toggle |
+
+### Grace, tolerance, in-arrears
+
+| Field | Column |
+| --- | --- |
+| `graceOnPrincipalPayment` | `grace_on_principal_periods` |
+| `graceOnInterestPayment` | `grace_on_interest_periods` |
+| `graceOnInterestCharged` | `grace_interest_free_periods` |
+| `recurringMoratoriumOnPrincipalPeriods` | `recurring_moratorium_principal_periods` |
+| `inArrearsTolerance` | `arrearstolerance_amount` |
+| `overdueDaysForNPA` | `overdue_days_for_npa` |
+| `accountMovesOutOfNPAOnlyOnArrearsCompletion` | `account_moves_out_of_npa_only_on_arrears_completion` |
+
+### Charges, rates, holidays
+
+```java
+@ManyToMany
+@JoinTable(name = "m_product_loan_charge",
+    joinColumns = @JoinColumn(name = "product_loan_id"),
+    inverseJoinColumns = @JoinColumn(name = "charge_id"))
+private List<Charge> charges;
+
+@ManyToMany
+@JoinTable(name = "m_product_loan_rate",
+    joinColumns = @JoinColumn(name = "product_loan_id"),
+    inverseJoinColumns = @JoinColumn(name = "rate_id"))
+private List<Rate> rates;
+```
+
+### Accounting
+
+```java
+@Column(name = "accounting_type", nullable = false)
+private Integer accountingRule;
+```
+
+`AccountingRuleType` enum:
+
+| Value | Meaning |
+| --- | --- |
+| `NONE` | No accounting |
+| `CASH_BASED` | Cash basis postings |
+| `ACCRUAL_PERIODIC` | Periodic accrual (manual / batch trigger) |
+| `ACCRUAL_UPFRONT` | Upfront accrual at disbursement |
+
+Account mappings are persisted in `m_product_loan_to_gl_account` and managed by `ProductToGLAccountMappingWritePlatformService`. See [Accounting overview](/accounting/overview) for posting rules.
+
+### Borrower cycle
+
+```java
+@Column(name = "include_in_borrower_cycle")
+private boolean includeInBorrowerCycle;
+
+@Column(name = "use_borrower_cycle")
+private boolean useBorrowerCycle;
+
+@OneToMany(cascade = CascadeType.ALL, mappedBy = "loanProduct", orphanRemoval = true, fetch = FetchType.EAGER)
+private Set<LoanProductBorrowerCycleVariations> borrowerCycleVariations;
+```
+
+When `useBorrowerCycle = true`, the principal/interest/repayment limits change per borrower's cycle number using `LoanProductBorrowerCycleVariations`.
+
+### Floating rates
+
+```java
+@Column(name = "is_linked_to_floating_interest_rates", nullable = false)
+private boolean isLinkedToFloatingInterestRate;
+```
+
+When true, `LoanProductFloatingRates` holds rate base + differential, validated by `LoanProductDataValidator.validateFloatingInterestRates`. Mutually exclusive with the fixed interest rate fields.
+
+### Variable installments
+
+```java
+@Column(name = "allow_variabe_installments", nullable = false)
+private boolean allowVariableInstallments;
+```
+
+Enables the `LoanScheduleApiResource` apply/undo flow ([Schedule API](/loan/loan-schedule-api)).
+
+### Top-up
+
+```java
+@Column(name = "can_use_for_topup", nullable = false)
+private boolean canUseForTopup;
+```
+
+### Down payment
+
+| Field | Column |
+| --- | --- |
+| `enableDownPayment` | `enable_down_payment` |
+| `disbursedAmountPercentageForDownPayment` | `disbursed_amount_percentage_for_down_payment` |
+| `enableAutoRepaymentForDownPayment` | `enable_auto_repayment_for_down_payment` |
+
+### Delinquency
+
+```java
+@ManyToOne(fetch = FetchType.LAZY)
+@JoinColumn(name = "delinquency_bucket_id", nullable = true)
+private DelinquencyBucket delinquencyBucket;
+
+@Column(name = "enable_installment_level_delinquency", nullable = false)
+private boolean enableInstallmentLevelDelinquency;
+```
+
+Attaching a `DelinquencyBucket` activates the `LOAN_DELINQUENCY_CLASSIFICATION` COB step for accounts on this product — see [Delinquency](/loan/delinquency).
+
+### Repayment event & disbursement controls
+
+| Field | Column |
+| --- | --- |
+| `dueDaysForRepaymentEvent` | `due_days_for_repayment_event` |
+| `overDueDaysForRepaymentEvent` | `overdue_days_for_repayment_event` |
+| `repaymentStartDateType` | `repayment_start_date_type_enum` |
+| `syncExpectedWithDisbursementDate` | `sync_expected_with_disbursement_date` |
+| `disallowExpectedDisbursements` | `disallow_expected_disbursements` |
+| `allowApprovedDisbursedAmountsOverApplied` | `allow_approved_disbursed_amounts_over_applied` |
+| `overAppliedCalculationType` | `over_applied_calculation_type` |
+| `overAppliedNumber` | `over_applied_number` |
+
+### Capitalized income (BNPL)
+
+```java
+@Column(name = "enable_income_capitalization", nullable = false)
+private boolean enableIncomeCapitalization;
+@Column(name = "capitalized_income_calculation_type")
+@Enumerated(EnumType.STRING)
+private LoanCapitalizedIncomeCalculationType capitalizedIncomeCalculationType;
+@Column(name = "capitalized_income_strategy")
+@Enumerated(EnumType.STRING)
+private LoanCapitalizedIncomeStrategy capitalizedIncomeStrategy;
+@Column(name = "capitalized_income_type")
+@Enumerated(EnumType.STRING)
+private LoanCapitalizedIncomeType capitalizedIncomeType;
+```
+
+### Buy-down fee
+
+```java
+@Column(name = "enable_buy_down_fee", nullable = false)
+private boolean enableBuyDownFee;
+@Column(name = "buy_down_fee_calculation_type") @Enumerated(EnumType.STRING)
+private LoanBuyDownFeeCalculationType buyDownFeeCalculationType;
+@Column(name = "buy_down_fee_strategy") @Enumerated(EnumType.STRING)
+private LoanBuyDownFeeStrategy buyDownFeeStrategy;
+@Column(name = "buy_down_fee_income_type") @Enumerated(EnumType.STRING)
+private LoanBuyDownFeeIncomeType buyDownFeeIncomeType;
+```
+
+### Charge-off behaviour
+
+```java
+@Column(name = "charge_off_behaviour") @Enumerated(EnumType.STRING)
+private LoanChargeOffBehaviour chargeOffBehaviour; // ZERO_INTEREST or REGULAR
+```
+
+### Days-in-year custom strategy
+
+```java
+@Column(name = "days_in_year_custom_strategy_type_enum") @Enumerated(EnumType.STRING)
+private DaysInYearCustomStrategyType daysInYearCustomStrategyType;
+```
+
+### Guarantee funds
+
+```java
+@Column(name = "hold_guarantee_funds")
+private boolean holdGuaranteeFunds;
+
+@OneToOne(cascade = CascadeType.ALL, mappedBy = "loanProduct", fetch = FetchType.LAZY, orphanRemoval = true)
+private LoanProductGuaranteeDetails loanProductGuaranteeDetails;
+```
+
+When enabled, [Guarantors](/loan/guarantors) become mandatory and `GuarantorDomainService` hold/release rules apply.
+
+## Repayment frequency setup
+
+The combination of `repaymentEvery` + `repaymentPeriodFrequencyType` defines the schedule cadence. Fineract enumerates the frequency in `PeriodFrequencyType`:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | DAYS |
+| 1 | WEEKS |
+| 2 | MONTHS |
+| 3 | YEARS |
+| 4 | INVALID |
+| 5 | WHOLE_TERM |
+
+`interestPeriodFrequencyType` uses the same codes. The validator enforces consistency between `interestRatePerPeriod`, `interestPeriodFrequencyType` and the derived `annualInterestRate`.
+
+## Amortization & interest method
+
+| Enum | Source | Values |
+| --- | --- | --- |
+| `AmortizationType` | `portfolio/loanaccount/domain/AmortizationType.java` | `EQUAL_PRINCIPAL` (0), `EQUAL_INSTALLMENTS` (1) |
+| `InterestMethod` | `portfolio/loanproduct/domain/InterestMethod.java` | `DECLINING_BALANCE` (0), `FLAT` (1) |
+| `InterestCalculationPeriodMethod` | same package | `DAILY` (0), `SAME_AS_REPAYMENT_PERIOD` (1) |
+
+`LoanProductDataValidator` cross-checks combinations: equal-installments is permitted only with declining-balance interest; flat interest requires same-as-repayment-period calculation.
+
+## `LoanProductDataValidator`
+
+Defined in `fineract-provider/.../loanproduct/serialization/LoanProductDataValidator.java` (3 018 lines). Two main entry points:
+
+```java
+public void validateForCreate(final JsonCommand command) {
+    ...
+    final DataValidatorBuilder baseDataValidator =
+            new DataValidatorBuilder(dataValidationErrors).resource("loanproduct");
+    ...
+    // hundreds of field checks across name/principal/repayment/interest/charge/account/etc
+    throwExceptionIfValidationWarningsExist(dataValidationErrors);
+}
+
+public void validateForUpdate(final JsonCommand command, final LoanProduct loanProduct) {
+    ...
+    throwExceptionIfValidationWarningsExist(dataValidationErrors);
+}
+```
+
+Notable rule clusters (greppable inside the file):
+
+| Cluster | Examples |
+| --- | --- |
+| Currency & principal | `principal > 0`, `minPrincipal <= principal <= maxPrincipal` |
+| Repayment | `repaymentEvery > 0`, `numberOfRepayments > 0`, frequency vs grace consistency |
+| Interest | Period vs annual rate, floating-rate vs fixed-rate mutual exclusion |
+| Schedule type | If `LoanScheduleType.PROGRESSIVE`, `LoanScheduleProcessingType.HORIZONTAL` and certain features disallowed |
+| Down payment | Percentage in [0, 100]; `enableAutoRepaymentForDownPayment` only when `enableDownPayment` |
+| Capitalized income | Strategy + calculation type + income type all-or-nothing |
+| Buy-down fee | Strategy + calculation type + income type all-or-nothing |
+| Delinquency bucket | If `enableInstallmentLevelDelinquency`, bucket must be attached |
+| Charges & rates | Charge currency must equal product currency |
+| Accounting | If accounting rule != NONE, mappings for the required GL accounts must be supplied (`fund_source`, `loan_portfolio`, `interest_on_loans`, `income_from_fees`, `income_from_penalties`, `losses_written_off`, `transfers_in_suspense`, `over_payment_account`, etc.) |
+| Payment allocation | Required when product uses ADVANCED_PAYMENT_ALLOCATION_STRATEGY |
+| Charge-off behaviour | Allowed values per processing strategy |
+
+All errors are collected into `dataValidationErrors` and bubble up as `PlatformApiDataValidationException`.
+
+## `LoanProductWritePlatformService`
+
+The interface in `fineract-loan` declares:
+
+```java
+CommandProcessingResult createLoanProduct(JsonCommand command);
+CommandProcessingResult updateLoanProduct(Long loanProductId, JsonCommand command);
+```
+
+`LoanProductWritePlatformServiceJpaRepositoryImpl` (fineract-provider) executes:
+
+1. `LoanProductDataValidator.validateForCreate(command)`.
+2. Resolves `Fund`, `Charge`s, `Rate`s, `DelinquencyBucket`, `TransactionProcessingStrategy`.
+3. Instantiates `LoanProduct` via factory (`LoanProduct.assembleFromJson`).
+4. Persists, then `productToGLAccountMappingWritePlatformService.createOrUpdateProductToGLAccountMapping(...)`.
+5. Fires `LoanProductCreateBusinessEvent`.
+6. Returns `CommandProcessingResultBuilder.withProductId(loanProduct.getId()).build()`.
+
+Update flow mirrors create, with `loanProduct.update(JsonCommand)` returning a `Map<String, Object>` of changes, partial GL-mapping refresh, and `LoanProductUpdateBusinessEvent`.
+
+## Template endpoint
+
+`GET /loanproducts/template` returns a `LoanProductData` populated with dropdown options only: currencies, funds, payment types, charges, accounting rule options, transaction processing strategies, floating rates, delinquency buckets, etc. Used by Mifos X UI to render the create form.
+
+## Retrieve by external id
+
+```java
+@GET @Path("external-id/{externalProductId}")
+public String retrieveLoanProductDetailsByExternalId(
+        @PathParam("externalProductId") final String externalProductId,
+        @Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    final ExternalId externalId = ExternalIdFactory.produce(externalProductId);
+    final LoanProductData loanProduct =
+            loanProductReadPlatformService.retrieveLoanProductByExternalId(externalId);
+    if (loanProduct == null) {
+        throw new LoanProductNotFoundException(externalId);
+    }
+    ...
+}
+```
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Schedule API](/loan/loan-schedule-api)
+- [Delinquency](/loan/delinquency)
+- [Guarantors](/loan/guarantors)
+- [Mappers & serialization](/loan/loan-mappers-and-serialization)
+- [Accounting overview](/accounting/overview)
+- [Loan APIs index](/api/loan-apis)

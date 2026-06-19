@@ -1,0 +1,331 @@
+---
+title: "Share Products, Market Prices and Dividend Periods"
+sidebarTitle: "Share Products"
+description: "Reference for the ShareProduct entity, market-price periods, charges, dividend payouts and the Dividend API on /shareproduct/{id}/dividend."
+---
+
+Apache Fineract models cooperative-style share capital as a `ShareProduct` aggregate in `org.apache.fineract.portfolio.shareproducts`. A share product defines: how many shares the cooperative may issue, the current per-unit price, the share's market-price periods, the charges that apply on purchase/redemption, and dividend declarations. Per-client holdings — `ShareAccount` — sit on top (see [/portfolio/share-accounts](/portfolio/share-accounts)).
+
+Share products are created through the generic `/v1/products/{type}` facade with `{type}=share` (see [/portfolio/products-generic](/portfolio/products-generic)); dividends are declared and approved through the dedicated `/v1/shareproduct/{productId}/dividend` resource exposed by `ShareDividendApiResource`. This page documents the entity, the dividend lifecycle, the dividend API and the supporting `Charge`/market-price machinery.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ShareProduct` entity | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.domain` |
+| `ShareProductMarketPrice` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.domain` |
+| `ShareProductDividendPayOutDetails` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.domain` |
+| `ShareProductDividendStatusType` enum | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.domain` |
+| `SharePeriodFrequencyType` enum | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts` |
+| `ShareProductData`, `ShareProductMarketPriceData`, `ShareProductDividendPayOutData` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.data` |
+| `ShareDividendApiResource` (`/v1/shareproduct/{productId}/dividend`) | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.api` |
+| `ShareProductDividendReadPlatformService` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.service` |
+| `ShareProductWritePlatformService` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.service` |
+| `ShareProductDividendAssembler` | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.service` |
+| Handlers (Create / Update product; Create / Approve / Delete dividend) | `fineract-provider` | `org.apache.fineract.portfolio.shareproducts.handler` |
+
+The generic `ProductsApiResource` (`/v1/products/share`) handles CRUD on the product itself; `ShareDividendApiResource` handles only dividend payouts.
+
+## Entity
+
+```java
+// fineract-provider/.../portfolio/shareproducts/domain/ShareProduct.java
+@Entity
+@Table(name = "m_share_product")
+public class ShareProduct extends AbstractAuditableCustom {
+
+    @Column(name = "name", nullable = false, unique = true) private String name;
+    @Column(name = "short_name", nullable = false, unique = true) private String shortName;
+    @Column(name = "description") private String description;
+    @Column(name = "start_date") private LocalDate startDate;
+    @Column(name = "end_date")   private LocalDate endDate;
+    @Column(name = "external_id", length = 100, nullable = true, unique = true) private String externalId;
+    @Embedded private MonetaryCurrency currency;
+
+    @Column(name = "total_shares",   nullable = false) private Long totalShares;
+    @Column(name = "issued_shares",  nullable = false) private Long totalSharesIssued;
+    @Column(name = "totalsubscribed_shares") private Long totalSubscribedShares;
+    @Column(name = "unit_price",     nullable = false) private BigDecimal unitPrice;
+    @Column(name = "capital_amount", nullable = false) private BigDecimal shareCapital;
+
+    @Column(name = "minimum_client_shares") private Long minimumShares;
+    @Column(name = "nominal_client_shares", nullable = false) private Long nominalShares;
+    @Column(name = "maximum_client_shares") private Long maximumShares;
+
+    @OrderBy("fromDate,id")
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "product", orphanRemoval = true, fetch = FetchType.EAGER)
+    Set<ShareProductMarketPrice> marketPrice;
+
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(name = "m_share_product_charge",
+               joinColumns = @JoinColumn(name = "product_id"),
+               inverseJoinColumns = @JoinColumn(name = "charge_id"))
+    private Set<Charge> charges;
+
+    @Column(name = "allow_dividends_inactive_clients") private Boolean allowDividendCalculationForInactiveClients;
+
+    @Column(name = "lockin_period_frequency") private Integer lockinPeriod;
+    @Enumerated(EnumType.ORDINAL)
+    @Column(name = "lockin_period_frequency_enum", nullable = true) private PeriodFrequencyType lockPeriodType;
+
+    @Column(name = "minimum_active_period_frequency") private Integer minimumActivePeriod;
+    @Enumerated(EnumType.ORDINAL)
+    @Column(name = "minimum_active_period_frequency_enum", nullable = true) private PeriodFrequencyType minimumActivePeriodType;
+
+    @Column(name = "accounting_type", nullable = false) protected Integer accountingRule;
+```
+
+Field semantics:
+
+- **`totalShares` / `totalSharesIssued` / `totalSubscribedShares`** — capital structure. Total is the authorised count; issued is the count actually issued; subscribed is the running count of approved share-account purchases. New approvals fail when `totalSharesIssued + requested > totalShares` (raises `IssueableSharesExceededException` from share-account flows).
+- **`unitPrice` / `shareCapital`** — current price per share and total paid-up capital.
+- **`minimumShares` / `nominalShares` / `maximumShares`** — per-client constraints applied when a share account is created or has additional shares applied.
+- **`marketPrice`** — set of `ShareProductMarketPrice` rows (`fromDate`, `unitPrice`). The product selects the active row at any given date so unit price can be changed over time.
+- **`charges`** — many-to-many to `Charge` for purchase/activation fees.
+- **`allowDividendCalculationForInactiveClients`** — whether share accounts in non-active states (typically `APPROVED` but not yet `ACTIVE`) should be included in the dividend distribution.
+- **`lockinPeriod`/`lockPeriodType`** — minimum hold time before a share account on this product allows redemption.
+- **`minimumActivePeriod`/`minimumActivePeriodType`** — minimum activity time before an account becomes eligible for dividend distribution.
+- **`accountingRule`** — `NONE (1)` or `CASH (2)`; controls journal-entry behaviour on purchase/redemption.
+
+The entity uses `AbstractAuditableCustom` so `createdDate`, `lastModifiedDate`, `createdBy`, `lastModifiedBy` are persisted automatically.
+
+## Market price periods
+
+```java
+// fineract-provider/.../portfolio/shareproducts/domain/ShareProductMarketPrice.java
+@Entity
+@Table(name = "m_share_product_market_price")
+public class ShareProductMarketPrice extends AbstractPersistableCustom<Long> {
+    @ManyToOne @JoinColumn(name = "product_id", nullable = false) private ShareProduct product;
+    @Column(name = "from_date") private LocalDate fromDate;
+    @Column(name = "share_value") private BigDecimal shareValue;
+}
+```
+
+`ShareProduct.deriveMarketPrice(LocalDate asOf)` walks the ordered `marketPrice` set and returns the unit price effective on `asOf`. Share-account purchase and redemption use this — not the header `unitPrice` — when the transaction date is in the past.
+
+## Frequency enum
+
+```java
+// fineract-provider/.../portfolio/shareproducts/SharePeriodFrequencyType.java
+public enum SharePeriodFrequencyType {
+    DAYS(0, "sharePeriodFrequencyType.days"),
+    WEEKS(1, "sharePeriodFrequencyType.weeks"),
+    MONTHS(2, "sharePeriodFrequencyType.months"),
+    YEARS(3, "sharePeriodFrequencyType.years"),
+    INVALID(4, "sharePeriodFrequencyType.invalid");
+```
+
+Used wherever a per-share period is encoded as an `int`.
+
+## Dividend payout aggregate
+
+```java
+// fineract-provider/.../portfolio/shareproducts/domain/ShareProductDividendPayOutDetails.java
+@Entity
+@Table(name = "m_share_product_dividend_pay_out")
+public class ShareProductDividendPayOutDetails extends AbstractAuditableCustom {
+
+    @Column(name = "product_id") private Long shareProductId;
+    @Column(name = "amount", scale = 6, precision = 19) private BigDecimal amount;
+    @Column(name = "dividend_period_start_date") private LocalDate dividendPeriodStartDate;
+    @Column(name = "dividend_period_end_date")   private LocalDate dividendPeriodEndDate;
+    @Column(name = "status", nullable = false)   private Integer status;
+
+    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER,
+               mappedBy = "productDividentPayOutDetails")
+    private List<ShareAccountDividendDetails> accountDividendDetails = new ArrayList<>();
+```
+
+Constructor:
+
+```java
+public ShareProductDividendPayOutDetails(final Long shareProductId, final BigDecimal amount,
+        final LocalDate dividendPeriodStartDate, final LocalDate dividendPeriodEndDate) {
+    this.shareProductId = shareProductId;
+    this.amount = amount;
+    this.dividendPeriodStartDate = dividendPeriodStartDate;
+    this.dividendPeriodEndDate = dividendPeriodEndDate;
+    this.status = ShareProductDividendStatusType.INITIATED.getValue();
+}
+```
+
+Lifecycle:
+
+```java
+// fineract-provider/.../portfolio/shareproducts/domain/ShareProductDividendStatusType.java
+public enum ShareProductDividendStatusType {
+    INVALID(0,    "shareAccountDividendStatusType.invalid"),
+    INITIATED(100,"shareAccountDividendStatusType.initiated"),
+    APPROVED(300, "shareAccountDividendStatusType.approved");
+}
+```
+
+A payout is **initiated** when the assembler computes per-account allocations, and **approved** when the cooperative formally distributes the cash. Approval triggers credits to each share account's linked savings account proportional to its average holding during the dividend period.
+
+## Dividend lifecycle
+
+1. **Initiate** — operator calls `POST /v1/shareproduct/{productId}/dividend` with the period start/end and the total dividend amount. The assembler iterates over every `ShareAccount` on the product and computes its proportional share for the period, creating `ShareAccountDividendDetails` rows hung off the payout. Status: `INITIATED`.
+2. **Review** — operator inspects the payout and its per-account allocations through `GET /v1/shareproduct/{productId}/dividend` and `GET /v1/shareproduct/{productId}/dividend/{dividendId}`.
+3. **Approve** — `PUT /v1/shareproduct/{productId}/dividend/{dividendId}?command=approve`. The handler walks every account-detail row, credits the linked savings account, marks each detail as `PAID`, and flips the payout's status to `APPROVED`.
+4. **Delete** — `DELETE /v1/shareproduct/{productId}/dividend/{dividendId}` cancels an `INITIATED` payout. Approved payouts cannot be deleted (audit trail).
+
+## REST surface — `ShareDividendApiResource`
+
+```java
+// fineract-provider/.../portfolio/shareproducts/api/ShareDividendApiResource.java
+@Path("/v1/shareproduct/{productId}/dividend")
+@Component
+@Tag(name = "Self Dividend", description = "")
+@RequiredArgsConstructor
+public class ShareDividendApiResource {
+
+    public static final String APPROVE = "approve";
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "DIVIDEND_SHAREPRODUCT";
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/shareproduct/{productId}/dividend` | List dividend payouts for the product. Supports `?status`, `?offset`, `?limit`, `?orderBy`, `?sortOrder`. |
+| `GET`  | `/v1/shareproduct/{productId}/dividend/{dividendId}` | List the per-account allocations of a single payout. Supports `?accountNo` filter and pagination. |
+| `POST` | `/v1/shareproduct/{productId}/dividend` | Initiate a new payout. Body carries `amount`, `dividendPeriodStartDate`, `dividendPeriodEndDate`. |
+| `PUT`  | `/v1/shareproduct/{productId}/dividend/{dividendId}?command=approve` | Approve and distribute. |
+| `DELETE` | `/v1/shareproduct/{productId}/dividend/{dividendId}` | Cancel an initiated payout. |
+
+### List
+
+```java
+@GET
+public String retrieveAll(@PathParam("productId") final Long productId,
+                          @QueryParam("offset") final Integer offset,
+                          @QueryParam("limit")  final Integer limit,
+                          @QueryParam("orderBy") final String orderBy,
+                          @QueryParam("sortOrder") final String sortOrder,
+                          @QueryParam("status") final Integer status) {
+    this.platformSecurityContext.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    sqlValidator.validate(orderBy);
+    sqlValidator.validate(sortOrder);
+    final SearchParameters searchParameters = SearchParameters.builder()
+            .limit(limit).offset(offset).orderBy(orderBy).sortOrder(sortOrder).build();
+    Page<ShareProductDividendPayOutData> dividendPayoutDetails =
+            this.shareProductDividendReadPlatformService.retriveAll(productId, status, searchParameters);
+    return this.toApiJsonSerializer.serialize(dividendPayoutDetails);
+}
+```
+
+The `SqlValidator` injection prevents SQL injection through the `orderBy` / `sortOrder` parameters; only known column identifiers are accepted.
+
+### Approve
+
+```java
+@PUT
+@Path("{dividendId}")
+public String updateDividendDetail(@PathParam("productId") final Long productId,
+                                   @PathParam("dividendId") final Long dividendId,
+                                   @QueryParam("command") final String commandParam,
+                                   final String apiRequestBodyAsJson) {
+    CommandWrapper commandWrapper;
+    if (is(commandParam, APPROVE)) {
+        commandWrapper = new CommandWrapperBuilder()
+                .approveShareProductDividendPayoutCommand(productId, dividendId)
+                .withJson(apiRequestBodyAsJson).build();
+    } else {
+        throw new UnrecognizedQueryParamException("command", commandParam);
+    }
+    return this.toApiJsonSerializer.serialize(this.commandsSourceWritePlatformService.logCommandSource(commandWrapper));
+}
+```
+
+`approve` is the only recognised command on this verb. Maker-checker is supported through `PortfolioCommandSourceWritePlatformService`.
+
+### Initiate
+
+```java
+@POST
+public String createDividendDetail(@PathParam("productId") final Long productId, final String apiRequestBodyAsJson) {
+    CommandWrapper commandWrapper = new CommandWrapperBuilder().createShareProductDividendPayoutCommand(productId)
+            .withJson(apiRequestBodyAsJson).build();
+    return this.toApiJsonSerializer.serialize(this.commandsSourceWritePlatformService.logCommandSource(commandWrapper));
+}
+```
+
+### Delete
+
+```java
+@DELETE
+@Path("{dividendId}")
+public String deleteDividendDetail(@PathParam("productId") final Long productId,
+                                   @PathParam("dividendId") final Long dividendId) {
+    final CommandWrapper commandWrapper = new CommandWrapperBuilder()
+            .deleteShareProductDividendPayoutCommand(productId, dividendId).build();
+    return this.toApiJsonSerializer.serialize(this.commandsSourceWritePlatformService.logCommandSource(commandWrapper));
+}
+```
+
+## Handlers
+
+| Command | Handler |
+| --- | --- |
+| `CREATE_SHAREPRODUCT` | `CreateShareProductCommandHandler` |
+| `UPDATE_SHAREPRODUCT` | `UpdateShareProductCommandHandler` |
+| `CREATE_DIVIDEND_SHAREPRODUCT` | `CreateShareProductDividendCommandHandler` |
+| `APPROVE_DIVIDEND_SHAREPRODUCT` | `ApproveShareProductDividendCommandHandler` |
+| `DELETE_DIVIDEND_SHAREPRODUCT` | `DeleteShareProductDividendCommandHandler` |
+
+The product CRUD handlers are reached through the generic facade (`POST /v1/products/share`) — see [/portfolio/products-generic](/portfolio/products-generic). The dividend handlers are reached through `ShareDividendApiResource`.
+
+## Dividend assembler
+
+`ShareProductDividendAssembler.fromParsedJson(JsonElement, Long productId)` computes the per-account allocation:
+
+1. Validates the period (start ≤ end, within product life).
+2. Loads all `ShareAccount` rows for the product whose state qualifies (active; or also approved if `allowDividendCalculationForInactiveClients=true`).
+3. For each account, computes the **share-days** held during the dividend period: sum over each holding interval of `shares × days`.
+4. Distributes the total `amount` proportional to each account's share-days.
+5. Creates `ShareAccountDividendDetails` rows and attaches them to the new `ShareProductDividendPayOutDetails`.
+
+`DividentProcessingException` (HTTP 400) is raised on overlapping periods or invalid amounts.
+
+## Read services
+
+- `ShareProductReadPlatformService` — `retrieveAllProducts(offset, limit)`, `retrieveOne(productId, isTemplate)`, `retrieveTemplate()` — the generic-facade calls.
+- `ShareProductDividendReadPlatformService` — `retriveAll(productId, status, searchParameters)`, `retriveOne(payOutId)`.
+- `ShareAccountDividendReadPlatformService` — `retriveAll(dividendId, searchParameters)` — per-account allocations of a single payout.
+- `ShareProductDropdownReadPlatformService` — dropdown options for charges, accounting rules, frequencies.
+
+## Permissions
+
+- Product CRUD permissions are derived from the generic facade: `CREATE_SHAREPRODUCT`, `UPDATE_SHAREPRODUCT`, etc.
+- Dividend permissions use the explicit resource `DIVIDEND_SHAREPRODUCT`: `READ_DIVIDEND_SHAREPRODUCT`, `CREATE_DIVIDEND_SHAREPRODUCT`, `APPROVE_DIVIDEND_SHAREPRODUCT`, `DELETE_DIVIDEND_SHAREPRODUCT`.
+
+## Failure modes
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `DividendNotFoundException` | 404 | `{dividendId}` unknown. |
+| `DividentProcessingException` | 400 | Bad dividend period or amount; overlapping period. |
+| `ShareAccountsNotFoundException` | 400 | No active share accounts exist on the product for the requested period. |
+| `IssueableSharesExceededException` | 400 | Issued via share-account approval; tracked here because the product is the source of truth for total share limits. |
+
+## Accounting
+
+When `accountingRule = CASH`, share-account activation, additional-share approval, redemption and dividend approval each post journal entries through the accounting layer using the product's configured GL accounts. See [/accounting/overview](/accounting/overview).
+
+## Edge cases
+
+- **Charges are global to the product but applied per account.** Adding a charge to the product after share accounts exist does not retroactively charge them; charges only apply to subsequent purchases.
+- **`endDate` is best-effort.** Once a share product has approved share accounts referencing it, you cannot "end" the product such that its accounts become invalid; the platform treats `endDate` as a guideline for new applications.
+- **Dividend rounding.** Allocations use `BigDecimal` with the product currency's scale; the sum of allocations should equal the payout amount but a single-unit rounding residue may remain in the last detail row to preserve the invariant.
+- **`totalSharesIssued` vs `totalSubscribedShares`.** The first is the cooperative-controlled count of shares ever issued; the second is the running approved-subscriber count. Reports use the second to compute the active capital base.
+
+## Cross-references
+
+- [/portfolio/share-accounts](/portfolio/share-accounts) — the per-client holdings that consume the product.
+- [/portfolio/products-generic](/portfolio/products-generic) — the `/v1/products/{type}` facade that handles product CRUD.
+- [/portfolio/account-details](/portfolio/account-details) — `ShareAccountSummaryData` rolls up to here.
+- [/accounting/overview](/accounting/overview) — journal-entry routing when `accountingRule = CASH`.
+- [/savings/overview](/savings/overview) — the savings accounts that receive dividend credits and fund purchases.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder.approveShareProductDividendPayoutCommand(...)`.

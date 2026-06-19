@@ -1,0 +1,392 @@
+---
+title: "Loan Reschedule Requests, Preview, Approval and State Machine"
+sidebarTitle: "Reschedule"
+description: "LoanRescheduleRequest entity, RescheduleLoansApiResource, preview/approve/reject command handlers and the term-variation rewrite in Fineract."
+---
+
+The reschedule subsystem in Apache Fineract turns a single operator request — "from installment N, change the due date / interest rate / extend by K periods" — into a fully approved schedule rewrite, audit-trailed and previewable. It lives in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/rescheduleloan/`. The flow is **maker-checker**: a request is submitted, then either approved (the schedule is rewritten as `LoanTermVariations` rows) or rejected (the request transitions to a terminal state without touching the loan).
+
+Cross references: ad-hoc schedule tweaks via `LoanScheduleApiResource` are at [Schedule API](/loan/loan-schedule-api); the underlying term-variation model is shared with [Interest pauses](/loan/interest-pauses); reAge/reAmortize are separate flows ([Re-aging](/loan/loan-arrears-and-reaging), [Re-amortization](/loan/loan-reamortization)); the REST handler table is at [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| REST | `portfolio/loanaccount/rescheduleloan/api/RescheduleLoansApiResource.java` | `fineract-loan` |
+| Swagger DTOs | `portfolio/loanaccount/rescheduleloan/api/RescheduleLoansApiResourceSwagger.java` | `fineract-loan` |
+| Constants | `portfolio/loanaccount/rescheduleloan/RescheduleLoansApiConstants.java` | `fineract-loan` |
+| Entity | `portfolio/loanaccount/rescheduleloan/domain/LoanRescheduleRequest.java` | `fineract-loan` |
+| Repository | `portfolio/loanaccount/rescheduleloan/domain/LoanRescheduleRequestRepository.java` | `fineract-loan` |
+| Repository wrapper | `LoanRescheduleRequestRepositoryWrapper` | `fineract-loan` |
+| Model | `LoanRescheduleModelRepaymentPeriod`, `LoanRescheduleModalPeriod` | `fineract-loan` |
+| Status data | `data/LoanRescheduleRequestStatusEnumData.java` | `fineract-loan` |
+| Enumeration | `data/LoanRescheduleRequestEnumerations.java` | `fineract-loan` |
+| Read service | `service/LoanRescheduleRequestReadPlatformService(Impl)` | `fineract-loan` |
+| Preview service | `service/LoanReschedulePreviewPlatformService.java` | `fineract-loan` |
+| Write service | `service/LoanRescheduleRequestWritePlatformService.java` | `fineract-loan` |
+| Create handler | `handler/CreateLoanRescheduleRequestCommandHandler.java` | `fineract-loan` |
+| Approve handler | `handler/ApproveLoanRescheduleRequestCommandHandler.java` | `fineract-loan` |
+| Reject handler | `handler/RejectLoanRescheduleRequestCommandHandler.java` | `fineract-loan` |
+| Validator | `data/LoanRescheduleRequestDataValidator(Impl)` | `fineract-loan` |
+
+## REST surface — `/v1/rescheduleloans`
+
+```java
+@Path("/v1/rescheduleloans")
+@Component
+public class RescheduleLoansApiResource {
+```
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/rescheduleloans/template` | Dropdown options (reasons, etc.) |
+| `GET` | `/rescheduleloans/{scheduleId}` | Read one request (with optional `?command=previewLoanReschedule`) |
+| `POST` | `/rescheduleloans` | Create reschedule request |
+| `POST` | `/rescheduleloans/{scheduleId}?command=approve` | Approve |
+| `POST` | `/rescheduleloans/{scheduleId}?command=reject` | Reject |
+| `GET` | `/rescheduleloans` | List with optional `?command=pending|approved|rejected` |
+
+Create handler:
+
+```java
+@POST
+public String createLoanRescheduleRequest(final String apiRequestBodyAsJson) {
+    final CommandWrapper commandWrapper = new CommandWrapperBuilder()
+            .createLoanRescheduleRequest(RescheduleLoansApiConstants.ENTITY_NAME)
+            .withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result =
+            this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+    return this.loanRescheduleRequestToApiJsonSerializer.serialize(result);
+}
+```
+
+State transitions:
+
+```java
+@POST @Path("{scheduleId}")
+public String updateLoanRescheduleRequest(@PathParam("scheduleId") final Long scheduleId,
+        @QueryParam("command") final String command, final String apiRequestBodyAsJson) {
+    CommandWrapper commandWrapper;
+    if (compareIgnoreCase(command, "approve")) {
+        commandWrapper = new CommandWrapperBuilder()
+                .approveLoanRescheduleRequest(RescheduleLoansApiConstants.ENTITY_NAME, scheduleId)
+                .withJson(apiRequestBodyAsJson).build();
+    } else if (compareIgnoreCase(command, "reject")) {
+        commandWrapper = new CommandWrapperBuilder()
+                .rejectLoanRescheduleRequest(RescheduleLoansApiConstants.ENTITY_NAME, scheduleId)
+                .withJson(apiRequestBodyAsJson).build();
+    } else {
+        throw new UnrecognizedQueryParamException("command", command, "approve", "reject");
+    }
+    ...
+}
+```
+
+## Entity — `LoanRescheduleRequest`
+
+```java
+public class LoanRescheduleRequest extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @Column(name = "status_enum", nullable = false)
+    private Integer statusEnum;
+
+    @Column(name = "reschedule_from_installment")
+    private Integer rescheduleFromInstallment;
+
+    @Column(name = "reschedule_from_date")
+    private LocalDate rescheduleFromDate;
+
+    @Column(name = "recalculate_interest")
+    private Boolean recalculateInterest;
+
+    @ManyToOne
+    @JoinColumn(name = "reschedule_reason_cv_id", nullable = false)
+    private CodeValue rescheduleReasonCodeValue;
+
+    @Column(name = "reschedule_reason_comment")
+    private String rescheduleReasonComment;
+
+    @Column(name = "submitted_on_date")
+    private LocalDate submittedOnDate;
+    @ManyToOne @JoinColumn(name = "submitted_by_user_id")
+    private AppUser submittedByUser;
+
+    @Column(name = "approved_on_date")
+    private LocalDate approvedOnDate;
+    @ManyToOne @JoinColumn(name = "approved_by_user_id")
+    private AppUser approvedByUser;
+
+    @Column(name = "rejected_on_date")
+    private LocalDate rejectedOnDate;
+    @ManyToOne @JoinColumn(name = "rejected_by_user_id")
+    private AppUser rejectedByUser;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "loanRescheduleRequest",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    private Set<LoanRescheduleRequestToTermVariationMapping>
+            loanRescheduleRequestToTermVariationMappings = new HashSet<>();
+```
+
+The DB table is `m_loan_reschedule_request`. The mapping table `m_loan_reschedule_request_term_variations_mapping` links the request to the `LoanTermVariations` rows generated when the request is approved.
+
+## Status enum
+
+`LoanStatus.fromInt` style enum in `LoanRescheduleRequestStatusEnumData`:
+
+| Value | Meaning |
+| --- | --- |
+| 100 | `Submitted and pending approval` |
+| 200 | `Approved` |
+| 300 | `Rejected` |
+
+State machine:
+
+<Steps>
+<Step title="Submitted (100)">
+Inserted by `CreateLoanRescheduleRequestCommandHandler` after validation. `submittedByUser`, `submittedOnDate` populated. Schedule untouched — the loan continues to amortise on its current installments.
+</Step>
+<Step title="Approved (200)">
+On `command=approve`, the write service generates `LoanTermVariations` (one row per `RescheduleReason` parameter present in the request — change of due date, interest rate, principal, grace, extra installments etc.), writes the schedule history archive, and re-projects the schedule using `LoanReschedulePreviewPlatformService.previewLoanReschedule(requestId)` as the truth source. `approvedByUser`, `approvedOnDate` populated. Loan schedule mutates.
+</Step>
+<Step title="Rejected (300)">
+`rejectedByUser`, `rejectedOnDate` set. No schedule change. Terminal.
+</Step>
+</Steps>
+
+Transitions Approved → Rejected and Rejected → Approved are **not allowed** — the entity throws `LoanRescheduleRequestNotInSubmittedAndPendingApprovalStateException`.
+
+## Validator — `LoanRescheduleRequestDataValidatorImpl`
+
+Implements `LoanRescheduleRequestDataValidator`. Key checks on create:
+
+| Field | Rule |
+| --- | --- |
+| `loanId` | Exists; loan status Active (or active in arrears) |
+| `rescheduleFromDate` | Required; must match an installment due date or fall on/after the first unpaid installment |
+| `rescheduleReasonId` | Must be a `CodeValue` of code `LoanRescheduleReason` |
+| `submittedOnDate` | Defaults to today; cannot be in the future |
+| One of the change parameters required: | `graceOnPrincipal`, `graceOnInterest`, `extraTerms`, `newInterestRate`, `adjustedDueDate`, `principalAmount`, `recalculateInterest`, etc. |
+| `adjustedDueDate` | Must be > `rescheduleFromDate` |
+| `principalAmount` | Allowed only for products with `allowVariableInstallments=true` |
+
+Approve checks:
+
+| Rule | |
+| --- | --- |
+| Request status must be `Submitted` (100) | |
+| `approvedOnDate >= submittedOnDate` | |
+| Loan still Active and not closed | |
+| All term variations the request would create do not collide with existing variations | |
+
+## Preview service — `LoanReschedulePreviewPlatformService`
+
+```java
+public interface LoanReschedulePreviewPlatformService {
+    LoanScheduleModel previewLoanReschedule(Long requestId);
+}
+```
+
+The preview path:
+
+1. Loads `LoanRescheduleRequest` by id.
+2. Translates the request parameters into a set of *transient* `LoanTermVariations` (not persisted).
+3. Calls the schedule generator (`LoanScheduleGenerator`) for the loan with those variations applied.
+4. Returns the resulting `LoanScheduleModel`.
+
+REST exposure:
+
+```java
+@GET @Path("{scheduleId}")
+public String readLoanRescheduleRequest(@Context final UriInfo uriInfo,
+        @PathParam("scheduleId") final Long scheduleId,
+        @QueryParam("command") final String command) {
+
+    LoanRescheduleRequestData data = ...;
+    if (compareIgnoreCase(command, "previewLoanReschedule")) {
+        LoanScheduleModel model = loanReschedulePreviewPlatformService.previewLoanReschedule(scheduleId);
+        return toApiJsonSerializer.serialize(model.toData());
+    }
+    return loanRescheduleRequestToApiJsonSerializer.serialize(settings, data);
+}
+```
+
+This means UIs can show "what would the schedule look like if approved" *without* committing.
+
+## Write service — `LoanRescheduleRequestWritePlatformService`
+
+```java
+public interface LoanRescheduleRequestWritePlatformService {
+    CommandProcessingResult create(JsonCommand jsonCommand);
+    CommandProcessingResult approve(JsonCommand jsonCommand);
+    CommandProcessingResult reject(JsonCommand jsonCommand);
+}
+```
+
+Implementation flow for `create`:
+
+1. Validate via `LoanRescheduleRequestDataValidator.validateForCreateAction(jsonCommand, loan)`.
+2. Build `LoanRescheduleRequest` with status `Submitted` (100).
+3. Persist; build child `LoanRescheduleRequestToTermVariationMapping` rows for each parameter present (using `LoanTermVariationType` values: `EMI_AMOUNT`, `DUE_DATE`, `EXTEND_REPAYMENT_PERIOD`, `INTEREST_RATE`, `GRACE_ON_PRINCIPAL`, `GRACE_ON_INTEREST`, `PRINCIPAL_AMOUNT`).
+4. Fire `LoanRescheduleRequestCreatedBusinessEvent`.
+5. Return `CommandProcessingResultBuilder.withEntityId(rescheduleRequest.getId()).withLoanId(loan.getId()).build()`.
+
+`approve`:
+
+1. Load + validate state.
+2. Snapshot the existing schedule into `LoanScheduleHistory`.
+3. For each mapped term variation, promote the *transient* variation to a persisted `LoanTermVariations` row (now linked to the loan).
+4. Recompute the schedule (`LoanMapper.regenerateScheduleModel` — see [Mappers & serialization](/loan/loan-mappers-and-serialization)).
+5. Apply payment allocation rules to reseat existing transactions.
+6. Mark request as `Approved` (200) with timestamp + approver.
+7. Fire `LoanRescheduleRequestApprovedBusinessEvent`.
+
+`reject`:
+
+1. Load + validate state.
+2. Set status `Rejected` (300) with timestamp + rejector.
+3. Fire `LoanRescheduleRequestRejectedBusinessEvent`.
+
+## Command handlers
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "RESCHEDULELOAN", action = "CREATE")
+public class CreateLoanRescheduleRequestCommandHandler implements NewCommandSourceHandler {
+    private final LoanRescheduleRequestWritePlatformService writeService;
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return writeService.create(command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "RESCHEDULELOAN", action = "APPROVE")
+public class ApproveLoanRescheduleRequestCommandHandler implements NewCommandSourceHandler {
+    private final LoanRescheduleRequestWritePlatformService writeService;
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return writeService.approve(command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "RESCHEDULELOAN", action = "REJECT")
+public class RejectLoanRescheduleRequestCommandHandler implements NewCommandSourceHandler {
+    private final LoanRescheduleRequestWritePlatformService writeService;
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return writeService.reject(command);
+    }
+}
+```
+
+## Request body shapes
+
+### Create
+
+```json
+{
+  "loanId": 123,
+  "rescheduleFromDate": "21 February 2024",
+  "rescheduleReasonId": 17,
+  "rescheduleReasonComment": "Customer travel",
+  "submittedOnDate": "10 February 2024",
+  "graceOnPrincipal": 2,
+  "graceOnInterest": 0,
+  "extraTerms": 3,
+  "newInterestRate": "12.5",
+  "recalculateInterest": true,
+  "adjustedDueDate": "15 March 2024",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+Most fields are optional; at least one *change* field must be present.
+
+### Approve
+
+```json
+{ "approvedOnDate": "12 February 2024", "locale": "en", "dateFormat": "dd MMMM yyyy" }
+```
+
+### Reject
+
+```json
+{ "rejectedOnDate": "12 February 2024", "locale": "en", "dateFormat": "dd MMMM yyyy" }
+```
+
+### Preview
+
+`GET /v1/rescheduleloans/{id}?command=previewLoanReschedule` — no body. Response is a `LoanScheduleData` JSON.
+
+## Term variations created on approval
+
+| Reschedule param | `LoanTermVariationType` |
+| --- | --- |
+| `adjustedDueDate` | `DUE_DATE` |
+| `extraTerms` | `EXTEND_REPAYMENT_PERIOD` |
+| `newInterestRate` | `INTEREST_RATE` |
+| `graceOnPrincipal` | `GRACE_ON_PRINCIPAL` |
+| `graceOnInterest` | `GRACE_ON_INTEREST` |
+| `principalAmount` | `PRINCIPAL_AMOUNT` |
+| `installmentAmount` | `EMI_AMOUNT` |
+
+All rows carry the same `applicableFromDate = rescheduleFromDate` and link back to the request via `m_loan_reschedule_request_term_variations_mapping`.
+
+## Permissions
+
+| Operation | Permission |
+| --- | --- |
+| Create | `CREATE_RESCHEDULELOAN` |
+| Approve | `APPROVE_RESCHEDULELOAN` |
+| Reject | `REJECT_RESCHEDULELOAN` |
+| Read | `READ_RESCHEDULELOAN` |
+
+Maker-checker can be configured against each via the standard `m_permission` rows.
+
+## Worked sequence
+
+<Steps>
+<Step title="Operator drafts request">
+`POST /v1/rescheduleloans` with `rescheduleFromDate`, reason, and change parameters. Row inserted with status 100.
+</Step>
+<Step title="Reviewer previews">
+`GET /v1/rescheduleloans/{id}?command=previewLoanReschedule` returns the prospective `LoanScheduleData`. No persistence.
+</Step>
+<Step title="Approver approves">
+`POST /v1/rescheduleloans/{id}?command=approve` writes `LoanTermVariations`, archives the prior schedule, recomputes installments and fires `LoanRescheduleRequestApprovedBusinessEvent`.
+</Step>
+<Step title="(Alternative) Approver rejects">
+`POST /v1/rescheduleloans/{id}?command=reject` — status 300, terminal, schedule untouched.
+</Step>
+</Steps>
+
+## Differences vs. `LoanScheduleApiResource`
+
+| Aspect | Reschedule | Schedule API |
+| --- | --- | --- |
+| Maker-checker | Built-in (Submitted → Approved/Rejected) | Single-step; rely on generic maker-checker permission |
+| Audit row | `m_loan_reschedule_request` + `m_loan_schedule_history` | `m_loan_schedule_history` only |
+| Body model | Reschedule reasons, extra terms, new interest rate | Per-installment exceptions only |
+| Preview endpoint | `?command=previewLoanReschedule` | `?command=calculateLoanSchedule` |
+| Applicable products | All loan products | Only when `allowVariableInstallments = true` |
+| Granularity | Whole tail of schedule from N onward | Individual installments |
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Schedule API](/loan/loan-schedule-api)
+- [Interest pauses](/loan/interest-pauses)
+- [Re-aging and arrears](/loan/loan-arrears-and-reaging)
+- [Re-amortization](/loan/loan-reamortization)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

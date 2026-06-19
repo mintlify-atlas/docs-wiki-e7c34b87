@@ -1,0 +1,329 @@
+---
+title: "Client and Group Transfers Between Offices"
+sidebarTitle: "Transfers"
+description: "Reference for client/group transfers across offices: propose, accept, reject, withdraw and propose-and-accept, plus the TransferEventType lifecycle."
+---
+
+Apache Fineract supports moving a client (and their loans, savings, group/center memberships and staff assignments) from one branch office to another through the `org.apache.fineract.portfolio.transfer` subsystem. Transfers may go through a two-step "propose then accept" handshake when the source and destination offices want separate maker/approver actors, or they may run as a one-step "propose-and-accept" for users with data scope over both.
+
+There is **no** standalone `TransfersApiResource` — the endpoints are mounted on `ClientsApiResource` (`POST /v1/clients/{clientId}?command=...`) and `GroupsApiResource` (`POST /v1/groups/{groupId}?command=transferClients`). All the lifecycle logic lives in `TransferWritePlatformService` and is invoked through dedicated command handlers (`ProposeClientTransferCommandHandler`, `AcceptClientTransferCommandHandler`, …).
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `TransferWritePlatformService`, `…Impl` | `fineract-provider` | `org.apache.fineract.portfolio.transfer.service` |
+| `TransferEventType` enum | `fineract-provider` | `org.apache.fineract.portfolio.transfer.service` |
+| `TransferApiConstants` | `fineract-provider` | `org.apache.fineract.portfolio.transfer.api` |
+| `TransfersDataValidator` | `fineract-provider` | `org.apache.fineract.portfolio.transfer.data` |
+| Handlers (`ProposeClientTransfer…`, `AcceptClientTransfer…`, `RejectClientTransfer…`, `WithdrawClientTransfer…`, `ProposeAndAcceptClientTransfer…`, `TransferClientsBetweenGroups…`) | `fineract-provider` | `org.apache.fineract.portfolio.transfer.handler` |
+| Exceptions (`ClientNotAwaitingTransferApprovalException`, `…OrOnHoldException`, `TransferNotSupportedException`) | `fineract-provider` | `org.apache.fineract.portfolio.transfer.exception` |
+| `TransferConfiguration` | `fineract-provider` | `org.apache.fineract.portfolio.transfer.starter` |
+
+The transfer flow does not own its own JPA entity. It mutates `Client.office`, `Client.transferToOffice`, `Client.status`, group memberships, loan/savings office references, and writes a `ClientTransferDetails` audit row through `ClientTransferDetailsRepository`.
+
+## Lifecycle
+
+```java
+// fineract-provider/.../portfolio/transfer/service/TransferEventType.java
+public enum TransferEventType {
+    PROPOSAL(1, "transferEvent.proposal"),
+    ACCEPTANCE(2, "transferEvent.acceptance"),
+    WITHDRAWAL(3, "transferEvent.withdrawal"),
+    REJECTION(4, "transferEvent.rejection");
+}
+```
+
+The client status transitions through:
+
+```
+ACTIVE
+  │   proposeClientTransfer (PROPOSAL)
+  ▼
+TRANSFER_IN_PROGRESS
+  │   acceptClientTransfer (ACCEPTANCE) → ACTIVE (in destination office)
+  │   rejectClientTransfer (REJECTION) → ACTIVE (in source office)
+  │   withdrawClientTransfer (WITHDRAWAL) → ACTIVE (in source office)
+  ▼   (optionally TRANSFER_ON_HOLD)
+
+ACTIVE
+  │   proposeAndAcceptClientTransfer (PROPOSAL + ACCEPTANCE in one call)
+  ▼
+ACTIVE (in destination office)
+```
+
+The "on hold" sub-state is set during the propose call so the destination office can review without the source's source-of-truth changing. Read-side queries during this period continue to scope by office hierarchy.
+
+## Service contract
+
+```java
+// fineract-provider/.../portfolio/transfer/service/TransferWritePlatformService.java
+public interface TransferWritePlatformService {
+
+    CommandProcessingResult transferClientsBetweenGroups(Long sourceGroupId, JsonCommand jsonCommand);
+
+    CommandProcessingResult proposeClientTransfer(Long clientId, JsonCommand jsonCommand);
+
+    CommandProcessingResult withdrawClientTransfer(Long clientId, JsonCommand jsonCommand);
+
+    CommandProcessingResult acceptClientTransfer(Long clientId, JsonCommand jsonCommand);
+
+    CommandProcessingResult rejectClientTransfer(Long clientId, JsonCommand jsonCommand);
+
+    CommandProcessingResult proposeAndAcceptClientTransfer(Long clientId, JsonCommand jsonCommand);
+}
+```
+
+All six are wired through `TransferWritePlatformServiceJpaRepositoryImpl`. Each is `@Transactional` and pushes the work through a shared helper `handleClientTransferLifecycleEvent(client, office, eventType, command)` so the side effects (group membership rewrites, savings/loan office reassignment, staff reassignment, audit-row creation) stay consistent.
+
+## Request parameters
+
+```java
+// fineract-provider/.../portfolio/transfer/api/TransferApiConstants.java
+public final class TransferApiConstants {
+    public static final String localeParamName       = "locale";
+    public static final String dateFormatParamName   = "dateFormat";
+
+    public static final String idParamName                       = "id";
+    public static final String destinationGroupIdParamName        = "destinationGroupId";
+    public static final String clients                            = "clients";
+    public static final String inheritDestinationGroupLoanOfficer = "inheritDestinationGroupLoanOfficer";
+    public static final String newStaffIdParamName                = "staffId";
+    public static final String transferActiveLoans                = "transferActiveLoans";
+    public static final String destinationOfficeIdParamName       = "destinationOfficeId";
+    public static final String note                               = "note";
+    public static final String transferDate                       = "transferDate";
+
+    public static final String transferClientLoanException     = "error.msg.cannot.transfer.client.as.loan.transaction.present.on.or.after.transfer.date";
+    public static final String transferClientSavingsException  = "error.msg.cannot.transfer.client.as.savings.transaction.present.on.or.after.transfer.date";
+    public static final String transferClientToSameOfficeException = "error.msg.cannot.transfer.client.as.selected.office.and.current.office.are.same";
+}
+```
+
+Common body for a propose: `destinationOfficeId`, `transferDate`, optional `staffId`, optional `note`. The accept body may carry `destinationGroupId` to link the transferred client to a group at acceptance time, and `inheritDestinationGroupLoanOfficer=true` to take over the loan officer of the destination group.
+
+## REST mounting on `ClientsApiResource`
+
+The transfer commands ride the standard `POST /v1/clients/{clientId}?command=...` envelope:
+
+```java
+// fineract-provider/.../portfolio/client/api/ClientsApiResource.java
+@POST
+@Path("{clientId}")
+@Operation(summary = "Activate a Client | Close a Client | ... | "
+                  + "Propose a Client Transfer | Withdraw a Client Transfer | "
+                  + "Reject a Client Transfer | Accept a Client Transfer | "
+                  + "Propose and Accept a Client Transfer")
+public String activate(@PathParam("clientId") final Long clientId,
+                       @QueryParam("command") final String commandParam,
+                       final String apiRequestBodyAsJson) {
+    return applyCommandOverClient(clientId, null, commandParam, apiRequestBodyAsJson);
+}
+```
+
+Recognised `?command=` values for transfer:
+
+| Command | Handler | Service method |
+| --- | --- | --- |
+| `proposeTransfer` | `ProposeClientTransferCommandHandler` | `proposeClientTransfer` |
+| `acceptTransfer` | `AcceptClientTransferCommandHandler` | `acceptClientTransfer` |
+| `rejectTransfer` | `RejectClientTransferCommandHandler` | `rejectClientTransfer` |
+| `withdrawTransfer` | `WithdrawClientTransferCommandHandler` | `withdrawClientTransfer` |
+| `proposeAndAcceptTransfer` | `ProposeAndAcceptClientTransferCommandHandler` | `proposeAndAcceptClientTransfer` |
+
+`GET /v1/clients/{clientId}/transferproposaldate` returns a template suitable for proposing a transfer (today's business date plus the office hierarchy).
+
+The group-to-group flow is mounted on `GroupsApiResource` as `POST /v1/groups/{sourceGroupId}?command=transferClients` and dispatched through `TransferClientsBetweenGroupsCommandHandler` → `transferClientsBetweenGroups(...)`.
+
+## `proposeAndAcceptClientTransfer`
+
+The most-used path in installations with a single back-office actor. Source:
+
+```java
+@Override
+public CommandProcessingResult proposeAndAcceptClientTransfer(final Long clientId, final JsonCommand jsonCommand) {
+    this.transfersDataValidator.validateForProposeAndAcceptClientTransfer(jsonCommand.json());
+
+    final Long destinationOfficeId = jsonCommand.longValueOfParameterNamed(TransferApiConstants.destinationOfficeIdParamName);
+    final Office office = this.officeRepository.findOneWithNotFoundDetection(destinationOfficeId);
+    final Client client = this.clientRepositoryWrapper.findOneWithNotFoundDetection(clientId, true);
+
+    handleClientTransferLifecycleEvent(client, office, TransferEventType.PROPOSAL, jsonCommand);
+    this.clientRepositoryWrapper.saveAndFlush(client);
+
+    handleClientTransferLifecycleEvent(client, client.getTransferToOffice(), TransferEventType.ACCEPTANCE, jsonCommand);
+    this.clientRepositoryWrapper.saveAndFlush(client);
+
+    return new CommandProcessingResultBuilder()
+            .withClientId(clientId)
+            .withEntityId(clientId)
+            .build();
+}
+```
+
+Two passes through `handleClientTransferLifecycleEvent` — first to propose, then to accept — execute in a single DB transaction. If anything fails (loan validation, savings validation, office hierarchy), both are rolled back.
+
+## `proposeClientTransfer`
+
+```java
+@Override
+public CommandProcessingResult proposeClientTransfer(final Long clientId, final JsonCommand jsonCommand) {
+    this.transfersDataValidator.validateForProposeClientTransfer(jsonCommand.json());
+    final Long destinationOfficeId = jsonCommand.longValueOfParameterNamed(TransferApiConstants.destinationOfficeIdParamName);
+    final Office office = this.officeRepository.findOneWithNotFoundDetection(destinationOfficeId);
+    final Client client = this.clientRepositoryWrapper.findOneWithNotFoundDetection(clientId);
+
+    if (client.getOffice().getId().equals(destinationOfficeId)) {
+        throw new GeneralPlatformDomainRuleException(
+                TransferApiConstants.transferClientToSameOfficeException,
+                TransferApiConstants.transferClientToSameOfficeExceptionMessage,
+                office.getName());
+    }
+    handleClientTransferLifecycleEvent(client, office, TransferEventType.PROPOSAL, jsonCommand);
+    this.clientRepositoryWrapper.saveAndFlush(client);
+    return new CommandProcessingResultBuilder()
+            .withClientId(clientId).withEntityId(clientId).build();
+}
+```
+
+Side effects:
+
+- Sets `Client.transferToOffice = destinationOffice`.
+- Sets `Client.status = TRANSFER_IN_PROGRESS`.
+- Records a `ClientTransferDetails` row with `transferEventType = PROPOSAL`, `submitted_by`, `submitted_on_date`.
+- If `inheritDestinationGroupLoanOfficer=true` and `destinationGroupId` is present, queues the staff reassignment for acceptance.
+
+## `acceptClientTransfer`
+
+```java
+@Override
+public CommandProcessingResult acceptClientTransfer(final Long clientId, final JsonCommand jsonCommand) {
+    this.transfersDataValidator.validateForAcceptClientTransfer(jsonCommand.json());
+    final Client client = this.clientRepositoryWrapper.findOneWithNotFoundDetection(clientId, true);
+    validateClientAwaitingTransferAcceptance(client);
+    handleClientTransferLifecycleEvent(client, client.getTransferToOffice(), TransferEventType.ACCEPTANCE, jsonCommand);
+    this.clientRepositoryWrapper.saveAndFlush(client);
+    return new CommandProcessingResultBuilder().withClientId(clientId).withEntityId(clientId).build();
+}
+```
+
+`validateClientAwaitingTransferAcceptance(client)` raises `ClientNotAwaitingTransferApprovalException` (HTTP 400) when the client is not actually in `TRANSFER_IN_PROGRESS`.
+
+`handleClientTransferLifecycleEvent(..., ACCEPTANCE, ...)`:
+
+- Sets `Client.office = transferToOffice`.
+- Clears `Client.transferToOffice`.
+- Sets `Client.status = ACTIVE`.
+- Rewrites loan/savings/share account `office_id` for every account the client owns.
+- Removes the client from any source-office group; adds to `destinationGroupId` if provided.
+- Reassigns the loan officer to the destination's officer if `inheritDestinationGroupLoanOfficer=true`.
+- Records a `ClientTransferDetails` row with `transferEventType = ACCEPTANCE`.
+
+## `withdrawClientTransfer` and `rejectClientTransfer`
+
+Both unwind the proposal:
+
+- `withdraw` — the **source office** withdraws the proposal. Uses `validateClientAwaitingTransferAcceptanceOnHold(client)`; raises `ClientNotAwaitingTransferApprovalOrOnHoldException` (HTTP 400).
+- `reject` — the **destination office** rejects. Raises `ClientNotAwaitingTransferApprovalException` if the client is not awaiting.
+
+Both flip the client back to `ACTIVE` in the source office, clear `transferToOffice`, and record the appropriate event.
+
+## Validation rules (`TransfersDataValidator`)
+
+Cross-cutting rules enforced on every flow:
+
+- **Date** — `transferDate` must be on or after the latest loan or savings transaction touching the client. Otherwise raises `GeneralPlatformDomainRuleException` with `transferClientLoanException` / `transferClientSavingsException`.
+- **Same-office prevention** — `transferClientToSameOfficeException` blocks moves to the current office.
+- **Loan / savings activity gate** — if `transferActiveLoans=false` is requested but the client has active loans, the operation refuses with `TransferNotSupportedException`.
+- **Office hierarchy** — the caller must have data scope over both source and destination offices for the propose-and-accept flow; otherwise the security filter cuts in before validation.
+
+## Group ↔ group client transfers
+
+`transferClientsBetweenGroups(Long sourceGroupId, JsonCommand)` moves a set of clients listed by id (`"clients": [1, 2, 3]`) from one group to another within the same office. The body carries `destinationGroupId`, optional `inheritDestinationGroupLoanOfficer`, and optional `transferActiveLoans`. The handler:
+
+1. Validates that source and destination groups belong to the same office.
+2. For each client, rewrites the `m_group_client` membership row.
+3. Optionally rewrites loan officer assignments on the client's loans and savings.
+
+No cross-office implication — this is a within-office regrouping.
+
+## Audit and events
+
+Every transfer event is published as a `BusinessEvent` (`ClientTransferBusinessEvent` family) so listeners (Kafka, web hooks) can react. The `ClientTransferDetails` JPA row provides the audit trail of who proposed/accepted/rejected and when.
+
+See [/event/overview](/event/overview) and [/cob/overview](/cob/overview) for downstream consumers.
+
+## Permissions
+
+- `PROPOSE_CLIENTTRANSFER`, `WITHDRAW_CLIENTTRANSFER`, `REJECT_CLIENTTRANSFER`, `ACCEPT_CLIENTTRANSFER`, `PROPOSEANDACCEPT_CLIENTTRANSFER`.
+- `TRANSFERCLIENTS_GROUP` for group-to-group.
+
+Maker-checker is supported on every command.
+
+## Failure modes
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `ClientNotAwaitingTransferApprovalException` | 400 | Accept/reject called on a client not in `TRANSFER_IN_PROGRESS`. |
+| `ClientNotAwaitingTransferApprovalOrOnHoldException` | 400 | Withdraw called on a client not awaiting/on-hold. |
+| `TransferNotSupportedException` | 400 | Active loans or savings preclude the transfer under the requested flags. |
+| `GeneralPlatformDomainRuleException` (`transferClientToSameOfficeException`) | 400 | Destination equals source office. |
+| `GeneralPlatformDomainRuleException` (`transferClientLoanException` / `…Savings…`) | 400 | Transactions exist on or after `transferDate`. |
+
+## Edge cases
+
+- **JLG loans in the source group** — when a client with active JLG loans is transferred, those loans are typically converted to individual loans at acceptance time (see [/loan/glim-group-loans](/loan/glim-group-loans)).
+- **Repeat transfers** — a client can be transferred any number of times. Each event is auditable.
+- **Bulk transfer** — there is no bulk-clients-across-offices endpoint analogous to the group-to-group one; loop the calling application over `proposeAndAcceptTransfer` instead.
+- **Transfer date in the past** — allowed as long as no transactions exist on or after that date for the client.
+
+## Wire-level example: propose-and-accept
+
+```bash
+curl -u admin:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/clients/12?command=proposeAndAcceptTransfer' \
+  -d '{
+    "destinationOfficeId": 2,
+    "transferDate": "2024-08-01",
+    "dateFormat": "yyyy-MM-dd",
+    "locale": "en",
+    "note": "Client relocated to north branch",
+    "transferActiveLoans": true,
+    "inheritDestinationGroupLoanOfficer": false
+  }'
+```
+
+The response is a single `CommandProcessingResult` with `clientId`, `entityId` and (for maker-checker installs) the `commandId` to monitor for approval.
+
+## Two-step example
+
+```bash
+# Source-office step
+curl -u maker:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/clients/12?command=proposeTransfer' \
+  -d '{ "destinationOfficeId": 2, "transferDate": "2024-08-01",
+        "dateFormat": "yyyy-MM-dd", "locale": "en" }'
+
+# Destination-office step (different actor)
+curl -u acceptor:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/clients/12?command=acceptTransfer' \
+  -d '{ "destinationGroupId": 5,
+        "inheritDestinationGroupLoanOfficer": true,
+        "dateFormat": "yyyy-MM-dd", "locale": "en" }'
+```
+
+Between the two calls the client sits in `TRANSFER_IN_PROGRESS`; the source office can call `?command=withdrawTransfer` to abort, and the destination office can call `?command=rejectTransfer`.
+
+## Cross-references
+
+- [/portfolio/clients](/portfolio/clients) — `Client` entity, lifecycle, status types.
+- [/portfolio/groups-and-centers](/portfolio/groups-and-centers) — the JLG groups that may be reassigned.
+- [/portfolio/account-details](/portfolio/account-details) — the summary view used to confirm what would be transferred.
+- [/loan/loan-domain-model](/loan/loan-domain-model) — loan office references rewritten on accept.
+- [/savings/savings-account-domain](/savings/savings-account-domain) — savings office references rewritten on accept.
+- [/event/overview](/event/overview) — business-event listeners that react to transfer events.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder.acceptClientTransfer(...)` and family.

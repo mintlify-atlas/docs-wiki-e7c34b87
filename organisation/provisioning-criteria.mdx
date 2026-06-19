@@ -1,0 +1,309 @@
+---
+title: "Provisioning Criteria — Loan Loss Provisioning Definitions"
+sidebarTitle: "Provisioning Criteria"
+description: "Fineract ProvisioningCriteria, ProvisioningCriteriaDefinition (min/max age, percentage, GL accounts), product mapping, API endpoints and overlap rules."
+---
+
+In Apache Fineract a **provisioning criteria** is the rule set that turns the day-count of overdue loans into a set of GL journal lines for loan-loss provisioning. It binds:
+
+- a name (`criteriaName`),
+- a list of `LoanProduct`s the rule applies to,
+- a list of *definitions* — one per [provisioning category](/organisation/provisioning-categories) — each carrying a min/max overdue-day band, a `provisioningPercentage`, and the pair of GL accounts (liability + expense) to debit/credit when the periodic "Generate Loan Loss Provisioning" job runs.
+
+A single criteria typically encodes a national-regulator schedule like *RBI's IRACP*, or a Basel-style staging table. This page documents the entities, the validator's overlap and percentage rules, and every endpoint on `ProvisioningCriteriaApiResource` (`/v1/provisioningcriteria`).
+
+<Note>
+Provisioning entity classes are split: a few read-side data classes and exception types live in `fineract-core` under `organisation/provisioning/data` and `…/exception`, while the JPA entities, repositories, write services, validators, command handlers and the JAX-RS resource all live in `fineract-provider`. Categories ([provisioning-categories](/organisation/provisioning-categories)) and criteria are two sibling resources.
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `ProvisioningCriteria`, `ProvisioningCriteriaDefinition`, `LoanProductProvisionCriteria` | `fineract-provider` |
+| Entity | `ProvisioningCategory` | `fineract-provider` |
+| Data | `ProvisioningCriteriaData`, `ProvisioningCriteriaDefinitionData`, `ProvisioningCategoryData` (core) | core / provider |
+| Constants | `ProvisioningCriteriaConstants` | `fineract-provider` |
+| Repositories | `ProvisioningCriteriaRepository`, `ProvisioningCriteriaDefinitionRepository`, `ProvisioningCategoryRepository` | `fineract-provider` |
+| Read services | `ProvisioningCriteriaReadPlatformService` / `…Impl`, `ProvisioningCategoryReadPlatformService` (core) / `…Impl` | core / provider |
+| Write services | `ProvisioningCriteriaWritePlatformService` (core) / `…JpaRepositoryImpl`, `ProvisioningCategoryWritePlatformService` (core) / `…JpaRepositoryImpl` | core / provider |
+| Assembler | `ProvisioningCriteriaAssembler` | `fineract-provider` |
+| Validator | `ProvisioningCriteriaDefinitionJsonDeserializer` | `fineract-provider` |
+| Handlers | `CreateProvisioningCriteriaRequestCommandHandler`, `UpdateProvisioningCriteriaRequestCommandHandler`, `DeleteProvisioningCriteriaRequestCommandHandler` | `fineract-provider` |
+| JAX-RS | `ProvisioningCriteriaApiResource` (`/v1/provisioningcriteria`) | `fineract-provider` |
+| Exceptions | `ProvisioningCriteriaNotFoundException`, `ProvisioningCriteriaCannotBeCreatedException`, `ProvisioningCriteriaCannotBeDeletedException`, `ProvisioningCriteriaOverlappingDefinitionException` | core / provider |
+
+## `ProvisioningCriteria` entity
+
+```java
+// fineract-provider/.../provisioning/domain/ProvisioningCriteria.java
+@Entity
+@Table(name = "m_provisioning_criteria",
+       uniqueConstraints = { @UniqueConstraint(columnNames = {"criteria_name"}, name = "criteria_name") })
+public class ProvisioningCriteria extends AbstractAuditableCustom {
+
+    @Column(name = "criteria_name", nullable = false)
+    private String criteriaName;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "criteria",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    Set<ProvisioningCriteriaDefinition> provisioningCriteriaDefinition = new HashSet<>();
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "criteria",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    Set<LoanProductProvisionCriteria> loanProductMapping = new HashSet<>();
+}
+```
+
+- Extends `AbstractAuditableCustom` so `createdBy`, `createdDate`, `lastModifiedBy`, `lastModifiedDate` are managed automatically — provisioning policy changes need an audit trail.
+- `criteriaName` is **unique per tenant** (`criteria_name` unique constraint).
+- `provisioningCriteriaDefinition` is the set of age bands (typically four: standard, sub-standard, doubtful, loss).
+- `loanProductMapping` is the M:N to `LoanProduct` materialised through `LoanProductProvisionCriteria`.
+
+### `LoanProductProvisionCriteria`
+
+```java
+@Entity
+@Table(name = "m_loanproduct_provisioning_mapping")
+public class LoanProductProvisionCriteria {
+    @ManyToOne @JoinColumn(name = "criteria_id")     private ProvisioningCriteria criteria;
+    @ManyToOne @JoinColumn(name = "product_id")      private LoanProduct          loanProduct;
+}
+```
+
+This is a pure join table with the side benefit that re-assigning a product to a different criteria is a single row update. The `update(...)` method on `ProvisioningCriteria` walks the supplied product list, removes mappings that no longer apply and inserts new ones:
+
+```java
+public Map<String, Object> update(JsonCommand command, List<LoanProduct> loanProducts) {
+    // … rename criteriaName diff …
+    Set<LoanProductProvisionCriteria> temp = new HashSet<>();
+    Set<LoanProduct> productsTemp = new HashSet<>();
+    for (LoanProductProvisionCriteria mapping : loanProductMapping) {
+        if (!loanProducts.contains(mapping.getLoanProduct())) {
+            temp.add(mapping);
+        } else {
+            productsTemp.add(mapping.getLoanProduct());
+        }
+    }
+    loanProductMapping.removeAll(temp);
+    for (LoanProduct loanProduct : loanProducts) {
+        if (!productsTemp.contains(loanProduct)) {
+            this.loanProductMapping.add(new LoanProductProvisionCriteria(this, loanProduct));
+        }
+    }
+    actualChanges.put(ProvisioningCriteriaConstants.JSON_LOANPRODUCTS_PARAM, loanProductMapping);
+    return actualChanges;
+}
+```
+
+## `ProvisioningCriteriaDefinition`
+
+```java
+@Entity
+@Table(name = "m_provisioning_criteria_definition")
+public class ProvisioningCriteriaDefinition extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "criteria_id", nullable = false)
+    private ProvisioningCriteria criteria;
+
+    @ManyToOne @JoinColumn(name = "category_id", nullable = false)
+    private ProvisioningCategory provisioningCategory;
+
+    @Column(name = "min_age",                nullable = false) private Long       minimumAge;
+    @Column(name = "max_age",                nullable = false) private Long       maximumAge;
+    @Column(name = "provision_percentage",   nullable = false) private BigDecimal provisioningPercentage;
+
+    @ManyToOne @JoinColumn(name = "liability_account", nullable = false) private GLAccount liabilityAccount;
+    @ManyToOne @JoinColumn(name = "expense_account",   nullable = false) private GLAccount expenseAccount;
+}
+```
+
+### Column inventory
+
+| Column | Field | Meaning |
+| --- | --- | --- |
+| `criteria_id` | parent | FK to `m_provisioning_criteria` |
+| `category_id` | `provisioningCategory` | FK to `m_provision_category` — `STANDARD` / `SUB-STANDARD` / `DOUBTFUL` / `LOSS` (see [provisioning categories](/organisation/provisioning-categories)) |
+| `min_age` | `minimumAge` | Inclusive lower bound on overdue days |
+| `max_age` | `maximumAge` | Inclusive upper bound on overdue days |
+| `provision_percentage` | `provisioningPercentage` | `0.00`–`100.00` percentage to provision against the outstanding |
+| `liability_account` | `liabilityAccount` | GL account credited with the provision |
+| `expense_account` | `expenseAccount` | GL account debited with the provision |
+
+### Overlap rule
+
+The validator forbids overlapping age bands for the same criteria:
+
+```java
+public boolean isOverlapping(ProvisioningCriteriaDefinition def) {
+    return this.minimumAge <= def.maximumAge && def.minimumAge <= this.maximumAge;
+}
+```
+
+If two definitions overlap, the assembler raises `ProvisioningCriteriaOverlappingDefinitionException` (HTTP 400, `error.msg.provisioningcriteria.definition.is.overlapping`). The typical 4-band shape is:
+
+| Category | min_age | max_age | percentage |
+| --- | --- | --- | --- |
+| `STANDARD` | 0 | 30 | 0.25 |
+| `SUB-STANDARD` | 31 | 90 | 5.00 |
+| `DOUBTFUL` | 91 | 365 | 25.00 |
+| `LOSS` | 366 | 9999 | 100.00 |
+
+### In-place update of a definition
+
+```java
+public void update(Long minAge, Long maxAge, BigDecimal percentage, GLAccount lia, GLAccount exp) {
+    this.minimumAge = minAge;
+    this.maximumAge = maxAge;
+    this.provisioningPercentage = percentage;
+    this.liabilityAccount = lia;
+    this.expenseAccount   = exp;
+}
+```
+
+The parent calls this from `ProvisioningCriteria.update(ProvisioningCriteriaDefinitionData data, GLAccount lia, GLAccount exp)` for each definition whose id matches an entry in the new payload — the category itself cannot be reshuffled, only the band, percentage and GL accounts.
+
+## `ProvisioningCriteriaApiResource` — `/v1/provisioningcriteria`
+
+```java
+@Path("/v1/provisioningcriteria")
+@Component
+@Tag(name = "Provisioning Criteria", description = "This defines the Provisioning Criteria")
+@RequiredArgsConstructor
+public class ProvisioningCriteriaApiResource {
+    private final PlatformSecurityContext                          platformSecurityContext;
+    private final ApiRequestParameterHelper                        apiRequestParameterHelper;
+    private final ProvisioningCriteriaReadPlatformService          provisioningCriteriaReadPlatformService;
+    private final PortfolioCommandSourceWritePlatformService       commandsSourceWritePlatformService;
+    private final DefaultToApiJsonSerializer<ProvisioningCriteriaData> toApiJsonSerializer;
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/provisioningcriteria/template` | `retrieveTemplate` | — | Returns the unmapped loan products + categories + GL accounts for the create form |
+| GET | `/v1/provisioningcriteria/{criteriaId}` | `retrieveProvisioningCriteria` | — | One criteria; `?template=true` appends remaining options |
+| GET | `/v1/provisioningcriteria` | `retrieveAllProvisioningCriterias` | — | List of all criteria |
+| POST | `/v1/provisioningcriteria` | `createProvisioningCriteria` | `CREATE_PROVISIONINGCRITERIA` | Create new criteria |
+| PUT | `/v1/provisioningcriteria/{criteriaId}` | `updateProvisioningCriteria` | `UPDATE_PROVISIONINGCRITERIA` | Update |
+| DELETE | `/v1/provisioningcriteria/{criteriaId}` | `deleteProvisioningCriteria` | `DELETE_PROVISIONINGCRITERIA` | Delete (only if not in use) |
+
+### `GET /v1/provisioningcriteria/template`
+
+```java
+@GET @Path("template")
+public ProvisioningCriteriaData retrieveTemplate() {
+    platformSecurityContext.authenticatedUser();
+    return provisioningCriteriaReadPlatformService.retrievePrivisiongCriteriaTemplate();
+}
+```
+
+Returns:
+
+- `loanProducts` — only those **not** already mapped to any other criteria (a loan product can belong to at most one criteria).
+- `definitions` — one synthetic row per `ProvisioningCategory` with `provisioningPercentage = 0` and null GL accounts, ready to be edited in the UI.
+- `glAccounts` — both liability and expense accounts available in the chart.
+
+### `GET /v1/provisioningcriteria/{criteriaId}`
+
+```java
+public ProvisioningCriteriaData retrieveProvisioningCriteria(
+        @PathParam("criteriaId") final Long criteriaId, @Context final UriInfo uriInfo) {
+    platformSecurityContext.authenticatedUser();
+    ProvisioningCriteriaData criteria = provisioningCriteriaReadPlatformService.retrieveProvisioningCriteria(criteriaId);
+    final ApiRequestJsonSerializationSettings settings = apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    if (settings.isTemplate()) {
+        criteria = provisioningCriteriaReadPlatformService.retrievePrivisiongCriteriaTemplate(criteria);
+    }
+    return criteria;
+}
+```
+
+With `?template=true` the response is augmented with the loan products **still available** for assignment plus the GL chart — useful for the edit screen.
+
+### `POST /v1/provisioningcriteria`
+
+Body shape (per `ProvisioningCriteriaDefinitionJsonDeserializer` and `ProvisioningCriteriaConstants`):
+
+```json
+{
+  "criteriaName": "RBI IRACP",
+  "loanProducts": [
+    { "id": 1, "name": "Microloan", "includeInBorrowerCycle": false },
+    { "id": 4, "name": "SME Loan",  "includeInBorrowerCycle": false }
+  ],
+  "definitions": [
+    { "categoryId": 1, "categoryName": "STANDARD",     "minAge": 0,   "maxAge": 30,
+      "provisioningPercentage": 0.25, "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 2, "categoryName": "SUB-STANDARD", "minAge": 31,  "maxAge": 90,
+      "provisioningPercentage": 5.0,  "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 3, "categoryName": "DOUBTFUL",     "minAge": 91,  "maxAge": 365,
+      "provisioningPercentage": 25.0, "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 4, "categoryName": "LOSS",         "minAge": 366, "maxAge": 9999,
+      "provisioningPercentage": 100.0,"liabilityAccount": 21, "expenseAccount": 70 }
+  ],
+  "locale": "en"
+}
+```
+
+Mandatory: `criteriaName`, `definitions` (≥1 row). `loanProducts` is optional but typically supplied — an unmapped criteria is allowed (orphan policy) so an admin can stage rules before binding products.
+
+The handler runs `ProvisioningCriteriaAssembler.fromParsedJson(...)`, which:
+
+1. Verifies `criteriaName` is not already taken (else `ProvisioningCriteriaCannotBeCreatedException`).
+2. Loads each referenced `ProvisioningCategory` from `ProvisioningCategoryRepository` and rejects unknown ids.
+3. Loads each `LoanProduct` and rejects products already mapped to another criteria.
+4. Calls `ProvisioningCriteriaDefinition.isOverlapping(...)` pairwise — any overlap → `ProvisioningCriteriaOverlappingDefinitionException`.
+5. Validates each percentage is in `(0, 100]`.
+6. Persists and returns the new id in `CommandProcessingResult`.
+
+### `PUT /v1/provisioningcriteria/{criteriaId}`
+
+Same body shape; behaviour is "rewrite". Definitions with the same `id` are updated in place via `ProvisioningCriteriaDefinition.update(...)` — they cannot be moved between categories. Definitions added with no `id` are appended; definitions removed from the body are orphan-deleted (cascade + `orphanRemoval = true`).
+
+### `DELETE /v1/provisioningcriteria/{criteriaId}`
+
+```java
+public CommandProcessingResult deleteProvisioningCriteria(@PathParam("criteriaId") final Long criteriaId) {
+    platformSecurityContext.authenticatedUser();
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().deleteProvisioningCriteria(criteriaId).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The handler checks whether any **provisioning entry** rows in `m_loanproduct_provisioning_entry` already reference this criteria — if yes the deletion is blocked with `ProvisioningCriteriaCannotBeDeletedException` (HTTP 409). Otherwise the row plus its definitions and product mappings are removed in cascade.
+
+## How criteria are consumed by the COB job
+
+The "Generate Loan Loss Provisioning" job (`m_job` row name `"Generate Loan Loss Provisioning"`, cron `0 0 0 1/1 * ? *`) walks open loans, computes the overdue day-count for each, picks the matching `ProvisioningCriteriaDefinition` from the criteria mapped to the loan's product, multiplies the outstanding by `provisioningPercentage / 100`, and writes a row into `m_loanproduct_provisioning_entry` plus a journal-entry pair (debit `expenseAccount`, credit `liabilityAccount`) keyed by the loan's office. See [jobs domain](/core/jobs-domain) for scheduling, and the accounting module for how journal entries flow.
+
+## Exceptions
+
+| Exception | HTTP | Message key |
+| --- | --- | --- |
+| `ProvisioningCriteriaNotFoundException` | 404 | `error.msg.provisioningcriteria.id.invalid` |
+| `ProvisioningCriteriaCannotBeCreatedException` | 400 | `error.msg.provisioningcriteria.cannot.be.created.invalid.<reason>` |
+| `ProvisioningCriteriaOverlappingDefinitionException` | 400 | `error.msg.provisioningcriteria.definition.is.overlapping` |
+| `ProvisioningCriteriaCannotBeDeletedException` | 409 | `error.msg.provisioningcriteria.cannot.be.deleted` |
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_PROVISIONINGCRITERIA` | List / retrieve / template |
+| `CREATE_PROVISIONINGCRITERIA`, `CREATE_PROVISIONINGCRITERIA_CHECKER` | Create + maker–checker |
+| `UPDATE_PROVISIONINGCRITERIA`, `UPDATE_PROVISIONINGCRITERIA_CHECKER` | Update |
+| `DELETE_PROVISIONINGCRITERIA`, `DELETE_PROVISIONINGCRITERIA_CHECKER` | Delete |
+
+## See also
+
+- [Provisioning categories](/organisation/provisioning-categories) — the four built-in buckets each definition references.
+- [Currencies and monetary](/organisation/currencies-and-monetary) — provisioning amounts inherit the loan's currency.
+- [Organisation shared domain](/core/organisation-shared-domain) — package map.
+- [Accounting shared domain](/core/accounting-shared-domain) — GL accounts used by `liabilityAccount` / `expenseAccount`.
+- [Jobs domain](/core/jobs-domain) — the COB job that consumes the criteria.
+- [Organisation APIs](/api/organisation-apis) — Swagger payloads.
+- [Security overview](/security/overview) — `PROVISIONINGCRITERIA` permission resource.

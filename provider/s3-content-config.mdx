@@ -1,0 +1,374 @@
+---
+title: "S3 Content Repository and AWS S3 Client Configuration"
+sidebarTitle: "S3 Content Config"
+description: "ContentS3Config and AmazonS3Config — two S3Client beans backing Fineract's document content store and datatable export pipeline, with endpoint overrides."
+---
+
+Apache Fineract uses Amazon S3 (or any S3-compatible store: MinIO, Ceph,
+LocalStack) for two unrelated features, and they are wired by **two distinct
+`@Configuration` classes** in `fineract-provider`. Both produce an
+`S3Client` bean but with different conditions, different property prefixes
+and different intent.
+
+| Class | Bean | Used by |
+| --- | --- | --- |
+| `infrastructure.core.config.ContentS3Config` | `contentS3Client` | The document `ContentRepository` (uploaded files for clients, loans, savings, …) |
+| `infrastructure.s3.AmazonS3Config` | `s3Client` | The `S3DatatableReportExportServiceImpl` (datatable batch exports) |
+
+This page documents both. For the broader content-repository architecture
+(file-system vs database vs S3 backends, content URLs, cleanup), see
+[/document/content-store](/document/content-store).
+
+## ContentS3Config — for document storage
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/ContentS3Config.java`
+
+```java
+@Slf4j
+@Configuration
+public class ContentS3Config {
+
+    @Bean
+    @ConditionalOnProperty("fineract.content.s3.enabled")
+    public S3Client contentS3Client(FineractProperties fineractProperties) {
+        S3ClientBuilder builder = S3Client.builder()
+            .credentialsProvider(getCredentialProvider(fineractProperties.getContent().getS3()));
+
+        if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getRegion())) {
+            builder.region(Region.of(fineractProperties.getContent().getS3().getRegion()));
+        }
+        if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getEndpoint())) {
+            builder.endpointOverride(URI.create(fineractProperties.getContent().getS3().getEndpoint()))
+                   .forcePathStyle(fineractProperties.getContent().getS3().getPathStyleAddressingEnabled());
+        }
+
+        return builder.build();
+    }
+
+    private AwsCredentialsProvider getCredentialProvider(FineractProperties.FineractContentS3Properties s3Properties) {
+        if (Strings.isNullOrEmpty(s3Properties.getAccessKey()) || Strings.isNullOrEmpty(s3Properties.getSecretKey())) {
+            return DefaultCredentialsProvider.create();
+        }
+        return StaticCredentialsProvider.create(
+            AwsBasicCredentials.create(s3Properties.getAccessKey(), s3Properties.getSecretKey()));
+    }
+}
+```
+
+### Activation
+
+The bean is activated only when `fineract.content.s3.enabled=true`. When
+disabled, the document `ContentRepositoryFactory` returns a file-system or
+database-backed repository instead — see
+[/document/content-store](/document/content-store).
+
+### Property surface
+
+Bound by `FineractProperties.FineractContentS3Properties`:
+
+```
+fineract.content.s3.enabled
+fineract.content.s3.region
+fineract.content.s3.endpoint
+fineract.content.s3.pathStyleAddressingEnabled
+fineract.content.s3.accessKey
+fineract.content.s3.secretKey
+fineract.content.s3.bucketName    (read by the ContentRepository, not by this config)
+```
+
+### Credentials strategy
+
+```java
+if (Strings.isNullOrEmpty(s3Properties.getAccessKey()) || Strings.isNullOrEmpty(s3Properties.getSecretKey())) {
+    return DefaultCredentialsProvider.create();
+}
+return StaticCredentialsProvider.create(AwsBasicCredentials.create(...));
+```
+
+Two paths:
+
+1. **If both `accessKey` and `secretKey` are set** — use them as static
+   credentials. This is the simplest deployment.
+2. **Otherwise** — use AWS SDK v2's `DefaultCredentialsProvider`, which
+   walks the chain: environment variables, system properties, web-identity
+   token, EC2/ECS metadata, profile credentials. This is the right path for
+   IAM-role-based deployments (EKS pod identity, EC2 instance profile, ECS
+   task role).
+
+The "either both or default" semantics avoid the surprising case where only
+one of the two is set.
+
+### Region override
+
+```java
+if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getRegion())) {
+    builder.region(Region.of(...));
+}
+```
+
+If the property is set it wins; otherwise the AWS SDK's default region
+provider chain is used (env vars, AWS_DEFAULT_REGION, profile, instance
+metadata, …).
+
+### Endpoint override
+
+```java
+if (!Strings.isNullOrEmpty(fineractProperties.getContent().getS3().getEndpoint())) {
+    builder.endpointOverride(URI.create(...))
+           .forcePathStyle(fineractProperties.getContent().getS3().getPathStyleAddressingEnabled());
+}
+```
+
+This is the MinIO / LocalStack / Ceph path. For example:
+
+```properties
+fineract.content.s3.enabled=true
+fineract.content.s3.endpoint=http://minio.local:9000
+fineract.content.s3.pathStyleAddressingEnabled=true
+fineract.content.s3.region=us-east-1
+fineract.content.s3.accessKey=minio
+fineract.content.s3.secretKey=minio12345
+fineract.content.s3.bucketName=fineract-content
+```
+
+`forcePathStyle(true)` is *required* for MinIO and LocalStack: they don't
+support the virtual-hosted-style addressing (`<bucket>.<endpoint>`) that real
+AWS S3 uses.
+
+## AmazonS3Config — for datatable exports
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/s3/AmazonS3Config.java`
+
+```java
+@Configuration
+@Conditional(AmazonS3ConfigCondition.class)
+public class AmazonS3Config {
+
+    @Bean
+    public DefaultCredentialsProvider awsCredentialsProvider() {
+        return DefaultCredentialsProvider.create();
+    }
+
+    @Bean
+    public AwsRegionProvider awsRegionProvider() {
+        return DefaultAwsRegionProviderChain.builder().build();
+    }
+
+    @Bean("s3Client")
+    public S3Client s3Client(DefaultCredentialsProvider awsCredentialsProvider,
+                              AwsRegionProvider awsRegionProvider,
+                              List<S3ClientCustomizer> customizers) {
+        S3ClientBuilder builder = S3Client.builder()
+            .credentialsProvider(awsCredentialsProvider)
+            .region(awsRegionProvider.getRegion());
+        customizers.forEach(customizer -> customizer.customize(builder));
+        return builder.build();
+    }
+
+    @Bean
+    @ConditionalOnBean(S3Client.class)
+    public S3DatatableReportExportServiceImpl s3DatatableReportExportServiceImpl(
+            ReadReportingService reportServiceImpl,
+            ConfigurationDomainService configurationDomainService,
+            S3Client s3Client,
+            FineractProperties fineractProperties) {
+        return new S3DatatableReportExportServiceImpl(
+            reportServiceImpl, configurationDomainService, s3Client, fineractProperties);
+    }
+}
+```
+
+### Key differences from `ContentS3Config`
+
+| Aspect | `ContentS3Config` | `AmazonS3Config` |
+| --- | --- | --- |
+| Bean name | (default — `contentS3Client`) | Explicitly `"s3Client"` |
+| Condition | `@ConditionalOnProperty("fineract.content.s3.enabled")` | `@Conditional(AmazonS3ConfigCondition.class)` |
+| Credentials | Static key/secret OR default chain | Always default chain |
+| Region | Property `fineract.content.s3.region` OR SDK default | Always the SDK default-region chain |
+| Endpoint | Configurable | Not configurable (AWS only) |
+| Customizer SPI | No | Yes — `List<S3ClientCustomizer>` |
+| Customer of the bean | `ContentRepositoryFactory` | `S3DatatableReportExportServiceImpl` |
+
+### S3ClientCustomizer SPI
+
+`AmazonS3Config` accepts a `List<S3ClientCustomizer>` and applies them to the
+builder. The interface is in the same package:
+
+```java
+public interface S3ClientCustomizer {
+    void customize(S3ClientBuilder builder);
+}
+```
+
+The repo ships a `LocalstackS3ClientCustomizer` that runs only when LocalStack
+is in use — it sets `forcePathStyle(true)` and points at the LocalStack
+endpoint. Sibling modules or custom extensions can drop their own
+`S3ClientCustomizer` beans to e.g. add request signers or extra middleware.
+
+### `S3DatatableReportExportServiceImpl`
+
+This is the only consumer of the `s3Client` bean inside the provider module.
+Its job is to take a datatable report (a periodic SQL extraction), produce a
+file, and `PutObject` it into the configured bucket. The consumer-side
+configuration lives in `FineractProperties.report` (bucket name, prefix, etc.).
+
+## Why two configurations?
+
+The historical answer: they evolved independently. Content storage came first
+(circa 2014 with the legacy AWS SDK v1). The datatable export feature came
+later (2020s) and used the modern AWS SDK v2 from day one. When the content
+store was migrated to SDK v2, the two paths were left separate because:
+
+- They have different credential semantics (content allows static creds for
+  ad-hoc bucket access; exports must use IAM roles in production).
+- They serve different bucket conventions (content lives in one bucket
+  organized by entity; exports go to a reporting bucket organized by date).
+- They are conditionally enabled differently and a customer might enable one
+  but not the other.
+
+In practice, an operator deploying Fineract on AWS will enable both with
+overlapping (but separate) property blocks.
+
+## Spring qualifiers in consumers
+
+Because both produce `S3Client` beans, consumers must qualify their injection
+to avoid ambiguity:
+
+```java
+@Autowired
+@Qualifier("contentS3Client")    // ContentS3Config
+private S3Client contentS3Client;
+
+@Autowired
+@Qualifier("s3Client")           // AmazonS3Config
+private S3Client exportS3Client;
+```
+
+Within `ContentS3Config` the bean name defaults to the method name
+(`contentS3Client`), and `AmazonS3Config` makes it explicit with
+`@Bean("s3Client")`. If both are active in the same JVM, Spring would
+complain about an unqualified `S3Client` injection — so any new consumer must
+pick one.
+
+## What is NOT in either config
+
+- **Bucket creation.** Neither config creates buckets at startup. The bucket
+  must exist (created by Terraform / CloudFormation / `aws s3 mb`).
+- **Multi-tenancy.** Both clients are singletons. The bucket layout that
+  separates tenants is up to the consuming service. The content repo uses a
+  prefix derived from the tenant ID; the export service uses a per-tenant
+  prefix from `FineractProperties`.
+- **Pre-signed URLs.** Generated on-demand by the consuming services, not by
+  these configs.
+- **Server-side encryption.** SSE-S3 / SSE-KMS is set on a per-`PutObject`
+  basis in the consuming services, not on the client.
+
+## Production checklist
+
+- Use IAM role credentials (default credential chain) on AWS — leave
+  `accessKey` / `secretKey` unset.
+- Set the bucket region explicitly via `fineract.content.s3.region` to avoid
+  the SDK's slow region-discovery hop.
+- For MinIO/LocalStack, always set `pathStyleAddressingEnabled=true`.
+- For the export pipeline, ensure the `S3ClientCustomizer` chain is empty
+  unless you specifically need LocalStack — the customizer mechanism is opt-in.
+
+## AmazonS3ConfigCondition
+
+The `@Conditional(AmazonS3ConfigCondition.class)` guard on `AmazonS3Config`
+checks a different flag than `ContentS3Config`. It activates only when the
+S3 datatable-export feature is enabled — typically via
+`fineract.report.export.s3.enabled=true` (the exact property is read inside
+`AmazonS3ConfigCondition`). This means:
+
+- A deployment that only uses S3 for document storage does not pay the cost
+  of constructing the export `S3Client` / `S3DatatableReportExportServiceImpl`.
+- A deployment that only uses S3 for exports does not enable the content
+  store override.
+- A deployment that uses both will instantiate both — and consumers will
+  use the qualified names to keep them apart.
+
+## LocalstackS3ClientCustomizer
+
+The bundled `LocalstackS3ClientCustomizer` exists for local development against
+LocalStack:
+
+```java
+@Component
+@ConditionalOnProperty("fineract.localstack.enabled")
+public class LocalstackS3ClientCustomizer implements S3ClientCustomizer {
+
+    private final FineractProperties properties;
+
+    @Override
+    public void customize(S3ClientBuilder builder) {
+        builder.endpointOverride(URI.create(properties.getLocalstack().getEndpoint()))
+               .forcePathStyle(true);
+    }
+}
+```
+
+(The exact code may vary; the spirit is: rewrite the endpoint and enable
+path-style addressing when LocalStack is in use.) When
+`fineract.localstack.enabled=true`, every call through `s3Client` is
+redirected to the LocalStack endpoint. Useful for integration tests but
+**never** for production.
+
+## Bucket lifecycle conventions
+
+Although neither config touches buckets directly, two conventions are
+encoded in the consuming services:
+
+- **Content bucket** — flat key namespace prefixed by tenant. Keys look like
+  `<tenantId>/clients/<clientId>/documents/<uuid>-<filename>.pdf`. The
+  bucket should have versioning enabled to recover from accidental
+  overwrites.
+- **Export bucket** — prefixed by date and tenant.
+  `<tenantId>/<yyyy-MM-dd>/<report-name>.csv`. The bucket lifecycle policy
+  is expected to expire objects after the regulatory retention window.
+
+These conventions live in the application code, not the configs — but they
+inform how an operator should provision the buckets and IAM policies.
+
+## IAM policy sketches
+
+For the **content bucket** the running process needs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::fineract-content",
+    "arn:aws:s3:::fineract-content/*"
+  ]
+}
+```
+
+For the **export bucket**:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [ "s3:PutObject", "s3:ListBucket" ],
+  "Resource": [
+    "arn:aws:s3:::fineract-reports",
+    "arn:aws:s3:::fineract-reports/*"
+  ]
+}
+```
+
+Exports do not need delete or get — the report consumer (a downstream
+analytics pipeline) reads with its own credentials.
+
+## Related pages
+
+- [/document/content-store](/document/content-store) — the abstraction over the
+  S3 client built by `ContentS3Config`.
+- [Provider Overview](/provider/overview) — module map.
+- [Server Application Entrypoint](/provider/server-application-entrypoint) —
+  conditional configurations and the validation pipeline.

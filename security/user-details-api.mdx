@@ -1,0 +1,331 @@
+---
+title: "User Details API — GET /v1/userdetails for OAuth2 Mode"
+sidebarTitle: "User Details API"
+description: "How UserDetailsApiResource introspects the OAuth2 bearer token, builds AuthenticatedOauthUserData, and mirrors AuthenticationApiResource semantics."
+---
+
+`UserDetailsApiResource` is the OAuth2 counterpart to `AuthenticationApiResource`. When the platform is running in OAuth2 mode (`fineract.security.oauth2.enabled=true`), the client never calls `/v1/authentication` — it obtains a JWT via the embedded authorization server and then needs an introspection endpoint that returns the same kind of payload (`username`, roles, permissions, 2FA flag, password-renewal flag). `GET /v1/userdetails` is that endpoint.
+
+The resource lives in `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/api/UserDetailsApiResource.java`.
+
+## Class shape
+
+```java
+@Path("/v1/userdetails")
+@Component
+@ConditionalOnProperty("fineract.security.oauth2.enabled")
+@Tag(name = "Fetch authenticated user details", description = "")
+@RequiredArgsConstructor
+public class UserDetailsApiResource {
+
+    private final ToApiJsonSerializer<AuthenticatedOauthUserData> apiJsonSerializerService;
+    private final SpringSecurityPlatformSecurityContext springSecurityPlatformSecurityContext;
+
+    @Value("${fineract.security.2fa.enabled}")
+    private boolean twoFactorEnabled;
+
+    @GET
+    @Produces(MediaType.APPLICATION_JSON)
+    @Operation(summary = "Fetch authenticated user details\n",
+               description = "checks the Authentication and returns the set roles and permissions allowed.")
+    @ApiResponse(responseCode = "200", description = "OK",
+                 content = @Content(schema = @Schema(implementation = UserDetailsApiResourceSwagger.GetUserDetailsResponse.class)))
+    public String fetchAuthenticatedUserData() { /* … */ }
+}
+```
+
+Notes:
+
+- `@ConditionalOnProperty("fineract.security.oauth2.enabled")` — under basic-auth mode this bean is absent. The basic-auth mirror is `POST /v1/authentication` ([/security/authentication-api](/security/authentication-api)).
+- `@Path("/v1/userdetails")` — final URL is `/api/v1/userdetails`.
+- The endpoint **does not accept a body** and is `GET`. The bearer token in the `Authorization: Bearer …` header carries everything it needs.
+- No `customAuthenticationProvider` is injected because by the time this handler runs, the OAuth2 resource server filter has already validated the JWT and built a `FineractJwtAuthenticationToken` in `SecurityContextHolder`.
+
+## Request lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Filter as TenantAwareAuthenticationFilter
+    participant JWT as BearerTokenAuthenticationFilter<br/>(Spring resource server)
+    participant Conv as FineractJwtAuthenticationTokenConverter
+    participant API as GET /v1/userdetails
+    participant Ctx as SpringSecurityPlatformSecurityContext
+
+    Client->>Filter: GET /api/v1/userdetails<br/>Authorization: Bearer <jwt>
+    Filter->>Filter: JWTParser.parse → tenant claim<br/>ThreadLocalContextUtil.setTenant
+    Filter->>JWT: chain.doFilter
+    JWT->>JWT: decode + verify JWT
+    JWT->>Conv: convert(jwt)
+    Conv->>Conv: userDetailsService.loadUserByUsername(jwt.subject)
+    Conv-->>JWT: FineractJwtAuthenticationToken(AppUser)
+    JWT->>API: SecurityContext authenticated
+    API->>Ctx: doesPasswordHasToBeRenewed(principal)
+    Ctx-->>API: false / true
+    API-->>Client: 200 + AuthenticatedOauthUserData
+```
+
+## The handler body
+
+```java
+public String fetchAuthenticatedUserData() {
+
+    final SecurityContext context = SecurityContextHolder.getContext();
+    if (context == null) {
+        return null;
+    }
+
+    final FineractJwtAuthenticationToken authentication =
+            (FineractJwtAuthenticationToken) context.getAuthentication();
+    if (authentication == null) {
+        return null;
+    }
+
+    final AppUser principal = (AppUser) authentication.getPrincipal();
+    if (principal == null) {
+        return null;
+    }
+
+    final Collection<String> permissions = new ArrayList<>();
+    AuthenticatedOauthUserData authenticatedUserData;
+
+    final Collection<GrantedAuthority> authorities = new ArrayList<>(authentication.getAuthorities());
+    for (final GrantedAuthority grantedAuthority : authorities) {
+        permissions.add(grantedAuthority.getAuthority());
+    }
+
+    final Collection<RoleData> roles = new ArrayList<>();
+    final Set<Role> userRoles = principal.getRoles();
+    for (final Role role : userRoles) {
+        roles.add(role.toData());
+    }
+
+    final Long officeId = principal.getOffice().getId();
+    final String officeName = principal.getOffice().getName();
+    final Long staffId = principal.getStaffId();
+    final String staffDisplayName = principal.getStaffDisplayName();
+    final EnumOptionData organisationalRole = principal.organisationalRoleData();
+
+    boolean isTwoFactorRequired = this.twoFactorEnabled
+            && !principal.hasSpecificPermissionTo(TwoFactorConstants.BYPASS_TWO_FACTOR_PERMISSION);
+
+    if (this.springSecurityPlatformSecurityContext.doesPasswordHasToBeRenewed(principal)) {
+        authenticatedUserData = new AuthenticatedOauthUserData()
+                .setUsername(principal.getUsername())
+                .setUserId(principal.getId())
+                .setAccessToken(authentication.getToken().getTokenValue())
+                .setAuthenticated(true)
+                .setShouldRenewPassword(true)
+                .setTwoFactorAuthenticationRequired(isTwoFactorRequired);
+    } else {
+        authenticatedUserData = new AuthenticatedOauthUserData()
+                .setUsername(principal.getUsername())
+                .setOfficeId(officeId)
+                .setOfficeName(officeName)
+                .setStaffId(staffId)
+                .setStaffDisplayName(staffDisplayName)
+                .setOrganisationalRole(organisationalRole)
+                .setRoles(roles)
+                .setPermissions(permissions)
+                .setUserId(principal.getId())
+                .setAccessToken(authentication.getToken().getTokenValue())
+                .setAuthenticated(true)
+                .setTwoFactorAuthenticationRequired(isTwoFactorRequired);
+    }
+
+    return this.apiJsonSerializerService.serialize(authenticatedUserData);
+}
+```
+
+## Step-by-step
+
+### 1 — Pull the JWT-derived authentication out of the SecurityContext
+
+```java
+final FineractJwtAuthenticationToken authentication =
+        (FineractJwtAuthenticationToken) context.getAuthentication();
+```
+
+By the time this resource is invoked:
+
+- `TenantAwareAuthenticationFilter` has already extracted the `tenant` claim and set the `FineractPlatformTenant` on `ThreadLocalContextUtil`.
+- Spring's `BearerTokenAuthenticationFilter` has decoded and validated the JWT, then handed off to `FineractJwtAuthenticationTokenConverter` which loaded the `AppUser` via `TenantAwareJpaPlatformUserDetailsService`.
+- The resulting `FineractJwtAuthenticationToken` wraps the JWT (`authentication.getToken()`) and the `AppUser` (`authentication.getPrincipal()`).
+
+If the cast or any of the lookups fails the method returns `null`, which Jersey serialises as an empty body (HTTP 204). The OAuth2 resource server would normally reject anything missing a valid bearer with a 401 before the handler runs, so these null branches are defensive.
+
+### 2 — Build the permissions list
+
+```java
+final Collection<GrantedAuthority> authorities = new ArrayList<>(authentication.getAuthorities());
+for (final GrantedAuthority grantedAuthority : authorities) {
+    permissions.add(grantedAuthority.getAuthority());
+}
+```
+
+The authorities come from `JwtGrantedAuthoritiesConverter` (defaulting to the `scope` claim). The token customiser in `AuthorizationServerConfig` deliberately puts the user's full authority set into `scope` at issue time:
+
+```java
+List<String> scope = appUser.getAuthorities().stream()
+        .map(GrantedAuthority::getAuthority).collect(Collectors.toList());
+context.getClaims().claim("scope", scope).claim("role", roles).claim("tenant", details.getTenantId());
+```
+
+So the `permissions` array in the response mirrors the union of role-grant permissions, plus `BYPASS_TWOFACTOR` if held, etc. — exactly as the basic-auth response shows it.
+
+### 3 — Re-derive role objects from the database
+
+```java
+final Collection<RoleData> roles = new ArrayList<>();
+for (final Role role : principal.getRoles()) {
+    roles.add(role.toData());
+}
+```
+
+The role list is **not** read from the JWT (which only carries flat names in the `role` claim). It's resolved from the freshly-loaded `AppUser` so that the response includes full `RoleData` shape (id, name, description, disabled flag).
+
+### 4 — Pull office, staff, organisational role
+
+These are direct field reads off `AppUser` and match `AuthenticationApiResource` exactly:
+
+```java
+final Long officeId = principal.getOffice().getId();
+final String officeName = principal.getOffice().getName();
+final Long staffId = principal.getStaffId();
+final String staffDisplayName = principal.getStaffDisplayName();
+final EnumOptionData organisationalRole = principal.organisationalRoleData();
+```
+
+### 5 — Compute 2FA requirement
+
+```java
+boolean isTwoFactorRequired = this.twoFactorEnabled
+        && !principal.hasSpecificPermissionTo(TwoFactorConstants.BYPASS_TWO_FACTOR_PERMISSION);
+```
+
+This is the same expression as in `AuthenticationApiResource` — the flag tells the UI whether to continue to the OTP exchange before issuing business calls.
+
+### 6 — Password renewal branch
+
+```java
+if (this.springSecurityPlatformSecurityContext.doesPasswordHasToBeRenewed(principal)) {
+    authenticatedUserData = new AuthenticatedOauthUserData()
+            …
+            .setShouldRenewPassword(true)
+            …;
+}
+```
+
+Unlike the basic-auth resource, this branch **does not throw** `PasswordResetRequiredException`. The OAuth2 client already has a valid access token, and the password-policy nudge is a hint surfaced via `shouldRenewPassword`. The UI is expected to handle the renewal flow explicitly.
+
+## Response — `AuthenticatedOauthUserData`
+
+The DTO mirrors `AuthenticatedUserData` but replaces `base64EncodedAuthenticationKey` with `accessToken` (the JWT string from the inbound request, re-echoed for convenience):
+
+```java
+@Data @NoArgsConstructor @Accessors(chain = true)
+public class AuthenticatedOauthUserData {
+    private String username;
+    private Long userId;
+    private String accessToken;       // ← the JWT, echoed back
+    private boolean authenticated;
+    private Long officeId;
+    private String officeName;
+    private Long staffId;
+    private String staffDisplayName;
+    private EnumOptionData organisationalRole;
+    private Collection<RoleData> roles;
+    private Collection<String> permissions;
+    private boolean shouldRenewPassword;
+    private boolean isTwoFactorAuthenticationRequired;
+}
+```
+
+## Example
+
+```http
+GET /api/v1/userdetails HTTP/1.1
+Host: fineract.example
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJtaWZvcyIsInRlbmFudCI6ImRlZmF1bHQiLCJzY29wZSI6WyJBTExfRlVOQ1RJT05TIl0sImV4cCI6MTczNTY4OTYwMH0.<sig>
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "username": "mifos",
+  "userId": 1,
+  "accessToken": "eyJhbGciOi…",
+  "authenticated": true,
+  "officeId": 1,
+  "officeName": "Head Office",
+  "staffId": null,
+  "staffDisplayName": null,
+  "organisationalRole": null,
+  "roles": [ { "id": 1, "name": "Super user", "description": "…" } ],
+  "permissions": [ "ALL_FUNCTIONS" ],
+  "shouldRenewPassword": false,
+  "isTwoFactorAuthenticationRequired": false
+}
+```
+
+## Call chain
+
+```mermaid
+flowchart LR
+    Req[GET /api/v1/userdetails]
+    Req --> TAAF[TenantAwareAuthenticationFilter<br/>peek tenant claim]
+    TAAF --> BDF[BusinessDateFilter]
+    BDF --> SCH[SecurityContextHolderFilter]
+    SCH --> BAF[BearerTokenAuthenticationFilter<br/>decode + verify JWT]
+    BAF --> FJTC[FineractJwtAuthenticationTokenConverter<br/>load AppUser]
+    FJTC --> AuthZ[authorizeHttpRequests<br/>anyRequest authenticated]
+    AuthZ --> TFA[TwoFactorAuthenticationFilter<br/>optional]
+    TFA --> JAX[Jersey routing]
+    JAX --> UDA[UserDetailsApiResource.fetchAuthenticatedUserData]
+    UDA --> Ctx[SpringSecurityPlatformSecurityContext.doesPasswordHasToBeRenewed]
+    UDA --> Ser[ToApiJsonSerializer.serialize]
+    Ser --> Resp[200 + JSON]
+```
+
+## Difference from `/v1/authentication`
+
+| Concern | `POST /v1/authentication` | `GET /v1/userdetails` |
+| --- | --- | --- |
+| Active when | `fineract.security.basicauth.enabled=true` | `fineract.security.oauth2.enabled=true` |
+| Input | JSON body `{username, password}` | `Authorization: Bearer <jwt>` |
+| Credential validation | Calls `customAuthenticationProvider.authenticate` directly | Already done by Spring's resource server before the handler runs |
+| Echoes back | `base64EncodedAuthenticationKey` (`Basic` credential) | `accessToken` (the original JWT) |
+| Password expiry | Throws `PasswordResetRequiredException` (HTTP 403) | Sets `shouldRenewPassword=true` and returns 200 |
+| 2FA flag | `isTwoFactorAuthenticationRequired` | `isTwoFactorAuthenticationRequired` |
+
+Both endpoints exist so the front-end can have a single "fetch session info" call regardless of which auth scheme is active.
+
+## Swagger reference
+
+```java
+@ApiResponse(responseCode = "200", description = "OK",
+             content = @Content(schema = @Schema(implementation = UserDetailsApiResourceSwagger.GetUserDetailsResponse.class)))
+```
+
+`UserDetailsApiResourceSwagger.GetUserDetailsResponse` is a shape-only POJO that documents the JSON layout for OpenAPI consumers.
+
+## Pitfalls
+
+<Warning>
+The handler casts `context.getAuthentication()` to `FineractJwtAuthenticationToken`. If the resource server is wired without the custom converter (e.g. a misconfiguration where `jwtAuthenticationConverter` is removed), the cast will throw `ClassCastException` and the handler will produce a 500. Make sure `AuthorizationServerConfig.authenticationConverter()` is the active converter.
+</Warning>
+
+<Tip>
+The endpoint echoes the JWT back in `accessToken`. This is fine for diagnostics but be careful with logging — treat the response body the same as the original `Authorization` header.
+</Tip>
+
+## Related pages
+
+- [Authentication API](/security/authentication-api) — basic-auth counterpart.
+- [OAuth2 authorization server](/security/oauth2-authorization-server)
+- [Basic and tenant filters](/security/basic-and-tenant-filters)
+- [Two-factor authentication](/security/two-factor-auth)
+- [User administration overview](/users/overview)

@@ -1,0 +1,338 @@
+---
+title: "Validation overview — Bean Validation and DataValidatorBuilder"
+sidebarTitle: "Overview"
+description: "How fineract-validation pairs Jakarta Bean Validation on DTOs with the imperative DataValidatorBuilder used by command handlers and *DataValidator classes."
+---
+
+Fineract validates inbound API data in **two complementary layers** that run at different points in the request lifecycle. The declarative layer attaches Jakarta Bean Validation constraints (`@NotBlank`, `@NotNull`, and the custom annotations defined in `fineract-validation/src/main/java/org/apache/fineract/validation/constraints/`) directly to request DTO fields and runs automatically when Jersey deserializes the body. The imperative layer is the fluent `DataValidatorBuilder` in `fineract-core` — command handlers and `*DataValidator` components walk the parsed JSON, accumulate `ApiParameterError` instances, and throw a single `PlatformApiDataValidationException` that the exception-mapper turns into an HTTP 400. This page maps both layers to source files and shows where each runs in the request sequence.
+
+<Info>
+The two layers do **not** overlap by accident: Jakarta constraints are used on the newer typed request bodies (e.g. `BusinessDateUpdateRequest`, `ReAgePreviewRequest`), while the legacy `JsonCommand` path — most of the loan, savings, client, and group APIs — relies almost exclusively on `DataValidatorBuilder` inside dedicated `*DataValidator` classes. New code can mix and match: a typed DTO can carry annotations *and* be re-validated imperatively inside the handler.
+</Info>
+
+## What `fineract-validation` actually contains
+
+The Gradle module is intentionally tiny — three custom constraint annotations, their validator implementations, and a properties file for i18n message templates. It depends only on `jakarta.validation-api`, `commons-lang3`, and `lombok`. It does **not** depend on `fineract-core`, so it can be pulled into any module that needs to share constraint definitions with request DTOs.
+
+```text
+fineract-validation/
+├── build.gradle
+├── dependencies.gradle
+└── src/main/
+    ├── java/org/apache/fineract/validation/constraints/
+    │   ├── EnumValue.java              — @EnumValue annotation
+    │   ├── EnumValueValidator.java     — case-insensitive enum name check
+    │   ├── LocalDate.java              — @LocalDate (class-level) annotation
+    │   ├── LocalDateValidator.java     — composite date/format/locale check
+    │   ├── Locale.java                 — @Locale annotation
+    │   └── LocaleValidator.java        — BCP-47 / available-locales check
+    └── resources/
+        └── ValidationMessages.properties  — i18n message templates
+```
+
+`ValidationMessages.properties` is the **classpath resource** Jakarta Bean Validation looks for to resolve `{org.apache.fineract.validation.locale}` style placeholders. Every annotation references one or more keys from this file (or from a module-specific key like `{org.apache.fineract.businessdate.type.invalid}`). The full constraint catalogue is documented in [`/validation/constraints`](/validation/constraints).
+
+## What lives in `fineract-core` instead
+
+The imperative builder, the parameter error type, the global response wrapper, and the exception it throws all live in `fineract-core` so the rest of the platform can pull them in without dragging Jakarta-specific machinery:
+
+| File | Purpose |
+| --- | --- |
+| `infrastructure/core/data/DataValidatorBuilder.java` | Fluent builder accumulating `ApiParameterError` for each failed assertion. ~1,140 LOC, ~60 chainable methods. |
+| `infrastructure/core/data/ApiParameterError.java` | Per-parameter validation error: globalisation code, default message, parameter name, value, message args. |
+| `infrastructure/core/data/ApiGlobalErrorResponse.java` | HTTP-response wrapper produced by exception mappers; contains a `List<ApiParameterError>`. |
+| `infrastructure/core/data/PaginationParametersDataValidator.java` | Concrete `*DataValidator` used by paginated query endpoints — a minimal example of the imperative pattern. |
+| `infrastructure/core/exception/PlatformApiDataValidationException.java` | Runtime exception carrying the accumulated `ApiParameterError` list. |
+| `infrastructure/core/validator/ParseAndValidator.java` | Base class for command handlers that parse JSON then validate; provides `throwExceptionIfValidationWarningsExist(...)`. |
+| `infrastructure/core/exceptionmapper/PlatformApiDataValidationExceptionMapper.java` | JAX-RS `ExceptionMapper` mapping the exception to HTTP **400** with the JSON error body. |
+| `infrastructure/core/exceptionmapper/JakartaValidationExceptionMapper.java` | Maps Jakarta `ConstraintViolationException` (thrown by the Bean Validation layer) to the same response shape. |
+
+## Sequence: API → Bean Validation → handler → builder → 400
+
+The two layers slot in at different points of the dispatch pipeline. Here is the end-to-end sequence for a request that uses a typed DTO with constraints **and** a downstream `*DataValidator`:
+
+```text
+HTTP request body (JSON)
+        │
+        ▼
+┌─────────────────────────────────────────────────┐
+│  Jersey resource (e.g. *ApiResource method)     │
+│  - parameter type: TypedRequestDto              │
+│  - Jersey reads body, Jackson/Gson deserializes │
+└─────────────────────────────────────────────────┘
+        │
+        ▼  ① Bean Validation kicks in (Jakarta)
+┌─────────────────────────────────────────────────┐
+│  Hibernate Validator walks the DTO graph,       │
+│  evaluates @NotBlank / @NotNull / @EnumValue /  │
+│  @Locale / @LocalDate ConstraintValidators.     │
+│  Violations → ConstraintViolationException.     │
+└─────────────────────────────────────────────────┘
+        │ (if violations)
+        ▼
+   JakartaValidationExceptionMapper
+        │
+        ▼   ApiGlobalErrorResponse with errors → HTTP 400
+
+        │ (no violations)
+        ▼
+┌─────────────────────────────────────────────────┐
+│  Resource calls CommandWritePlatformService     │
+│  → CommandSourceService.processCommand(...)     │
+│  → resolves the @CommandType handler            │
+└─────────────────────────────────────────────────┘
+        │
+        ▼  ② Imperative validation (legacy + most loan/savings paths)
+┌─────────────────────────────────────────────────┐
+│  CommandHandler.processCommand(JsonCommand)     │
+│  → SomethingDataValidator.validateForCreate()   │
+│     - parses JSON via FromJsonHelper            │
+│     - new DataValidatorBuilder(errors)          │
+│         .resource("...")                        │
+│         .parameter("...").value(...)            │
+│         .notNull().integerGreaterThanZero()...  │
+│     - if !errors.isEmpty():                     │
+│         throw PlatformApiDataValidationException│
+└─────────────────────────────────────────────────┘
+        │ (if exception)
+        ▼
+   PlatformApiDataValidationExceptionMapper
+        │
+        ▼   ApiGlobalErrorResponse (errors[]) → HTTP 400
+```
+
+Both mappers produce the same JSON body shape so clients can treat declarative and imperative failures uniformly:
+
+```json
+{
+  "developerMessage": "Validation errors exist.",
+  "httpStatusCode": "400",
+  "defaultUserMessage": "Validation errors exist.",
+  "userMessageGlobalisationCode": "validation.msg.validation.errors.exist",
+  "errors": [
+    {
+      "developerMessage": "The parameter `glAccountId` must be greater than 0.",
+      "defaultUserMessage": "The parameter `glAccountId` must be greater than 0.",
+      "userMessageGlobalisationCode": "validation.msg.financialactivityaccount.glAccountId.not.greater.than.zero",
+      "parameterName": "glAccountId",
+      "value": null,
+      "args": [{ "value": "glAccountId" }, { "value": 0 }, { "value": 0 }]
+    }
+  ]
+}
+```
+
+<Tip>
+The `errors[]` element ordering is **insertion order**. `DataValidatorBuilder` appends to an `ArrayList<ApiParameterError>`, so the field-by-field order in a `*DataValidator` directly determines the order in the response. Use this when writing client integration tests.
+</Tip>
+
+## Layer 1: declarative Jakarta Bean Validation
+
+The custom annotations under `fineract-validation/src/main/java/org/apache/fineract/validation/constraints/` are vanilla Jakarta Bean Validation constraints — Jersey will pick them up automatically when the DTO is a typed parameter, provided a `Validator` is bootstrapped (which happens by default in Fineract's Spring Boot stack via `LocalValidatorFactoryBean`).
+
+Three custom constraints ship with the module:
+
+| Annotation | Target | Validator | Purpose |
+| --- | --- | --- | --- |
+| `@EnumValue(enumClass = …)` | `FIELD` | `EnumValueValidator` | String matches the **lower-cased** name of one of an enum's constants. |
+| `@LocalDate(dateField, formatField, localeField)` | `TYPE` | `LocalDateValidator` | Class-level constraint: the named string fields parse together as a strict `LocalDate` using BCP-47 locale. |
+| `@Locale` | `FIELD`, `PARAMETER` | `LocaleValidator` | String is a valid BCP-47 language tag matching one of `Locale.getAvailableLocales()`. |
+
+`BusinessDateUpdateRequest` is the canonical real-world combo:
+
+```java
+// fineract-core/.../infrastructure/businessdate/data/api/BusinessDateUpdateRequest.java
+@Builder
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@LocalDate(dateField = "date", formatField = "dateFormat", localeField = "locale")
+public class BusinessDateUpdateRequest implements Serializable {
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date-format.not-blank}")
+    private String dateFormat;
+
+    @EnumValue(enumClass = BusinessDateType.class, message = "{org.apache.fineract.businessdate.type.invalid}")
+    @NotNull(message = "{org.apache.fineract.businessdate.type.not-blank}")
+    private String type;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.date.not-blank}")
+    private String date;
+
+    @NotBlank(message = "{org.apache.fineract.businessdate.locale.not-blank}")
+    @Locale
+    private String locale;
+}
+```
+
+What this single DTO buys you:
+
+- `dateFormat` must be non-blank (Jakarta `@NotBlank`).
+- `type` must be both non-null **and** parse as a `BusinessDateType` enum (case-insensitive name match via `@EnumValue`).
+- `date` must be non-blank.
+- `locale` must be non-blank **and** be a real BCP-47 locale.
+- Cross-field: `date`/`dateFormat`/`locale` must successfully parse together (class-level `@LocalDate`).
+
+When any of these fail, Hibernate Validator throws a `ConstraintViolationException`, which `JakartaValidationExceptionMapper` flattens into an `ApiGlobalErrorResponse`:
+
+```java
+// JakartaValidationExceptionMapper.java
+@Override
+public Response toResponse(final ConstraintViolationException exception) {
+    final ApiGlobalErrorResponse dataValidationErrorResponse = ApiGlobalErrorResponse
+            .badClientRequest("validation.msg.validation.errors.exist",
+                              "Validation errors exist.",
+                              getApiParameterErrors(exception));
+    return Response.status(Status.BAD_REQUEST).entity(dataValidationErrorResponse).type(MediaType.APPLICATION_JSON).build();
+}
+
+private List<ApiParameterError> getApiParameterErrors(final ConstraintViolationException exception) {
+    return exception.getConstraintViolations().stream().map(violation -> {
+        final String messageTemplate = violation.getMessageTemplate();
+        final String messageKey = messageTemplate.replace("{", "").replace("}", "");
+        return ApiParameterError.parameterError(messageKey, violation.getMessage(),
+                violation.getPropertyPath().toString());
+    }).toList();
+}
+```
+
+Notice the mapper strips the `{}` from the message template to produce the `userMessageGlobalisationCode`. This means **the keys in `ValidationMessages.properties` become the globalisation codes** in the API response — clients can pattern-match `org.apache.fineract.businessdate.type.invalid` and render their own localized strings.
+
+See [`/validation/constraints`](/validation/constraints) for full constraint internals.
+
+## Layer 2: imperative `DataValidatorBuilder`
+
+`DataValidatorBuilder` is the workhorse for all the older command-style endpoints — loan, savings, client, group, charge, accounting, etc. The pattern is identical across the ~50 `*DataValidator.java` classes in the codebase:
+
+1. The command handler (`@CommandType("CREATE_FOO")`) hands a `JsonCommand` to a `FooDataValidator`.
+2. The validator parses the JSON via `FromJsonHelper`.
+3. It instantiates a `DataValidatorBuilder` bound to a fresh `List<ApiParameterError>` and a `resource("foo")` name.
+4. It chains `.reset().parameter("x").value(extracted).notNull().integerGreaterThanZero()` for each field.
+5. If the error list is non-empty, it throws `PlatformApiDataValidationException`.
+
+`PlatformApiDataValidationExceptionMapper` converts that to a 400 with the same response shape used by the Jakarta layer. Full anatomy of the builder — every chainable method, the `reset()` semantics, message-code construction — lives in [`/validation/data-validator-builder`](/validation/data-validator-builder).
+
+<Note>
+`DataValidatorBuilder.throwValidationErrors()` is the **builder-driven** form of the throw; many older validators throw the exception manually using the same `validation.msg.validation.errors.exist` code. Both paths land at the same exception mapper.
+</Note>
+
+## When each layer runs
+
+```text
+Request lifecycle (typed DTO + JsonCommand hybrid)
+──────────────────────────────────────────────────
+
+  TenantAware filter ──► Auth filter ──► Jersey routing
+                                              │
+                                              ▼
+                                Resource method matched
+                                              │
+              ┌───────────────────────────────┴───────────────┐
+              │                                                 │
+   ① Typed @Valid DTO bound                       JsonCommand body
+              │                                                 │
+              ▼                                                 │
+  Hibernate Validator                                            │
+   (constraints run NOW)                                         │
+              │                                                 │
+   ✗ violation → 400 (JakartaValidationExceptionMapper)          │
+   ✓ ok                                                          │
+              │                                                 │
+              └────────────► Resource invokes write service ◄────┘
+                                              │
+                                              ▼
+                              CommandSourceService dispatches
+                                              │
+                                              ▼
+                              CommandHandler.processCommand
+                                              │
+                                              ▼
+                        ② FooDataValidator.validateForCreate(json)
+                              uses DataValidatorBuilder
+                                              │
+            ✗ errors → PlatformApiDataValidationException → 400
+            ✓ ok                                                  │
+                                              ▼
+                                  Domain mutation, audit, return CommandProcessingResult
+```
+
+Cross-references:
+
+- [`/command/overview`](/command/overview) — how `@CommandType` handlers are registered and dispatched.
+- [`/core/serialization-and-json`](/core/serialization-and-json) — `FromJsonHelper`, `JsonCommand`, `parameterExists`, `extractLongNamed`, `checkForUnsupportedParameters` — the primitives every `*DataValidator` calls.
+- [`/core/exception-mappers`](/core/exception-mappers) — the full registry of JAX-RS `ExceptionMapper` providers, including `PlatformApiDataValidationExceptionMapper` and `JakartaValidationExceptionMapper`.
+
+## Why two layers? Practical tradeoffs
+
+<AccordionGroup>
+  <Accordion title="Jakarta Bean Validation — pros and cons">
+    **Pros**
+
+    - Annotations live next to the field; the contract is documented in the DTO source.
+    - Runs *before* any handler code — invalid bodies short-circuit early.
+    - Composable with OpenAPI generation: `@Schema(...)` and `@NotBlank` flow into Swagger metadata.
+    - Reusable across modules: `@EnumValue`, `@Locale`, `@LocalDate` are shared via `fineract-validation`.
+
+    **Cons**
+
+    - Cross-parameter rules (this only required when *that* is provided) get awkward — you end up writing class-level constraints like `@LocalDate`.
+    - Conditional / multi-pass validation (e.g. "fetch entity, then check business invariants") doesn't fit naturally.
+    - The legacy `JsonCommand` flow has no DTO — there's nothing to put the annotations on.
+  </Accordion>
+
+  <Accordion title="DataValidatorBuilder — pros and cons">
+    **Pros**
+
+    - Imperative — easy to do "if field A is present, then field B must be > 0".
+    - Free-form access to repositories and `DateUtils` mid-validation (used heavily for date-vs-date rules).
+    - Centralized error-code construction: every error becomes `validation.msg.{resource}.{parameter}.{rule}` automatically.
+    - Used by every CQRS command handler — universal pattern across the codebase.
+
+    **Cons**
+
+    - Verbose — each parameter is 1–3 chained calls.
+    - No compile-time guarantee that a parameter was actually validated.
+    - Has to live next to the handler, not the DTO.
+  </Accordion>
+</AccordionGroup>
+
+## File inventory at a glance
+
+<CardGroup cols={2}>
+  <Card title="fineract-validation" icon="folder">
+    `validation/constraints/EnumValue.java`<br />
+    `validation/constraints/EnumValueValidator.java`<br />
+    `validation/constraints/LocalDate.java`<br />
+    `validation/constraints/LocalDateValidator.java`<br />
+    `validation/constraints/Locale.java`<br />
+    `validation/constraints/LocaleValidator.java`<br />
+    `resources/ValidationMessages.properties`
+  </Card>
+  <Card title="fineract-core data & validator" icon="folder">
+    `infrastructure/core/data/DataValidatorBuilder.java`<br />
+    `infrastructure/core/data/ApiParameterError.java`<br />
+    `infrastructure/core/data/ApiGlobalErrorResponse.java`<br />
+    `infrastructure/core/data/ApiErrorMessageArg.java`<br />
+    `infrastructure/core/data/PaginationParametersDataValidator.java`<br />
+    `infrastructure/core/validator/ParseAndValidator.java`<br />
+    `infrastructure/core/exception/PlatformApiDataValidationException.java`
+  </Card>
+  <Card title="fineract-core exception mappers" icon="folder">
+    `infrastructure/core/exceptionmapper/PlatformApiDataValidationExceptionMapper.java` — maps the imperative path to 400.<br />
+    `infrastructure/core/exceptionmapper/JakartaValidationExceptionMapper.java` — maps the Bean Validation path to 400.<br />
+    `infrastructure/core/exceptionmapper/PlatformRequestBodyItemLimitValidationExceptionMapper.java`
+  </Card>
+  <Card title="Example DTOs using the constraints" icon="file-code">
+    `fineract-core/.../infrastructure/businessdate/data/api/BusinessDateUpdateRequest.java`<br />
+    `fineract-provider/.../portfolio/loanaccount/api/request/ReAgePreviewRequest.java`<br />
+    `fineract-provider/.../portfolio/loanaccount/api/request/ReAmortizationPreviewRequest.java`
+  </Card>
+</CardGroup>
+
+## Reading order
+
+1. [`/validation/constraints`](/validation/constraints) — every annotation class, its target, its validator, and example DTO wiring.
+2. [`/validation/data-validator-builder`](/validation/data-validator-builder) — every chainable method on `DataValidatorBuilder` plus a full real-world `*DataValidator` example.
+3. [`/core/exception-mappers`](/core/exception-mappers) — the JAX-RS mappers that turn validation failures into HTTP 400.
+4. [`/command/overview`](/command/overview) — where `*DataValidator` instances are called from inside the CQRS pipeline.
+5. [`/core/serialization-and-json`](/core/serialization-and-json) — the `FromJsonHelper` primitives every `*DataValidator` relies on.

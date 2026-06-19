@@ -1,0 +1,362 @@
+---
+title: "Client Identifiers: KYC Documents and Status"
+sidebarTitle: "Client Identifiers"
+description: "Reference for the Fineract ClientIdentifier entity, ClientIdentifierStatus, ClientIdentifiersApiResource and the document-tracking workflow."
+---
+
+# Client Identifiers
+
+`ClientIdentifier` records the KYC and statutory documents (passport,
+national ID, driving licence, tax ID, …) attached to a client in Apache
+Fineract. The entity is small but plays a central role in onboarding,
+fraud-checks and inter-institution data exchange: identifier keys are
+unique across the platform, so two clients cannot share the same passport
+number with the same document type.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ClientIdentifier` entity, `ClientIdentifierStatus` | `fineract-core` | `org.apache.fineract.portfolio.client.domain` |
+| `ClientIdentifierRepository` | `fineract-core` | `org.apache.fineract.portfolio.client.domain` |
+| `ClientIdentifiersApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.client.api` |
+| `ClientIdentifierWritePlatformService(JpaRepositoryImpl)` | `fineract-provider` | `org.apache.fineract.portfolio.client.service` |
+| `ClientIdentifierCommand` | `fineract-provider` | `org.apache.fineract.portfolio.client.command` |
+| Command handlers (`CreateClientIdentifier…`, `UpdateClientIdentifier…`, `DeleteClientIdentifier…`) | `fineract-provider` | `org.apache.fineract.portfolio.client.handler` |
+| Exceptions: `ClientIdentifierNotFoundException`, `DuplicateClientIdentifierException` | `fineract-provider` | `org.apache.fineract.portfolio.client.exception` |
+
+See [Clients](/portfolio/clients) for the owning entity and
+[/api/client-and-onboarding-apis](/api/client-and-onboarding-apis) for the
+documented REST contract.
+
+## Entity
+
+```java
+@Entity
+@Table(name = "m_client_identifier", uniqueConstraints = {
+    @UniqueConstraint(columnNames = { "document_type_id", "document_key" },
+                      name = "unique_identifier_key"),
+    @UniqueConstraint(columnNames = { "client_id", "document_key", "active" },
+                      name = "unique_active_client_identifier") })
+public class ClientIdentifier extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "client_id", nullable = false)
+    private Client client;
+
+    @ManyToOne
+    @JoinColumn(name = "document_type_id", nullable = false)
+    private CodeValue documentType;
+
+    @Column(name = "document_key", length = 1000)
+    private String documentKey;
+
+    @Column(name = "status", nullable = false)
+    private Integer status;
+
+    @Column(name = "description", length = 1000)
+    private String description;
+
+    @Column(name = "active")
+    private Integer active;
+}
+```
+
+Two unique constraints are layered:
+
+1. **`unique_identifier_key` (`document_type_id`, `document_key`)** —
+   prevents two rows (across any client) from carrying the same
+   `(documentType, documentKey)` pair. This is what makes the platform
+   able to enforce "no two clients can share the same passport number".
+2. **`unique_active_client_identifier` (`client_id`, `document_key`,
+   `active`)** — guards against a single client holding the same
+   document key in two active rows (e.g. accidentally double-inserting a
+   passport for the same person).
+
+`documentType` is a CodeValue against the `Customer Identifier` code. The
+code values are seeded as part of the reference data and editable through
+the Codes admin.
+
+### Status
+
+`ClientIdentifierStatus` is a small enum (`fineract-core`,
+`org.apache.fineract.portfolio.client.domain`):
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `100` | `INACTIVE` | Document exists but is not the current ID-of-record |
+| `300` | `ACTIVE` | The authoritative document for that document type |
+
+Two helpers shape the persistence model:
+
+- `status` always holds the integer code.
+- `active` is `null` when the row is inactive and equal to
+  `ClientIdentifierStatus.ACTIVE.getValue()` when active. The
+  three-column unique constraint relies on this: NULL is treated as
+  "absent" by most RDBMS, so inactive rows do not collide with each other
+  on the `(client, key, active)` tuple.
+
+Computed by the entity constructor:
+
+```java
+ClientIdentifierStatus statusEnum =
+        ClientIdentifierStatus.valueOf(statusName.toUpperCase());
+this.active = null;
+if (statusEnum.isActive()) {
+    this.active = statusEnum.getValue();
+}
+this.status = statusEnum.getValue();
+```
+
+## ClientIdentifiersApiResource
+
+`ClientIdentifiersApiResource` is mounted at
+`/v1/clients/{clientId}/identifiers` and produces JSON. Endpoints:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/clients/{clientId}/identifiers` | List identifiers for a client | `READ_CLIENTIDENTIFIER` |
+| `GET` | `/v1/clients/{clientId}/identifiers/template` | Template — supplies the list of allowed document type CodeValues | `READ_CLIENTIDENTIFIER` |
+| `POST` | `/v1/clients/{clientId}/identifiers` | Create a new identifier | `CREATE_CLIENTIDENTIFIER` |
+| `GET` | `/v1/clients/{clientId}/identifiers/{identifierId}` | Retrieve a single identifier | `READ_CLIENTIDENTIFIER` |
+| `PUT` | `/v1/clients/{clientId}/identifiers/{identifierId}` | Update key/description/type/status | `UPDATE_CLIENTIDENTIFIER` |
+| `DELETE` | `/v1/clients/{clientId}/identifiers/{identifierId}` | Hard delete | `DELETE_CLIENTIDENTIFIER` |
+
+### Create request
+
+```json
+{
+  "documentTypeId": 24,
+  "documentKey": "AB1234567",
+  "description": "Issued at Bogotá branch",
+  "status": "Active"
+}
+```
+
+The `status` value is the enum name (`"Active"` / `"Inactive"`), not the
+integer. The `ClientIdentifierCommand` value object normalises it via
+`ClientIdentifierStatus.valueOf(name.toUpperCase())`.
+
+Validation rules (`ClientIdentifierCommandFromApiJsonDeserializer`):
+
+- `documentTypeId` — required, positive long.
+- `documentKey` — required, non-blank, ≤ 1000 chars.
+- `description` — optional, ≤ 1000 chars.
+- `status` — required.
+
+On the database side, attempting to insert a duplicate
+`(documentType, documentKey)` triggers a constraint violation that the
+service translates into `DuplicateClientIdentifierException` carrying the
+existing `clientId` so the caller can deduplicate.
+
+### Update behaviour
+
+The entity's `update(JsonCommand command)` does change-detection for each
+field and returns a `Map<String,Object>` of actual changes (used by the
+audit log). Status transitions in the existing identifier read like:
+
+```java
+final String statusParamName = "status";
+if (command.isChangeInStringParameterNamed(statusParamName,
+        ClientIdentifierStatus.fromInt(this.status).getCode())) {
+    final String newValue = command.stringValueOfParameterNamed(statusParamName);
+    actualChanges.put(statusParamName, ClientIdentifierStatus.valueOf(newValue));
+    this.status = ClientIdentifierStatus.valueOf(newValue).getValue();
+}
+```
+
+Note that the implementation updates `status` but the `active` flag has
+to be re-derived; the write service handles this consistently when
+persisting the change.
+
+## Write service contract
+
+`ClientIdentifierWritePlatformService` (interface in
+`fineract-provider/.../service`) exposes:
+
+```java
+CommandProcessingResult addClientIdentifier(Long clientId, JsonCommand command);
+CommandProcessingResult updateClientIdentifier(Long clientId, Long identifierId,
+                                               JsonCommand command);
+CommandProcessingResult deleteClientIdentifier(Long clientId, Long identifierId);
+```
+
+Implementation steps (`ClientIdentifierWritePlatformServiceJpaRepositoryImpl`):
+
+1. Parse with `ClientIdentifierCommand fromApiJson`.
+2. Resolve `Client` via `ClientRepositoryWrapper` (honouring office
+   hierarchy).
+3. Resolve `documentType` via `CodeValueRepositoryWrapper` against the
+   `Customer Identifier` code.
+4. Build the `ClientIdentifier` and persist.
+5. Catch `DataIntegrityViolationException` and convert to the typed
+   duplicate exception, looking up the conflicting `clientId` for the
+   error payload.
+
+## Command handlers and audit
+
+Each REST operation lands in a dedicated handler:
+
+| Handler | Triggered by |
+| --- | --- |
+| `CreateClientIdentifierCommandHandler` | `POST .../identifiers` |
+| `UpdateClientIdentifierCommandHandler` | `PUT .../identifiers/{id}` |
+| `DeleteClientIdentifierCommandHandler` | `DELETE .../identifiers/{id}` |
+
+The handlers are wired into `CommandsSourceWritePlatformService`, so every
+operation produces a `m_portfolio_command_source` audit row (action name,
+JSON payload, user, office, returned `resourceId`).
+
+## Document tracking patterns
+
+- **Onboarding** — capture the primary government ID with `status =
+  Active`. Subsequent documents (utility bill, photo) can be added with
+  `status = Inactive` if you only want them archived.
+- **Renewal** — when a passport is reissued, update the existing row's
+  `documentKey` (preserving audit), or insert a new active row and flip
+  the previous one to `Inactive` via `PUT`.
+- **De-duplication** — handle `DuplicateClientIdentifierException` (HTTP
+  `403` with code `error.msg.clientIdentifier.duplicate`) by reading
+  `clientId` from the error JSON and showing the existing client to the
+  operator.
+
+## Read path
+
+`ClientIdentifierReadPlatformServiceImpl` returns `ClientIdentifierData`
+DTOs via `JdbcTemplate`. The template endpoint additionally exposes the
+list of allowed CodeValues (`/codes/{name}/codevalues` against
+`Customer Identifier`) so UIs can render a type picker.
+
+## Repository
+
+`ClientIdentifierRepository` (Spring Data) exposes the standard CRUD plus
+the implicit search by `client.id`. Look-ups by `(documentType,
+documentKey)` are performed by the write service in raw JPQL when handling
+the duplicate-constraint path:
+
+```java
+@Query("SELECT ci FROM ClientIdentifier ci WHERE ci.documentType = :docType "
+     + "AND ci.documentKey = :docKey")
+```
+
+(The actual method name and JPQL live in `ClientIdentifierRepository`.)
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `ClientIdentifierNotFoundException` | Identifier id unknown for that client |
+| `DuplicateClientIdentifierException` | Unique constraint hit on insert/update |
+| `ClientNotFoundException` | `clientId` does not resolve |
+| `CodeValueNotFoundException` | `documentTypeId` does not resolve to a `Customer Identifier` value |
+
+## Patterns and recipes
+
+### Onboarding flow
+
+Typical sequence for a new client:
+
+1. `POST /v1/clients` — create the client (PENDING).
+2. `POST /v1/clients/{id}/identifiers` — add the primary government ID
+   with `status = "Active"`.
+3. Optional repeats for secondary documents (`tax id`, `voter card`).
+4. `POST /v1/clients/{id}?command=activate` — activate.
+
+The order matters because `ClientWritePlatformService.activateClient`
+respects whatever the institution has configured for required KYC
+documents; some installs use the `Customer Identifier` code values list
+and a hook to enforce "must have at least one Active identifier" before
+activation.
+
+### Document renewal
+
+When a passport is reissued:
+
+```http
+PUT /v1/clients/{clientId}/identifiers/{identifierId}
+```
+
+```json
+{ "documentKey": "NEW1234567" }
+```
+
+Update in place — the audit chain on `m_portfolio_command_source` keeps
+the old value while preserving the integrity of any historical reports
+that linked to the row.
+
+### Inactivating an old document
+
+When you want to keep a record of an old document without making it the
+authoritative one:
+
+```http
+PUT /v1/clients/{clientId}/identifiers/{identifierId}
+```
+
+```json
+{ "status": "Inactive" }
+```
+
+The row's `active` column becomes `NULL`, freeing the
+`(client_id, document_key, active)` composite unique slot for a new
+active row with the same key (rare, but possible).
+
+### Handling the duplicate exception
+
+```text
+HTTP/1.1 403 Forbidden
+
+{
+  "developerMessage": "Client identifier already exists",
+  "userMessageGlobalisationCode": "error.msg.clientIdentifier.duplicate",
+  "defaultUserMessage": "...",
+  "userMessage": "...",
+  "errors": [
+    {
+      "userMessage": "Client identifier already exists",
+      "userMessageGlobalisationCode": "error.msg.clientIdentifier.duplicate",
+      "args": [ { "value": 209 } ]
+    }
+  ]
+}
+```
+
+The `args[0].value` is the conflicting `clientId`; integrations can
+follow up with `GET /v1/clients/209` to surface the existing party to
+the operator.
+
+## Sample response shapes
+
+### List
+
+```json
+[
+  {
+    "id": 33, "clientId": 109,
+    "documentType": { "id": 24, "name": "Passport", "active": true,
+                       "mandatory": false },
+    "documentKey": "AB1234567",
+    "description": "Issued at Bogotá branch",
+    "status": "Active"
+  }
+]
+```
+
+### Template
+
+```json
+{
+  "allowedDocumentTypes": [
+    { "id": 24, "name": "Passport" },
+    { "id": 25, "name": "National ID" },
+    { "id": 26, "name": "Driving Licence" }
+  ]
+}
+```
+
+## Cross-references
+
+- [Clients](/portfolio/clients) — owning entity
+- [Client Address](/portfolio/client-address) — sibling KYC information
+- [Client Family Members](/portfolio/client-family-members)
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `CodeValue`,
+  `ExternalId`, audit superclasses
+- [Client / onboarding APIs](/api/client-and-onboarding-apis)

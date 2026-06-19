@@ -1,0 +1,327 @@
+---
+title: "Entity Datatable Checks — Required Rows by Status"
+sidebarTitle: "Entity Datatable Checks"
+description: "Apache Fineract entity datatable checks: EntityDatatableChecks entity, runTheCheck enforcement, StatusEnum and the /v1/entityDatatableChecks REST surface."
+---
+
+The Apache Fineract **entity datatable checks** feature lets an operator declare that "every entity of type X must have at least one row in datatable Y before it can move to status Z". For example: "every loan must have a row in `ext_loan_kyc` before disbursal", or "every client must have a row in `ext_client_address` before activation". The aggregate is `EntityDatatableChecks` (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/domain/EntityDatatableChecks.java`, table `m_entity_datatable_check`); enforcement happens through `EntityDatatableChecksWritePlatformService.runTheCheck(...)`, which is invoked from portfolio status transitions (loan disburse, client activate, savings approve, …) and throws `DatatableEntryRequiredException` when a required row is missing.
+
+For datatable creation / registration see [Datatables](/dataqueries/datatables); for the wider module map see [Data queries overview](/dataqueries/overview).
+
+## Aggregate — `EntityDatatableChecks`
+
+```java
+@Entity
+@Table(name = "m_entity_datatable_check")
+public class EntityDatatableChecks extends AbstractPersistableCustom<Long> {
+    @Column(name = "application_table_name", nullable = false)  private String  entity;
+    @Column(name = "x_registered_table_name", nullable = false) private String  datatableName;
+    @Column(name = "status_enum", nullable = false)             private Integer status;
+    @Column(name = "system_defined")                            private boolean systemDefined = false;
+    @Column(name = "product_id", nullable = true)               private Long    productId;
+
+    public static EntityDatatableChecks fromJson(final JsonCommand command) {
+        final String entity   = command.stringValueOfParameterNamed("entity");
+        final Integer status  = command.integerValueSansLocaleOfParameterNamed("status");
+        final String datatableName = command.stringValueOfParameterNamed("datatableName");
+        boolean systemDefined = command.booleanPrimitiveValueOfParameterNamed("systemDefined");
+        Long productId = command.parameterExists("productId")
+            ? command.longValueOfParameterNamed("productId")
+            : null;
+        return new EntityDatatableChecks(entity, datatableName, status, systemDefined, productId);
+    }
+}
+```
+
+Semantics of each column:
+
+| Column | Meaning |
+|---|---|
+| `application_table_name` | Parent table name (e.g. `m_client`, `m_loan`) — must resolve via `EntityTables.fromEntityName(...)` |
+| `x_registered_table_name` | Name of a registered datatable (`x_registered_table.registered_table_name`) |
+| `status_enum` | A value from `StatusEnum` declaring at which lifecycle moment the check fires |
+| `system_defined` | `true` when the check was seeded by the platform; user-created checks are `false`. The flag is informational — both kinds enforce equally |
+| `product_id` | When non-null, the check applies only to a specific loan / savings product (joins on `m_product_loan` / `m_savings_product`) |
+
+The two distinct shapes — "for all entities" (`product_id IS NULL`) and "for a specific product" (`product_id = ?`) — are queried separately by `EntityDatatableChecksRepository`.
+
+## Status enum — `StatusEnum`
+
+```java
+// fineract-core/.../infrastructure/dataqueries/data/StatusEnum.java
+public enum StatusEnum {
+    CREATE("statusEnum.create", 100),
+    APPROVE("statusEnum.approve", 200),
+    ACTIVATE("statusEnum.activate", 300),
+    WITHDRAWN("statusEnum.withdraw", 400),
+    REJECTED("statusEnum.reject", 500),
+    CLOSE("statusEnum.close", 600),
+    WRITE_OFF("statusEnum.write off", 601),
+    RESCHEDULE("statusEnum.reschedule", 602),
+    OVERPAY("statusEnum.overpay", 700),
+    DISBURSE("statusEnum.disburse", 800);
+}
+```
+
+Which statuses are actually checkable per entity is declared on `EntityTables`:
+
+| Parent entity | Permitted check statuses |
+|---|---|
+| `CLIENT` (`m_client`) | `CREATE(100)`, `ACTIVATE(300)`, `CLOSE(600)` |
+| `GROUP` (`m_group`) | `CREATE(100)`, `ACTIVATE(300)`, `CLOSE(600)` |
+| `LOAN` (`m_loan`) | `CREATE(100)`, `APPROVE(200)`, `DISBURSE(800)`, `WITHDRAWN(400)`, `REJECTED(500)`, `WRITE_OFF(601)` |
+| `SAVINGS` (`m_savings_account`) | `CREATE(100)`, `APPROVE(200)`, `ACTIVATE(300)`, `WITHDRAWN(400)`, `REJECTED(500)`, `CLOSE(600)` |
+| All others | none (creating a check on `OFFICE` / `LOAN_PRODUCT` etc. is rejected) |
+
+The validator (`EntityDatatableChecksDataValidator`) enforces that the supplied `status` is one of the statuses declared on the resolved `EntityTables` value; otherwise it throws a `PlatformApiDataValidationException` with `error.msg.entityDatatableChecks.entity.status.not.supported`.
+
+## Enforcement — `runTheCheck(...)`
+
+The hot path is `EntityDatatableChecksWritePlatformServiceImpl.runTheCheck(...)`:
+
+```java
+@Override
+public void runTheCheck(final Long entityId, final String entityName, final Integer status,
+                        String foreignKeyColumn, final String entitySubtype) {
+    List<EntityDatatableChecks> requiredBeforeAction;
+    if (entitySubtype == null) {
+        requiredBeforeAction = entityDatatableChecksRepository.findByEntityAndStatus(entityName, status);
+    } else {
+        requiredBeforeAction = entityDatatableChecksRepository.findByEntityAndStatusAndSubtype(
+            entityName, status, entitySubtype.toUpperCase());
+    }
+
+    if (requiredBeforeAction != null) {
+        List<String> reqDatatables = new ArrayList<>();
+        for (EntityDatatableChecks t : requiredBeforeAction) {
+            final String datatableName = t.getDatatableName();
+            final Long countEntries = datatableReadService.countDatatableEntries(
+                datatableName, entityId, foreignKeyColumn);
+            if (countEntries.intValue() == 0) {
+                reqDatatables.add(datatableName);
+            }
+        }
+        if (!reqDatatables.isEmpty()) {
+            throw new DatatableEntryRequiredException(reqDatatables.toString());
+        }
+    }
+}
+```
+
+Walkthrough:
+
+1. Query `m_entity_datatable_check` for matching `(entity, status)` (optionally narrowed by `entity_subtype`, e.g. `PERSON`/`ENTITY` for clients).
+2. For each matching check, count the datatable rows for the parent entity via `DatatableReadService.countDatatableEntries(datatableName, entityId, foreignKeyColumn)`. This boils down to `SELECT COUNT(*) FROM <datatable> WHERE <fk_column> = ?`.
+3. Build a list of datatables that returned zero. If non-empty, throw `DatatableEntryRequiredException(reqDatatables.toString())` — the caller is the lifecycle operation, which aborts the transaction.
+4. If every required check has at least one row, return cleanly. The caller proceeds with the status transition.
+
+There is also a product-scoped variant `runTheCheckForProduct(entityId, entityName, status, foreignKeyColumn, productId)` which:
+
+1. Tries the product-specific checks first (`findByEntityStatusAndProduct(...)`).
+2. Falls back to product-less checks (`findByEntityStatusAndNoProduct(...)`) when nothing matches the product.
+
+This is how loan and savings transitions inject product-level granularity — a tenant can require `ext_loan_extra_kyc` only for a specific high-risk product.
+
+### Who calls `runTheCheck`
+
+Search for `runTheCheck` callers in `fineract-provider` to confirm the integration points; the canonical callers are:
+
+- `LoanWritePlatformServiceJpaRepositoryImpl` (approve, disburse, write-off, reject).
+- `SavingsAccountWritePlatformServiceJpaRepositoryImpl` (approve, activate, close).
+- `ClientWritePlatformServiceJpaRepositoryImpl` (create, activate, close).
+- `GroupingTypesWritePlatformServiceJpaRepositoryImpl` (create, activate, close).
+
+Each caller passes the matching `StatusEnum` value as `status`, the parent entity id, the parent table name, and the foreign-key column name on the datatable (`client_id`, `loan_id`, `savings_account_id`).
+
+## REST surface — `EntityDatatableChecksApiResource`
+
+`@Path("/v1/entityDatatableChecks")`:
+
+| Method | Path | Operation | Permission |
+|---|---|---|---|
+| `GET` | `/v1/entityDatatableChecks?status=&entity=&productId=&offset=&limit=` | List checks (paged) | `READ_ENTITYDATATABLECHECK` |
+| `GET` | `/v1/entityDatatableChecks/template` | Template (allowed entities + statuses + supporting datatables) | `READ_ENTITYDATATABLECHECK` |
+| `POST` | `/v1/entityDatatableChecks` | Create a check | `CREATE_ENTITYDATATABLECHECK` |
+| `DELETE` | `/v1/entityDatatableChecks/{entityDatatableCheckId}` | Delete a check | `DELETE_ENTITYDATATABLECHECK` |
+
+There is no `PUT`; checks are immutable. To "edit" a check, delete and recreate.
+
+### Create body
+
+```http
+POST /v1/entityDatatableChecks
+Content-Type: application/json
+
+{
+  "entity":        "m_loan",
+  "status":        800,                 // DISBURSE
+  "datatableName": "ext_loan_kyc",
+  "productId":     12,                  // optional - product-scoped
+  "systemDefined": false                // optional - default false
+}
+```
+
+Required fields: `entity`, `status`, `datatableName`. Validated by `EntityDatatableChecksDataValidator.validateForCreate(...)`.
+
+### Read shape
+
+`GET /v1/entityDatatableChecks` returns a paged `EntityDataTableChecksData`:
+
+```java
+public final class EntityDataTableChecksData {
+    private final Long    id;
+    private final String  entity;
+    private final String  status;            // resolved label, e.g. "Disburse"
+    private final Integer statusValue;       // StatusEnum value
+    private final String  datatableName;
+    private final boolean systemDefined;
+    private final Long    productId;
+    private final String  productName;       // resolved label
+    // ...
+}
+```
+
+`GET /v1/entityDatatableChecks/template` returns `EntityDataTableChecksTemplateData` containing the list of valid entities, the list of valid statuses per entity, and the registered datatables that can host a check (filtered by which datatables carry an appropriate foreign-key column).
+
+## Create flow — `createCheck(JsonCommand)`
+
+The write service performs structural validation before persisting:
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult createCheck(final JsonCommand command) {
+    this.context.authenticatedUser();
+    this.fromApiJsonDeserializer.validateForCreate(command.json());
+
+    // 1. datatable must exist
+    String datatableName = command.stringValueOfParameterNamed("datatableName");
+    DatatableData datatableData = this.datatableReadService.retrieveDatatable(datatableName);
+    if (datatableData == null) {
+        throw new DatatableNotFoundException(datatableName);
+    }
+
+    // 2. datatable must have the FK column matching the requested entity
+    final String entity = command.stringValueOfParameterNamed("entity");
+    final String foreignKeyColumnName = EntityTables.getForeignKeyColumnNameOnDatatable(entity);
+    if (!datatableData.hasColumn(foreignKeyColumnName)) {
+        throw new EntityDatatableCheckNotSupportedException(
+            datatableData.getRegisteredTableName(), entity);
+    }
+
+    // 3. (status, entity, datatable[, productId]) must be unique
+    final Long productId = command.longValueOfParameterNamed("productId");
+    final Integer status = command.integerValueSansLocaleOfParameterNamed("status");
+
+    if (productId == null) {
+        if (!entityDatatableChecksRepository
+                .findByEntityStatusAndDatatableIdAndNoProduct(entity, status, datatableName).isEmpty()) {
+            throw new EntityDatatableCheckAlreadyExistsException(entity, status, datatableName);
+        }
+    } else {
+        // productId must reference a valid loan/savings product
+        EntityTables entityTable = EntityTables.fromEntityName(entity);
+        if (entityTable == EntityTables.LOAN) {
+            this.loanProductReadPlatformService.retrieveLoanProduct(productId);
+        } else if (entityTable == EntityTables.SAVINGS) {
+            this.savingsProductReadPlatformService.retrieveOne(productId);
+        } else {
+            throw new EntityDatatableCheckNotSupportedException(entity, productId);
+        }
+        if (!entityDatatableChecksRepository
+                .findByEntityStatusAndDatatableIdAndProductId(entity, status, datatableName, productId).isEmpty()) {
+            throw new EntityDatatableCheckAlreadyExistsException(entity, status, datatableName, productId);
+        }
+    }
+
+    final EntityDatatableChecks check = EntityDatatableChecks.fromJson(command);
+    this.entityDatatableChecksRepository.saveAndFlush(check);
+
+    return new CommandProcessingResultBuilder()
+        .withCommandId(command.commandId())
+        .withEntityId(check.getId()).build();
+}
+```
+
+Structural invariants enforced:
+
+- The named datatable must be registered (`DatatableNotFoundException` otherwise).
+- The datatable must have the foreign-key column corresponding to the requested parent (e.g. a check on `m_loan` requires the datatable to have a `loan_id` column — `EntityDatatableCheckNotSupportedException` otherwise).
+- The `(entity, status, datatableName[, productId])` tuple must be unique (`EntityDatatableCheckAlreadyExistsException`).
+- If `productId` is supplied, the parent must be `LOAN` or `SAVINGS` AND the product id must resolve via `LoanProductReadPlatformService.retrieveLoanProduct(...)` / `SavingsProductReadPlatformService.retrieveOne(...)`.
+
+## Delete flow — `deleteCheck(Long)`
+
+Loads the check by id; throws `EntityDatatableChecksNotFoundException` if missing; deletes via `entityDatatableChecksRepository.delete(check)`. There is no soft-delete and no auditing beyond the standard command-source log.
+
+## Configuration knob — `enableConfigUpdatesForDataTables`
+
+`ConfigurationDomainService.isConstraintApproachEnabledForDatatables()` is consulted at *datatable creation* time, not at check enforcement. Even with constraints disabled at the datatable layer, the check enforcement still calls `countDatatableEntries(...)`. The "constraint approach" is unrelated to the entity-datatable check mechanism; the two coexist independently.
+
+## What the caller sees when a check fires
+
+```java
+throw new DatatableEntryRequiredException(reqDatatables.toString());
+```
+
+`DatatableEntryRequiredException` extends `PlatformDataIntegrityException`. The HTTP response is `403 Forbidden` with payload similar to:
+
+```json
+{
+  "developerMessage": "Required datatables: [ext_loan_kyc]",
+  "userMessageGlobalisationCode": "error.msg.datatable.entry.required",
+  "defaultUserMessage": "There are required datatables that should be filled before continuing",
+  "errors": [{
+    "developerMessage": "There are required datatables that should be filled before continuing",
+    "defaultUserMessage": "There are required datatables that should be filled before continuing",
+    "args": [{ "value": "[ext_loan_kyc]" }],
+    "userMessageGlobalisationCode": "error.msg.datatable.entry.required"
+  }]
+}
+```
+
+The transaction is rolled back; the operator must `POST /v1/datatables/ext_loan_kyc/{loanId}` with a complete payload before retrying the disburse / activate call.
+
+## Worked example — "every loan must have KYC before disbursal"
+
+1. Create the datatable as a normal extension of `m_loan` — see [Datatables](/dataqueries/datatables):
+   ```http
+   POST /v1/datatables
+   { "datatableName": "ext_loan_kyc", "apptableName": "m_loan", "multiRow": false,
+     "columns": [ { "name": "id_number", "type": "String", "length": 50, "mandatory": true } ] }
+   ```
+2. Create the check:
+   ```http
+   POST /v1/entityDatatableChecks
+   { "entity": "m_loan", "status": 800, "datatableName": "ext_loan_kyc" }
+   ```
+3. Try to disburse a loan that has no row in `ext_loan_kyc`:
+   ```http
+   POST /v1/loans/42?command=disburse
+   ```
+   → `403 Forbidden` with `error.msg.datatable.entry.required` and `args = [ext_loan_kyc]`.
+4. Populate the datatable row:
+   ```http
+   POST /v1/datatables/ext_loan_kyc/42
+   { "id_number": "ABCD123" }
+   ```
+5. Retry the disbursement → succeeds.
+
+## Errors
+
+| Exception | Trigger |
+|---|---|
+| `DatatableNotFoundException` | `datatableName` not in `x_registered_table` (also raised by `runTheCheck` if a check references a since-dropped datatable) |
+| `EntityDatatableCheckNotSupportedException` | Datatable lacks the required FK column for the parent, or `productId` supplied for a non-LOAN/SAVINGS entity |
+| `EntityDatatableCheckAlreadyExistsException` | Unique-tuple violation on create |
+| `EntityDatatableChecksNotFoundException` | Delete against an unknown id |
+| `DatatableEntryRequiredException` | Enforcement-time miss — surfaces from `runTheCheck` |
+| `PlatformApiDataValidationException` | `EntityDatatableChecksDataValidator` rejected payload (missing field, status not allowed for entity, etc.) |
+
+## Related references
+
+- The host datatables that checks reference: [Datatables](/dataqueries/datatables).
+- The wider data queries map: [Data queries overview](/dataqueries/overview).
+- The portfolio status transitions that call `runTheCheck`: see loan / savings / client write-platform services in the [Loan](/loan/overview) and [Savings](/savings/overview) modules.
+- Business events emitted by datatable CRUD: [Hooks overview](/hooks/overview).
+- The REST surface in one place: [Reports and data APIs](/api/reports-and-data-apis).

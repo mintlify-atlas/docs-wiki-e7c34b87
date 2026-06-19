@@ -1,0 +1,379 @@
+---
+title: "LoansApiResource Endpoints and Command Switchboard"
+sidebarTitle: "Loans API"
+description: "Apache Fineract LoansApiResource at /v1/loans: list, get, create, update, delete, and the ?command= switchboard for approval and disbursal."
+---
+
+`LoansApiResource` is the front door for Apache Fineract loan accounts. It implements `/v1/loans` and dispatches every state-changing call through the `CommandWrapperBuilder` → `PortfolioCommandSourceWritePlatformService` pipeline documented in [Command source pipeline](/command/portfolio-command-source). Reads are served from `LoanReadPlatformService` directly (no command). This page enumerates every endpoint, including the long `?command=...` switchboard on `POST /v1/loans/{loanId}`.
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoansApiResource.java` (1,430 lines).
+
+```java
+@Path("/v1/loans")
+@Component
+@RequiredArgsConstructor
+@Tag(name = "Loans", description = …)
+public class LoansApiResource {
+    private final PlatformSecurityContext context;
+    private final LoanReadPlatformService loanReadPlatformService;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final DefaultToApiJsonSerializer<LoanAccountData> toApiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    // … plus ~30 collaborator services for template / association hydration
+}
+```
+
+## Endpoint table
+
+### Read
+
+| Method | Path | Handler method | Returns |
+| --- | --- | --- | --- |
+| `GET` | `/v1/loans` | `retrieveAll(uriInfo, …)` | `Page<LoanAccountData>` (paged, filtered) |
+| `GET` | `/v1/loans/{loanId}` | `retrieveLoan(loanId, …, uriInfo)` | `LoanAccountData` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}` | `retrieveLoan(loanExternalId, …)` | Same |
+| `GET` | `/v1/loans/template` | `template(clientId, groupId, productId, …)` | `LoanAccountData` (form defaults + option lists) |
+| `GET` | `/v1/loans/{loanId}/template` | `retrieveApprovalTemplate(loanId, …)` | `LoanApprovalData` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/template` | (mirror) | Same |
+| `GET` | `/v1/loans/{loanId}/delinquencytags` | `getDelinquencyTagHistory(loanId, …)` | `Collection<LoanDelinquencyTagHistoryData>` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/delinquencytags` | (mirror) | Same |
+| `GET` | `/v1/loans/{loanId}/delinquency-actions` | `getLoanDelinquencyActions(loanId)` | `List<LoanDelinquencyAction>` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/delinquency-actions` | (mirror) | Same |
+| `GET` | `/v1/loans/{loanId}/approved-amount` | `getLoanApprovedAmountHistory(loanId)` | `List<LoanApprovedAmountHistoryData>` |
+| `GET` | `/v1/loans/glimAccount/{glimId}` | `getGlimRepaymentTemplate(glimId)` | GLIM template |
+| `GET` | `/v1/loans/downloadtemplate` | `getLoansTemplate(officeId, staffId, …)` | XLSX (bulk import) |
+| `GET` | `/v1/loans/repayments/downloadtemplate` | `getLoanRepaymentTemplate(officeId, …)` | XLSX |
+
+### Write (single loan)
+
+| Method | Path | Verb | Handler method | Service call |
+| --- | --- | --- | --- | --- |
+| `POST` | `/v1/loans` | (no command) or `?command=calculateLoanSchedule` | `calculateLoanScheduleOrSubmitLoanApplication` | `LoanApplicationWritePlatformService.submitApplication` |
+| `PUT` | `/v1/loans/{loanId}` | `?command=markAsFraud` or none | `modifyLoanApplication` | `LoanApplicationWritePlatformService.modifyApplication` |
+| `DELETE` | `/v1/loans/{loanId}` | — | `deleteLoanApplication` | `LoanApplicationWritePlatformService.deleteApplication` |
+| `POST` | `/v1/loans/{loanId}` | `?command=…` (see switchboard below) | `stateTransitions` | various |
+| `PUT` | `/v1/loans/{loanId}/approved-amount` | — | `modifyLoanApprovedAmount` | `LoanApprovedAmountWritePlatformService` |
+| `PUT` | `/v1/loans/{loanId}/available-disbursement-amount` | — | `modifyLoanAvailableDisbursementAmount` | Same |
+| `POST` | `/v1/loans/{loanId}/delinquency-actions` | — | `createLoanDelinquencyAction` | Delinquency service |
+| `POST` | `/v1/loans/uploadtemplate` | (multipart) | `postLoanTemplate` | Bulk import |
+| `POST` | `/v1/loans/repayments/uploadtemplate` | (multipart) | `postLoanRepaymentTemplate` | Bulk import |
+
+### GLIM (multi-account)
+
+| Method | Path | Verb | Handler |
+| --- | --- | --- | --- |
+| `POST` | `/v1/loans/glimAccount/{glimId}` | `?command=reject \| approve \| disburse \| glimrepayment \| undodisbursal \| undoapproval` | `glimStateTransitions` |
+
+External-id mirrors exist for every loan-id-keyed endpoint listed above:
+
+```text
+/v1/loans/external-id/{loanExternalId}…
+```
+
+## Command switchboard (`POST /v1/loans/{loanId}?command=`)
+
+The `stateTransitions` private method is the heart of the resource. The full switch:
+
+```java
+private String stateTransitions(final Long loanId, final String loanExternalIdStr,
+        final String commandParam, final String apiRequestBodyAsJson) {
+    ExternalId loanExternalId = ExternalIdFactory.produce(loanExternalIdStr);
+    Long resolvedLoanId = loanId == null ? loanReadPlatformService.getResolvedLoanId(loanExternalId) : loanId;
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandWrapper commandRequest = null;
+    if (CommandParameterUtil.is(commandParam, "reject")) {
+        commandRequest = builder.rejectLoanApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "withdrawnByApplicant")) {
+        commandRequest = builder.withdrawLoanApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "approve")) {
+        commandRequest = builder.approveLoanApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "disburse")) {
+        commandRequest = builder.disburseLoanApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "disburseToSavings")) {
+        commandRequest = builder.disburseLoanToSavingsApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "disburseWithoutAutoDownPayment")) {
+        commandRequest = builder.disburseWithoutAutoDownPayment(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "undoapproval")) {
+        commandRequest = builder.undoLoanApplicationApproval(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "undodisbursal")) {
+        commandRequest = builder.undoLoanApplicationDisbursal(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "undolastdisbursal")) {
+        commandRequest = builder.undoLastDisbursalLoanApplication(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "assignloanofficer")) {
+        commandRequest = builder.assignLoanOfficer(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "unassignloanofficer")) {
+        commandRequest = builder.unassignLoanOfficer(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "recoverGuarantees")) {
+        commandRequest = new CommandWrapperBuilder().recoverFromGuarantor(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, "assigndelinquency")) {
+        commandRequest = builder.assignDelinquency(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, LoanApiConstants.CONTRACT_TERMINATION_COMMAND)) {
+        commandRequest = builder.applyContractTermination(resolvedLoanId).build();
+    } else if (CommandParameterUtil.is(commandParam, LoanApiConstants.UNDO_CONTRACT_TERMINATION_COMMAND)) {
+        commandRequest = builder.undoContractTermination(resolvedLoanId).build();
+    }
+    if (commandRequest == null) {
+        throw new UnrecognizedQueryParamException("command", commandParam);
+    }
+    CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return this.toApiJsonSerializer.serialize(result);
+}
+```
+
+### Command catalogue
+
+| `?command=` | Builder verb | Handler bean | Service method |
+| --- | --- | --- | --- |
+| `reject` | `rejectLoanApplication(id)` | `LoanApplicationRejectedCommandHandler` | `LoanApplicationWritePlatformService.rejectApplication` |
+| `withdrawnByApplicant` | `withdrawLoanApplication(id)` | `LoanApplicationWithdrawnByApplicantCommandHandler` | `applicantWithdrawsFromApplication` |
+| `approve` | `approveLoanApplication(id)` | `ApproveLoanApplicationCommandHandler` | `approveApplication` |
+| `disburse` | `disburseLoanApplication(id)` | `DisburseLoanCommandHandler` | `LoanWritePlatformService.disburseLoan(..., false, …)` |
+| `disburseToSavings` | `disburseLoanToSavingsApplication(id)` | `DisburseLoanToSavingsCommandHandler` | `disburseLoan(..., true, …)` (account transfer) |
+| `disburseWithoutAutoDownPayment` | `disburseWithoutAutoDownPayment(id)` | `DisburseLoanWithoutAutoDownPaymentCommandHandler` | `disburseLoan(..., …, true)` |
+| `undoapproval` | `undoLoanApplicationApproval(id)` | `UndoLoanApplicationApprovalCommandHandler` | `undoApplicationApproval` |
+| `undodisbursal` | `undoLoanApplicationDisbursal(id)` | `UndoLoanDisbursalCommandHandler` | `undoLoanDisbursal` |
+| `undolastdisbursal` | `undoLastDisbursalLoanApplication(id)` | `UndoLastTrancheLoanDisbursalCommandHandler` | `undoLastLoanDisbursal` |
+| `assignloanofficer` | `assignLoanOfficer(id)` | `AssignLoanOfficerCommandHandler` | `loanReassignment` |
+| `unassignloanofficer` | `unassignLoanOfficer(id)` | `RemoveLoanOfficerCommandHandler` | `removeLoanOfficer` |
+| `recoverGuarantees` | `recoverFromGuarantor(id)` | `RecoverFromGuarantorCommandHandler` | `recoverFromGuarantor` |
+| `assigndelinquency` | `assignDelinquency(id)` | (delinquency module) | `assignDelinquency` |
+| `contractTermination` | `applyContractTermination(id)` | `ContractTerminationCommandHandler` | `applyContractTermination` |
+| `undoContractTermination` | `undoContractTermination(id)` | `UndoContractTerminationCommandHandler` | `undoContractTermination` |
+
+For monetary state changes (`?command=repayment`, `?command=writeoff`, `?command=charge-off`, etc.) the path is `POST /v1/loans/{loanId}/transactions?command=...` — see [Loan transactions API](/loan/loan-transactions-api).
+
+## GLIM command switchboard
+
+```java
+public String glimStateTransitions(@PathParam("glimId") final Long glimId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandWrapper commandRequest = null;
+    if (CommandParameterUtil.is(commandParam, "reject"))     commandRequest = builder.rejectGLIMApplicationApproval(glimId).build();
+    else if (CommandParameterUtil.is(commandParam, "approve"))      commandRequest = builder.approveGLIMLoanApplication(glimId).build();
+    else if (CommandParameterUtil.is(commandParam, "disburse"))     commandRequest = builder.disburseGLIMLoanApplication(glimId).build();
+    else if (CommandParameterUtil.is(commandParam, "glimrepayment")) commandRequest = builder.repaymentGLIMLoanApplication(glimId).build();
+    else if (CommandParameterUtil.is(commandParam, "undodisbursal")) commandRequest = builder.undoGLIMLoanDisbursal(glimId).build();
+    else if (CommandParameterUtil.is(commandParam, "undoapproval"))  commandRequest = builder.undoGLIMLoanApproval(glimId).build();
+    else throw new UnrecognizedQueryParamException("command", commandParam);
+    return this.toApiJsonSerializer.serialize(
+        this.commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+## `POST /v1/loans` (submit / calculate)
+
+```java
+@POST
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Calculate loan repayment schedule | Submit a new Loan Application", …)
+public String calculateLoanScheduleOrSubmitLoanApplication(
+        @QueryParam("command") @Parameter(description = "command") final String commandParam,
+        @Context final UriInfo uriInfo,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    if (CommandParameterUtil.is(commandParam, "calculateLoanSchedule")) {
+        // No command-source; run synchronously via LoanScheduleAssembler
+        final JsonElement parsedQuery = this.fromJsonHelper.parse(apiRequestBodyAsJson);
+        final JsonQuery query = JsonQuery.from(apiRequestBodyAsJson, parsedQuery, this.fromJsonHelper);
+        final LoanScheduleData loanSchedule = this.calculationPlatformService.calculateLoanSchedule(query, true);
+        final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+        return this.loanScheduleToApiJsonSerializer.serialize(settings, loanSchedule, new HashSet<>());
+    }
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createLoanApplication().withJson(apiRequestBodyAsJson).build();
+    return this.toApiJsonSerializer.serialize(
+        this.commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+Two distinct behaviours under the same path:
+
+- **`?command=calculateLoanSchedule`** — pure projection; no persistence. Returns a `LoanScheduleData`.
+- **No command** (default) — submits the loan application, returning the new `loanId`.
+
+## `PUT /v1/loans/{loanId}` (modify)
+
+```java
+private String modifyLoanApplication(final Long loanId, final String loanExternalIdStr,
+        final String commandParam, final String apiRequestBodyAsJson) {
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    ExternalId loanExternalId = ExternalIdFactory.produce(loanExternalIdStr);
+    Long resolvedLoanId = loanId == null ? loanReadPlatformService.getResolvedLoanId(loanExternalId) : loanId;
+    CommandWrapper commandRequest;
+    if (CommandParameterUtil.is(commandParam, LoanApiConstants.MARK_AS_FRAUD_COMMAND)) {
+        commandRequest = builder.markLoanAsFraud(resolvedLoanId).build();
+    } else {
+        commandRequest = builder.updateLoanApplication(resolvedLoanId).build();
+    }
+    return this.toApiJsonSerializer.serialize(
+        this.commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+Two commands sharing the path:
+
+- **No command** → modify the application (only while `SUBMITTED_AND_PENDING_APPROVAL`).
+- **`?command=markAsFraud`** → flip `Loan.fraud = true`.
+
+## `DELETE /v1/loans/{loanId}`
+
+```java
+@DELETE
+@Path("{loanId}")
+public String deleteLoanApplication(@PathParam("loanId") final Long loanId) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().deleteLoanApplication(loanId).build();
+    return this.toApiJsonSerializer.serialize(
+        this.commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+Only valid while the loan is `SUBMITTED_AND_PENDING_APPROVAL`. Throws `LoanApplicationNotInSubmittedAndPendingApprovalStateCannotBeDeleted` otherwise.
+
+## `GET /v1/loans/{loanId}` — associations and templating
+
+The richest read endpoint. Selected via `?fields=` (output filter) and `?associations=` (lazy loading):
+
+```text
+GET /v1/loans/123?associations=all
+GET /v1/loans/123?associations=repaymentSchedule,transactions,charges,collateral
+GET /v1/loans/123?fields=accountNo,status,principal,summary
+GET /v1/loans/123?associations=repaymentSchedule&exclude=transactions
+GET /v1/loans/123?staffInSelectedOfficeOnly=true&template=true
+```
+
+The full association list (managed inside `retrieveLoan`):
+
+| Association param | Hydrates |
+| --- | --- |
+| `multiDisburseDetails` | `disbursementDetails` |
+| `repaymentSchedule` | `repaymentSchedule` (from `m_loan_repayment_schedule`) |
+| `originalSchedule` | `originalSchedule` (from `m_loan_repayment_schedule_history`) — only when interest recalc enabled |
+| `futureSchedule` | Projected schedule beyond today — only when interest recalc enabled |
+| `transactions` | All `LoanTransactionData` |
+| `charges` | All `LoanChargeData` |
+| `collateral` | `LoanCollateralResponseData` |
+| `meeting` | Group meeting calendar |
+| `notes` | Notes attached to the loan |
+| `linkedAccount` | Linked savings account |
+| `emiAmountVariations` | `LoanTermVariations` of type `EMI_AMOUNT` |
+| `loanTermVariations` | All `LoanTermVariations` |
+| `loanProductConfigurableAttributes` | Product config |
+| `originators` | Originator list (optional bean) |
+| `all` | All of the above |
+
+When `template=true` is added, the response also includes the dropdown option lists (officers, charges, payment types, calendars, etc.) so the caller can render edit/disburse UI without follow-up calls.
+
+## `GET /v1/loans` — list
+
+```java
+public String retrieveAll(@Context final UriInfo uriInfo,
+        @QueryParam("sqlSearch") String sqlSearch,
+        @QueryParam("externalId") String externalId,
+        @QueryParam("offset") Integer offset,
+        @QueryParam("limit") Integer limit,
+        @QueryParam("orderBy") String orderBy,
+        @QueryParam("sortOrder") String sortOrder,
+        @QueryParam("accountNo") String accountNo,
+        @QueryParam("status") String status) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    final SearchParameters searchParameters = SearchParameters.builder()
+            .sqlSearch(sqlSearch).externalId(externalId)
+            .offset(offset).limit(limit).orderBy(orderBy).sortOrder(sortOrder)
+            .accountNo(accountNo).status(status).build();
+    final Page<LoanAccountData> loanBasicDetails = this.loanReadPlatformService.retrieveAll(searchParameters);
+    final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return this.toApiJsonSerializer.serialize(settings, loanBasicDetails, …);
+}
+```
+
+Filter params: `status`, `accountNo`, `externalId`, `officeId`, `clientId`, `orderBy`, `sortOrder`, `limit`, `offset`. Hierarchy scoping is added automatically by `retrieveAll(...)` — see [Loan read service](/loan/loan-read-service).
+
+## `GET /v1/loans/template`
+
+Form-defaults endpoint:
+
+```java
+public String template(@QueryParam("clientId") final Long clientId,
+                       @QueryParam("groupId") final Long groupId,
+                       @QueryParam("productId") final Long productId,
+                       @QueryParam("templateType") final String templateType,
+                       @QueryParam("staffInSelectedOfficeOnly") final boolean staffInSelectedOfficeOnly,
+                       @QueryParam("activeOnly") final boolean activeOnly,
+                       @Context final UriInfo uriInfo) {
+    LoanAccountData newLoanAccount = null;
+    Long officeId = null;
+    if ("collateral".equals(templateType)) {
+        newLoanAccount = LoanAccountData.collateralTemplate();
+    } else { /* …pick by clientId/groupId/productId */ }
+    return this.toApiJsonSerializer.serialize(settings, newLoanAccount, …);
+}
+```
+
+Used by the UI before submitting a new loan to populate dropdowns and defaults.
+
+## Approved-amount and available-disbursement-amount
+
+These two PUT endpoints flow through `LoanApprovedAmountWritePlatformService`:
+
+```text
+PUT /v1/loans/{loanId}/approved-amount
+PUT /v1/loans/{loanId}/available-disbursement-amount
+```
+
+`modifyLoanApprovedAmount(loanId, command)` adjusts the approved principal post-approval (only allowed when product configuration permits). The history is recorded in `m_loan_approved_amount_history` and surfaced through `GET /v1/loans/{loanId}/approved-amount`.
+
+## Delinquency action
+
+```text
+POST   /v1/loans/{loanId}/delinquency-actions
+GET    /v1/loans/{loanId}/delinquency-actions
+```
+
+`POST` records a `LoanDelinquencyAction` (e.g. pause, resume, custom action). `GET` returns the history. See `loan/delinquency` for the model.
+
+## Bulk import (XLSX)
+
+```text
+GET  /v1/loans/downloadtemplate           → .xlsx for loan applications
+POST /v1/loans/uploadtemplate             → ingest .xlsx
+GET  /v1/loans/repayments/downloadtemplate → .xlsx for bulk repayments
+POST /v1/loans/repayments/uploadtemplate  → ingest .xlsx
+```
+
+Powered by `BulkImportWorkbookPopulatorService` and `BulkImportWorkbookService` from the bulk-import module. See `runtime/bulk-import`.
+
+## `?fields=` and serialization
+
+Every response goes through `DefaultToApiJsonSerializer<LoanAccountData>`. The `?fields=` query parameter restricts the output. `mandatoryResponseParameters` is built by `retrieveLoan` from the requested associations — those always appear in the output even when not in the `fields` list.
+
+## Security
+
+Every endpoint calls `this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS)` (read) or `…validateHasWritePermission(...)` (write) with `RESOURCE_NAME_FOR_PERMISSIONS = "LOAN"`. The actual permission codes (`READ_LOAN`, `CREATE_LOAN`, `UPDATE_LOAN`, `DISBURSE_LOAN`, `APPROVE_LOAN`, …) are seeded in `m_permission` via Liquibase.
+
+## Maker-checker
+
+When the loan product has `useMakerChecker = true`, the command is **not** executed immediately. Instead, `logCommandSource` returns a `pending` `CommandProcessingResult`; a second user must call `POST /v1/makercheckers/{commandId}` (or use `?command=approve` on the same path) to materialise the change. See [Maker-checker](/command/maker-checker).
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Application write service" icon="file-pen" href="/loan/loan-application-write-service">
+    `LoanApplicationWritePlatformService.submitApplication`, `approveApplication`, `undoApplicationApproval`, `rejectApplication`, `applicantWithdrawsFromApplication`, `deleteApplication`.
+  </Card>
+  <Card title="Loan write service" icon="pen-to-square" href="/loan/loan-write-service">
+    `LoanWritePlatformService.disburseLoan`, `undoLoanDisbursal`, `loanReassignment`, `recoverFromGuarantor`.
+  </Card>
+  <Card title="Loan read service" icon="magnifying-glass" href="/loan/loan-read-service">
+    Where `GET` endpoints go.
+  </Card>
+  <Card title="Loan transactions API" icon="globe" href="/loan/loan-transactions-api">
+    The companion `POST /v1/loans/{loanId}/transactions?command=...` switchboard for monetary operations.
+  </Card>
+  <Card title="Command pipeline" icon="diagram-project" href="/command/portfolio-command-source">
+    How `CommandWrapperBuilder` verbs reach the handler beans.
+  </Card>
+  <Card title="API catalog" icon="list" href="/api/loan-apis">
+    Swagger-style reference of every endpoint shape.
+  </Card>
+</CardGroup>

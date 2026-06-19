@@ -1,0 +1,320 @@
+---
+title: "Bulk Import: Excel Workbooks, Populators and Import Handlers"
+sidebarTitle: "Bulk Import"
+description: "Fineract's Excel/POI bulk import pipeline — GlobalEntityType, BulkImportWorkbookService, populators and the per-entity import handlers."
+---
+
+The bulk‑import subsystem lets operators upload XLSX workbooks (clients,
+loans, journal entries, …) that Fineract validates, transforms into REST
+commands and replays through the normal write pipeline. The contract types
+(`GlobalEntityType`, `ImportData`, `BulkImportWorkbookService`,
+`BulkImportWorkbookPopulatorService`) live in `fineract-core`. The actual
+populators (which build the workbook templates) and the import handlers
+(which parse uploaded files and call into REST) live in `fineract-provider`.
+This page is the reference for both pieces.
+
+## Layout
+
+`fineract-core` side:
+
+```text
+infrastructure/bulkimport/
+├── data/
+│   ├── GlobalEntityType.java
+│   └── ImportData.java
+└── service/
+    ├── BulkImportWorkbookPopulatorService.java
+    └── BulkImportWorkbookService.java
+```
+
+`fineract-provider` side (where the real work happens):
+
+```text
+infrastructure/bulkimport/
+├── api/                    BulkImportApiResource
+├── constants/              per-entity column constants
+├── data/                   Count, FieldOption, response DTOs
+├── domain/                 Import entity (persisted upload tracking)
+├── exceptions/             not-found, unsupported-type, etc.
+├── importhandler/          ImportHandler + per-entity implementations
+│   ├── center, chartofaccounts, client, fixeddeposits, group,
+│   │   guarantor, helper, journalentry, loan, loanrepayment,
+│   │   office, recurringdeposit, savings, sharedaccount, staff, users
+├── mapping/                cell ↔ field mappers
+├── populator/              per-entity workbook templates (one folder each)
+└── service/                BulkImportWorkbookServiceImpl + populator service
+```
+
+## `GlobalEntityType`
+
+The enum is the discriminator that ties an uploaded file to the right
+populator and the right import handler. Truncated catalog:
+
+| Enum | `id` | Slug used in URLs |
+| --- | --- | --- |
+| `CLIENTS_PERSON` | 1 | `clients.person` |
+| `CLIENTS_ENTITY` | 2 | `clients.entity` |
+| `GROUPS` | 3 | `groups` |
+| `CENTERS` | 4 | `centers` |
+| `OFFICES` | 5 | `offices` |
+| `STAFF` | 6 | `staff` |
+| `USERS` | 7 | `users` |
+| `SMS` | 8 | `sms` |
+| `DOCUMENTS` | 9 | `documents` |
+| `TEMPLATES` | 10 | `templates` |
+| `NOTES` | 11 | `templates` |
+| `CALENDAR` | 12 | `calendar` |
+| `MEETINGS` | 13 | `meetings` |
+| `HOLIDAYS` | 14 | `holidays` |
+| `LOANS` | 15 | `loans` |
+| `LOAN_PRODUCTS` | 16 | `loancharges` |
+| `LOAN_TRANSACTIONS` | 18 | `loantransactions` |
+| `GUARANTORS` | 19 | `guarantors` |
+| `COLLATERALS` | 20 | `collaterals` |
+| `FUNDS` | 21 | `funds` |
+| `CURRENCY` | 22 | `currencies` |
+| `SAVINGS_ACCOUNT` | 23 | `savingsaccount` |
+| `SAVINGS_CHARGES` | 24 | `savingscharges` |
+| `SAVINGS_TRANSACTIONS` | 25 | `savingstransactions` |
+| `SAVINGS_PRODUCTS` | 26 | `savingsproducts` |
+| `GL_JOURNAL_ENTRIES` | 27 | `gljournalentries` |
+| `CODE_VALUE` | 28 | `codevalue` |
+| `CODE` | 29 | `code` |
+| `CHART_OF_ACCOUNTS` | 30 | `chartofaccounts` |
+| `FIXED_DEPOSIT_ACCOUNTS` | 31 | `fixeddepositaccounts` |
+| `FIXED_DEPOSIT_TRANSACTIONS` | 32 | `fixeddeposittransactions` |
+| `SHARE_ACCOUNTS` | 33 | `shareaccounts` |
+| `RECURRING_DEPOSIT_ACCOUNTS` | 34 | `recurringdeposits` |
+| `RECURRING_DEPOSIT_ACCOUNTS_TRANSACTIONS` | 35 | `recurringdepositstransactions` |
+| `CLIENT` | 36 | `client` |
+
+The slug is what shows up in `GET /v1/imports?entityType=...` and what the
+API resource uses to route uploads to the right handler.
+
+## `ImportData`
+
+A simple read DTO that exposes the persisted upload row:
+
+| Field | Meaning |
+| --- | --- |
+| `importId` | PK of the `m_import_document` row. |
+| `importTime` | UTC timestamp when the upload started. |
+| `endTime` | UTC timestamp when processing finished (or `null` if still running). |
+| `completed` | Boolean — was every row processed (success or failure)? |
+| `name` | Original filename. |
+| `createdBy` | Username of the operator who uploaded. |
+| `totalRecords` | Number of data rows detected in the workbook. |
+| `successCount` / `errorCount` | Counters populated by the import handler. |
+
+The persisted entity itself (`ImportDocument`) lives in
+`fineract-provider/.../bulkimport/domain/`.
+
+## `BulkImportWorkbookService`
+
+```java
+public interface BulkImportWorkbookService {
+
+    Long importWorkbook(String entityType, InputStream inputStream,
+                        FormDataContentDisposition fileDetail, String locale, String dateFormat);
+
+    Collection<ImportData> getImports(GlobalEntityType type);
+
+    ImportData getImport(Long id);
+}
+```
+
+Three operations:
+
+| Method | Purpose |
+| --- | --- |
+| `importWorkbook(...)` | Persists the upload (`m_import_document` + the binary blob), enqueues the import handler asynchronously, returns the new `importId`. |
+| `getImports(type)` | Lists prior uploads for an entity type. |
+| `getImport(id)` | Fetches a single upload's status / counters. |
+
+The implementation (`BulkImportWorkbookServiceImpl`, in
+`fineract-provider`) uses Apache POI to open the uploaded XLSX, dispatches
+to the matching `ImportHandler` and updates the `Import` row with the final
+counters.
+
+## `BulkImportWorkbookPopulatorService`
+
+Generates the **template** workbook the user fills out before upload:
+
+```java
+public interface BulkImportWorkbookPopulatorService {
+    Response getTemplate(String entityType, Long officeId, Long staffId, String dateFormat);
+}
+```
+
+For each entity type, the implementation calls the matching populator
+(in `bulkimport/populator/<entity>/`) which builds the rows, drop‑down
+validations and header styles for the workbook.
+
+## `ImportHandler` — the per‑entity contract
+
+```java
+package org.apache.fineract.infrastructure.bulkimport.importhandler;
+
+public interface ImportHandler {
+    Count process(Workbook workbook, String locale, String dateFormat);
+}
+```
+
+`Workbook` is `org.apache.poi.ss.usermodel.Workbook`. The full Apache POI
+binding is the platform's choice for Excel parsing — POI ships in the
+`fineract-provider` runtime classpath and is referenced throughout the
+populator / mapping / importhandler packages.
+
+`Count` (in `bulkimport/data/`) is the return value:
+
+| Field | Meaning |
+| --- | --- |
+| `successCount` | Number of rows that imported successfully. |
+| `errorCount` | Number of rows that failed validation or `CommandWrapper` execution. |
+
+## The full handler catalog
+
+Every concrete `ImportHandler` lives in
+`fineract-provider/.../bulkimport/importhandler/`:
+
+| Handler | Entity it imports |
+| --- | --- |
+| `CenterImportHandler` | Centers |
+| `ChartOfAccountsImportHandler` | GL accounts |
+| `ClientPersonImportHandler` | Person‑type clients |
+| `ClientEntityImportHandler` | Entity‑type clients |
+| `FixedDepositImportHandler` | Fixed‑deposit accounts |
+| `FixedDepositTransactionImportHandler` | Fixed‑deposit transactions |
+| `GroupImportHandler` | Groups |
+| `GuarantorImportHandler` | Loan guarantors |
+| `JournalEntriesImportHandler` | GL journal entries |
+| `LoanImportHandler` | Loan applications |
+| `LoanRepaymentImportHandler` | Loan repayments |
+| `OfficeImportHandler` | Offices |
+| `RecurringDepositImportHandler` | Recurring‑deposit accounts |
+| `RecurringDepositTransactionImportHandler` | Recurring‑deposit transactions |
+| `SavingsImportHandler` | Savings accounts |
+| `SavingsTransactionImportHandler` | Savings transactions |
+| `SharedAccountImportHandler` | Share accounts |
+| `StaffImportHandler` | Staff members |
+| `UserImportHandler` | Platform users |
+
+A typical handler:
+
+1. Walks every data row in the workbook starting from the first data row.
+2. Calls a `*Mapping` class (in `bulkimport/mapping/`) to convert the row
+   into a typed DTO.
+3. Builds a `CommandWrapper` via `CommandWrapperBuilder`.
+4. Submits the wrapper through
+   `PortfolioCommandSourceWritePlatformService.logCommandSource(...)` — the
+   same path a REST POST takes.
+5. Writes back any error details to a per‑row "errors" column in the
+   workbook so the operator can download a marked‑up file.
+
+Because each row goes through the same command pipeline as a manual REST
+call, every validator, every domain rule and every audit row is identical
+to what would happen if the operator typed those rows by hand.
+
+## Populator catalog
+
+Workbook **templates** (with column headers, validation rules and
+dropdowns) are produced by `Populator` classes that live in
+`fineract-provider/.../bulkimport/populator/`. One folder per entity type
+mirroring the import handler list (`client`, `loan`, `savings`,
+`chartofaccounts`, `journalentry`, etc.). The shared utilities for cell
+styles, dropdowns and headers live in `populator/comparator/` and the root
+of the populator package.
+
+## Constants
+
+Each entity type has a `*Constants` class in `bulkimport/constants/`
+(`ClientPersonConstants`, `LoanConstants`, `JournalEntryConstants`, …) that
+declares:
+
+- The exact column indices used by the populator.
+- The header strings.
+- The drop‑down ranges.
+- The sheet name.
+
+`TemplatePopulateImportConstants` holds the cross‑entity constants —
+sheet names for embedded lookup tables (`Offices`, `Staff`, `ClientType`,
+`Currencies`), the row offset for the data section, and font/style codes.
+
+## End‑to‑end: importing a clients workbook
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant API as BulkImportApiResource
+    participant Svc as BulkImportWorkbookServiceImpl
+    participant DB as m_import_document
+    participant Handler as ClientPersonImportHandler
+    participant Mapper as ClientPersonMapping
+    participant Pipe as PortfolioCommandSource
+    participant Domain as Client write service
+
+    Op->>API: POST /v1/imports?entityType=clients.person + XLSX
+    API->>Svc: importWorkbook("clients.person", stream, ...)
+    Svc->>DB: INSERT m_import_document
+    Svc-->>API: importId
+    API-->>Op: 200 OK {"importId":N}
+    par async
+        Svc->>Handler: process(workbook, locale, dateFormat)
+        loop each data row
+            Handler->>Mapper: rowToDto(row)
+            Mapper-->>Handler: ClientDTO
+            Handler->>Pipe: logCommandSource(CommandWrapper)
+            Pipe->>Domain: createClient
+            Domain-->>Pipe: CommandProcessingResult
+            alt success
+                Handler->>Handler: successCount++
+            else failure
+                Handler->>Handler: errorCount++; write error to row
+            end
+        end
+        Handler-->>Svc: Count
+        Svc->>DB: UPDATE m_import_document SET end_time, success/errorCount, completed=true
+    end
+```
+
+The async step uses Spring's `@Async` executor configured in
+`fineract-provider`. Errors per row are stored on the workbook itself so
+the operator can download the annotated file via the GET endpoint and fix
+the rows.
+
+## Apache POI usage
+
+The handler signature takes `org.apache.poi.ss.usermodel.Workbook`, so the
+implementation is binding‑agnostic between XLS (POI HSSF) and XLSX (POI
+XSSF). In practice every populator builds an `XSSFWorkbook` (xlsx) and the
+service implementation opens uploads with
+`WorkbookFactory.create(InputStream)` so both formats are accepted on
+import. The mapping classes use POI `Row`/`Cell` APIs directly — there is
+no intermediate DTO between the workbook and the per‑row data class.
+
+## Exceptions
+
+| Exception | Status |
+| --- | --- |
+| `ImportTypeNotFoundException` | `404` — `entityType` slug does not map to any `GlobalEntityType`. |
+| `ImportNotFoundException` | `404` — `importId` not found. |
+| `BulkImportFileFormatException` (where used) | `400` — uploaded file is not a valid XLS/XLSX. |
+| Per‑row validation failures | Stored in the workbook itself; never thrown. |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Command pipeline" href="/command/overview">
+    Where every imported row is dispatched through `CommandWrapper`.
+  </Card>
+  <Card title="Codes" href="/core/codes">
+    The `CODE` and `CODE_VALUE` import types load code‑value rows.
+  </Card>
+  <Card title="Configuration properties" href="/core/configuration-properties">
+    Account‑number generation flags apply to imported clients/loans/savings.
+  </Card>
+  <Card title="Infrastructure core inventory" href="/core/infrastructure-core">
+    Map of the wider core packages.
+  </Card>
+</CardGroup>

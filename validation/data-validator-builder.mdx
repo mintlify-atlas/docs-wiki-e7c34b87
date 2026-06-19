@@ -1,0 +1,663 @@
+---
+title: "DataValidatorBuilder — imperative validation chain reference"
+sidebarTitle: "DataValidatorBuilder"
+description: "Anatomy of DataValidatorBuilder in fineract-core: reset()/parameter()/value() state, ~60 chainable assertions, error accumulation, and throwValidationErrors()."
+---
+
+`DataValidatorBuilder` is the imperative, fluent validation engine that ~50 `*DataValidator.java` classes use across the Fineract codebase. It is the only validation primitive that fits the legacy `JsonCommand` request style — there is no typed DTO to attach annotations to, just a parsed `JsonElement`, so command handlers walk the JSON field-by-field with a chain of assertions. The builder collects an `ApiParameterError` per failure into a shared `List`, then `throwValidationErrors()` raises a single `PlatformApiDataValidationException` that the JAX-RS layer turns into an HTTP 400 with every error in one response. This page documents the builder's state machine, every chainable method by category, the `ApiParameterError` shape, and a complete real-world example.
+
+<Info>
+The builder lives in `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/data/DataValidatorBuilder.java` — about 1,140 LOC and ~60 chainable methods. It depends only on `commons-lang3`, `commons-collections4`, Quartz `CronExpression`, ical4j `RRule`, and Fineract's own `DateUtils`/`ApiParameterError`/`PlatformApiDataValidationException`.
+</Info>
+
+## Mental model: a builder with shared mutable state
+
+`DataValidatorBuilder` is **not** a stateless utility — every chain mutates four pieces of internal state, then each assertion reads them when deciding whether to record an error.
+
+```java
+// DataValidatorBuilder.java — fields (lines 42-51)
+public class DataValidatorBuilder {
+
+    public static final String VALID_INPUT_SEPARATOR = "_";
+    @Getter
+    private final List<ApiParameterError> dataValidationErrors;
+    private String resource;
+    private String parameter;
+    private String arrayPart;
+    private Integer arrayIndex;
+    private Object value;
+    private boolean ignoreNullValue = false;
+
+    public DataValidatorBuilder() {
+        this(new ArrayList<>());
+    }
+
+    public DataValidatorBuilder(final List<ApiParameterError> dataValidationErrors) {
+        this.dataValidationErrors = dataValidationErrors;
+    }
+    ...
+}
+```
+
+| Field | Set by | Used by |
+| --- | --- | --- |
+| `dataValidationErrors` | constructor — **shared** across all builders in the same validator | every assertion appends to it on failure |
+| `resource` | `.resource(name)` | every assertion to build `validation.msg.{resource}.{parameter}.{rule}` |
+| `parameter` | `.parameter(name)` | every assertion as the field name in the error |
+| `arrayPart` / `arrayIndex` | `.parameterAtIndexArray(part, idx)` | `notNull` / `notBlank` to format `name[idx][part]` |
+| `value` | `.value(obj)` | every assertion as the actual data to test |
+| `ignoreNullValue` | `.ignoreIfNull()` | every assertion to short-circuit if `value == null` |
+
+There are **two constructors**: the no-arg one starts a fresh chain with a new `ArrayList`, and the `(List<ApiParameterError>)` constructor *continues* an existing chain by reusing the caller's list. The second form is what every `*DataValidator` uses — they pre-create the list so they own it and can decide whether to throw based on `isEmpty()`.
+
+## The canonical chain
+
+The shape every chain follows is:
+
+```java
+dataValidatorBuilder
+        .reset()                       // wipe parameter/value/arrayPart/ignoreNullValue
+        .parameter("locale")           // name of the field being validated
+        .value(extractedLocale)        // the actual value (may be null)
+        .notBlank();                   // the assertion (zero or more)
+```
+
+`reset()` returns a **new** `DataValidatorBuilder` that shares the same `dataValidationErrors` list and the same `resource`, but with all per-parameter state cleared:
+
+```java
+// lines 72-74
+public DataValidatorBuilder reset() {
+    return new DataValidatorBuilder(this.dataValidationErrors).resource(this.resource);
+}
+```
+
+<Warning>
+Reusing a builder across parameters **without** calling `reset()` leaks `parameter`, `value`, `arrayPart`, `arrayIndex`, and `ignoreNullValue` from the previous chain. Every `*DataValidator` in the codebase calls `.reset()` at the start of every chain — follow this convention strictly.
+</Warning>
+
+The terminal method is `throwValidationErrors()`, which raises iff the shared error list is non-empty:
+
+```java
+// lines 1131-1136
+public void throwValidationErrors() throws PlatformApiDataValidationException {
+    if (!dataValidationErrors.isEmpty()) {
+        throw new PlatformApiDataValidationException(dataValidationErrors);
+    }
+}
+```
+
+## Error code anatomy
+
+Every assertion that records a failure constructs the globalisation code with the same template:
+
+```
+validation.msg.{resource}.{parameter}.{ruleSpecificSuffix}
+```
+
+For instance `integerGreaterThanZero()` produces `validation.msg.{resource}.{parameter}.not.greater.than.zero`, `notBlank()` produces `validation.msg.{resource}.{parameter}.cannot.be.blank`, `isOneOfTheseValues(...)` produces `validation.msg.{resource}.{parameter}.is.not.one.of.expected.enumerations`. The `developerMessage` / `defaultUserMessage` is an English template inlined in the assertion. The `ApiParameterError` carries both — clients can pick globalisation-code translation, English fallback, or a mix.
+
+```java
+// Example: integerGreaterThanZero(), lines 431-447
+public DataValidatorBuilder integerGreaterThanZero() {
+    if (this.value == null && this.ignoreNullValue) {
+        return this;
+    }
+    if (this.value != null) {
+        final int number = Integer.parseInt(this.value.toString());
+        if (number < 1) {
+            String validationErrorCode = "validation.msg." + this.resource + "." + this.parameter + ".not.greater.than.zero";
+            String defaultEnglishMessage = "The parameter `" + this.parameter + "` must be greater than 0.";
+            final ApiParameterError error = ApiParameterError.parameterError(
+                    validationErrorCode, defaultEnglishMessage, this.parameter, number, 0);
+            this.dataValidationErrors.add(error);
+        }
+    }
+    return this;
+}
+```
+
+The trailing positional args (`this.parameter, number, 0`) become message arguments — they show up under `errors[].args[]` in the JSON response and can be used by clients to render localized strings (e.g. *"`glAccountId` must be greater than 0 (received 0)"*).
+
+## `ignoreIfNull()` semantics
+
+```java
+// lines 105-108
+public DataValidatorBuilder ignoreIfNull() {
+    this.ignoreNullValue = true;
+    return this;
+}
+```
+
+Every assertion follows the same prelude:
+
+```java
+if (this.value == null && this.ignoreNullValue) {
+    return this;
+}
+```
+
+Use this for **update** payloads where a field may be absent (only mutate what the client sent). The pattern in `FooDataValidator.validateForUpdate(...)` is always:
+
+```java
+if (jsonHelper.parameterExists("paramX", element)) {
+    final Long x = jsonHelper.extractLongNamed("paramX", element);
+    baseDataValidator.reset().parameter("paramX").value(x).ignoreIfNull().integerGreaterThanZero();
+}
+```
+
+Without `.ignoreIfNull()`, a `null` value would silently pass `integerGreaterThanZero` (the assertion explicitly guards `this.value != null`), but would *fail* `notNull()`. The `.ignoreIfNull()` flag flips this behaviour for any assertion that respects it.
+
+## Method reference by category
+
+The full set of chainable methods, grouped by intent. Every method returns `this` (or a `void` in the case of `failWithCode` / `expectedArrayButIsNot` / `throwValidationErrors`).
+
+### State management
+
+| Method | Effect |
+| --- | --- |
+| `reset()` | Returns a new builder sharing the error list + `resource`; clears per-parameter state. |
+| `resource(String name)` | Sets the resource prefix used in every subsequent error code. Typically called once. |
+| `parameter(String name)` | Sets the parameter name for the next assertions. |
+| `parameterAtIndexArray(String part, Integer idx)` | Marks the parameter as `name[idx][part]` — used for nested array validation. |
+| `value(Object v)` | Sets the value to test. |
+| `ignoreIfNull()` | Makes every following assertion skip when `value == null`. |
+| `merge(DataValidatorBuilder other)` | Appends another builder's errors into this one's list. |
+| `hasError()` | Returns whether the shared error list is non-empty. |
+| `getDataValidationErrors()` | Lombok-generated getter for the shared list. |
+
+### Nullability and presence
+
+| Method | Pass condition |
+| --- | --- |
+| `notNull()` | `value != null`. Honors `arrayPart`/`arrayIndex` formatting. |
+| `notBlank()` | `value != null` and `value.toString()` is non-blank. Honors `arrayPart`/`arrayIndex` formatting. |
+| `andNotBlank(String linkedParameterName, String linkedValue)` | If the previously-set `value` is non-null, `linkedValue` must also be non-blank. |
+| `anyOfNotNull(Object... objects)` | At least one of the supplied values is non-null. Used for "update with no parameters". |
+| `mustBeBlankWhenParameterProvided(String name, Object val)` | `value` must be blank when `val` is non-null. |
+| `mustBeBlankWhenParameterProvidedIs(String name, Object val)` | `value` must be blank when `val` equals a *specific* sentinel. |
+| `cantBeBlankWhenParameterProvidedIs(String name, Object val)` | Inverse of the above. |
+
+### Strings
+
+| Method | Pass condition |
+| --- | --- |
+| `notExceedingLengthOf(Integer maxLength)` | `value.toString().trim().length() <= maxLength`. |
+| `notExceedingListLengthOf(Integer maxLength)` | When `value instanceof List`, list size `<= maxLength`. |
+| `matchesRegularExpression(String regex)` | `value.toString()` matches `Pattern.matches(regex, ...)`. |
+| `matchesRegularExpression(String regex, String message)` | Same but with a custom message override. |
+| `validateForBooleanValue()` | Equivalent to `isOneOfTheseStringValues("TRUE", "FALSE")` via `VALID_INPUT_SEPARATOR`. |
+| `validatePhoneNumber()` | Matches `^\\+?[0-9. ()-]{0,25}$`. |
+| `validateCronExpression()` | `CronExpression.isValidExpression(value.toString().trim())`. |
+| `isValidRecurringRule(String recurringRule)` | iCal4j `RRule` validate. |
+| `validDateTimeFormatPattern()` | Value is a `DateTimeFormatter`-compatible pattern. |
+
+### Enumerations and value sets
+
+| Method | Pass condition |
+| --- | --- |
+| `isOneOfTheseValues(Object... values)` | `values.contains(value)` (exact `equals`). |
+| `isOneOfTheseStringValues(Object... values)` | Same but `toString().equalsIgnoreCase(...)` per element. |
+| `isOneOfTheseStringValues(List<String> valuesList)` | List form. |
+| `isOneOfEnumValues(Class<? extends Enum<?>> e)` | Wraps `isOneOfTheseStringValues` against enum `.name()` set. |
+| `isNotOneOfTheseValues(Object... values)` | Inverse. |
+| `inValidValue(String parameterValueCode, Object invalidValue)` | Unconditional failure: appends an `invalid.{code}` error. |
+| `trueOrFalseRequired(Object trueOrFalseField)` | Value must be a boolean. |
+
+### Numbers — Integer
+
+| Method | Pass condition (numeric, parsed from `value.toString()`) |
+| --- | --- |
+| `inMinMaxRange(Integer min, Integer max)` | `min <= n <= max`. |
+| `integerZeroOrGreater()` | `n >= 0`. |
+| `integerGreaterThanZero()` | `n >= 1`. |
+| `integerGreaterThanNumber(Integer number)` | `n > number`. |
+| `integerEqualToOrGreaterThanNumber(Integer number)` | `n >= number`. |
+| `integerSameAsNumber(Integer number)` | `n == number`. |
+| `integerInMultiplesOfNumber(Integer number)` | `n >= number && n % number == 0`. |
+| `notLessThanMin(Integer min)` | `n >= min`. |
+| `notGreaterThanMax(Integer max)` | `n <= max`. |
+
+### Numbers — Long
+
+| Method | Pass condition |
+| --- | --- |
+| `longGreaterThanZero()` | `n >= 1`. Catches `NumberFormatException` and throws immediately. |
+| `longZeroOrGreater()` | `n >= 0`. |
+| `longGreaterThanNumber(Long number)` | `n > number`. |
+| `longGreaterThanNumber(String paramName, Long number, int index)` | Variant used when validating array elements. |
+
+### Numbers — BigDecimal / monetary amounts
+
+| Method | Pass condition |
+| --- | --- |
+| `positiveAmount()` | `BigDecimal n > 0`. |
+| `zeroOrPositiveAmount()` | `n >= 0`. |
+| `notLessThanMin(BigDecimal min)` | `n >= min`. |
+| `notGreaterThanMax(BigDecimal max)` | `n <= max`. |
+| `inMinAndMaxAmountRange(BigDecimal min, BigDecimal max)` | `min <= n <= max`. |
+| `compareMinimumAndMaximumAmounts(BigDecimal minimumBalance, BigDecimal maximumBalance)` | `max >= min`. |
+| `compareMinAndMaxOfTwoBigDecmimalNos(BigDecimal min, BigDecimal max)` | Same, against caller-supplied numbers (the spelling is intentional — kept for binary compatibility). |
+| `scaleNotGreaterThan(Integer scale)` | `value.scale() <= scale`. |
+
+### Dates
+
+| Method | Pass condition (against `LocalDate value`) |
+| --- | --- |
+| `validateDateAfter(LocalDate date)` | `value > date`. |
+| `validateDateBefore(LocalDate date)` | `value < date`. |
+| `validateDateAfterOrEqual(LocalDate date)` | `value >= date`. |
+| `validateDateBeforeOrEqual(LocalDate date)` | `value <= date`. |
+| `validateDateForEqual(LocalDate date)` | `value == date`. |
+
+All five delegate to `DateUtils.isAfter` / `isBefore` / `isEqual` — see [`/core/serialization-and-json`](/core/serialization-and-json) for the rules around `DateUtils` and tenant time zones.
+
+### Arrays and lists
+
+| Method | Pass condition |
+| --- | --- |
+| `arrayNotEmpty()` | Casts `value` to `Object[]` and checks `!ObjectUtils.isEmpty(...)`. |
+| `listNotEmpty()` | Casts `value` to `List<?>` and checks non-empty; records a separate error if `value` is not a list. |
+| `jsonArrayNotEmpty()` | Casts `value` to Gson `JsonArray` and checks `iterator().hasNext()`. |
+| `expectedArrayButIsNot()` | Unconditional failure: records a single "not an array" error. |
+
+### Cross-parameter
+
+| Method | Pass condition |
+| --- | --- |
+| `equalToParameter(String linkedParameterName, Object linkedValue)` | `value.equals(linkedValue)`. |
+| `notSameAsParameter(String linkedParameterName, Object linkedValue)` | `!value.equals(linkedValue)`. |
+
+### Unconditional / terminal
+
+| Method | Effect |
+| --- | --- |
+| `failWithCode(String errorCode, Object... args)` | Unconditional failure with code `validation.msg.{resource}.{parameter}.{errorCode}`. |
+| `failWithCodeNoParameterAddedToErrorCode(String errorCode, Object... args)` | Same but omits `parameter` from the code. |
+| `throwValidationErrors()` | Throws `PlatformApiDataValidationException` iff errors exist. |
+| `buildValidationParameterApiError(String resource, String parameterName, String errorCode, String errorMessage, Object... args)` *(static)* | Free helper to build an `ApiParameterError` without going through the chain. |
+
+## `ApiParameterError` shape
+
+Every failure becomes an `ApiParameterError`. The constructor signatures the builder uses:
+
+```java
+// ApiParameterError.java
+public static ApiParameterError parameterError(final String globalisationMessageCode,
+        final String defaultUserMessage, final String parameterName,
+        final Object... defaultUserMessageArgs) {
+    return new ApiParameterError(globalisationMessageCode, defaultUserMessage,
+            defaultUserMessageArgs, parameterName, null);
+}
+
+public static ApiParameterError parameterErrorWithValue(final String globalisationMessageCode,
+        final String defaultUserMessage, final String parameterName, final String value,
+        final Object... defaultUserMessageArgs) {
+    return new ApiParameterError(globalisationMessageCode, defaultUserMessage,
+            defaultUserMessageArgs, parameterName, value);
+}
+```
+
+Fields exposed to JSON:
+
+| Field | Meaning |
+| --- | --- |
+| `developerMessage` | English template — what went wrong, for engineers. |
+| `defaultUserMessage` | Same string by default — meant to be safe to surface to end users. |
+| `userMessageGlobalisationCode` | `validation.msg.{resource}.{parameter}.{rule}` — client-side i18n key. |
+| `parameterName` | The offending field name (`glAccountId`, `loanType`, ...). |
+| `value` | The actual offending value (often `null` because the builder rarely sets it). |
+| `args` | List of `ApiErrorMessageArg` for message placeholder substitution. `LocalDate` args get auto-formatted as `yyyy-MM-dd`. |
+
+## `PlatformApiDataValidationException` and the mapper
+
+```java
+// fineract-core/.../exception/PlatformApiDataValidationException.java
+public class PlatformApiDataValidationException extends AbstractPlatformException {
+
+    private final List<ApiParameterError> errors;
+
+    public PlatformApiDataValidationException(List<ApiParameterError> errors) {
+        super("validation.msg.validation.errors.exist", "Validation errors exist.");
+        this.errors = errors;
+    }
+    ...
+}
+```
+
+```java
+// fineract-core/.../exceptionmapper/PlatformApiDataValidationExceptionMapper.java
+@Provider
+@Component
+@Scope("singleton")
+public class PlatformApiDataValidationExceptionMapper
+        implements FineractExceptionMapper, ExceptionMapper<PlatformApiDataValidationException> {
+
+    @Override
+    public Response toResponse(final PlatformApiDataValidationException exception) {
+        log.warn("Exception occurred", ErrorHandler.findMostSpecificException(exception));
+        final ApiGlobalErrorResponse dataValidationErrorResponse = ApiGlobalErrorResponse
+                .badClientRequest(exception.getGlobalisationMessageCode(),
+                                  exception.getDefaultUserMessage(),
+                                  exception.getErrors());
+        return Response.status(Status.BAD_REQUEST)
+                .entity(dataValidationErrorResponse)
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @Override
+    public int errorCode() { return 2002; }
+}
+```
+
+The mapper always returns **HTTP 400** with `Content-Type: application/json`. The body wraps the error list inside `ApiGlobalErrorResponse`. See [`/core/exception-mappers`](/core/exception-mappers) for the full registry.
+
+## Full real-world example: `FinancialActivityAccountDataValidator`
+
+This is the cleanest minimal example in the tree — `validateForCreate` for a financial-activity account mapping. It exercises every part of the pattern: JSON parsing, supported-params guard, resource binding, two field chains, and a manual throw.
+
+```java
+// fineract-accounting/.../financialactivityaccount/serialization/FinancialActivityAccountDataValidator.java
+@Component
+@RequiredArgsConstructor
+public final class FinancialActivityAccountDataValidator {
+
+    private final Set<String> supportedParameters = FinancialActivityAccountsJsonInputParams.getAllValues();
+
+    private final String paramNameForFinancialActivity =
+            FinancialActivityAccountsJsonInputParams.FINANCIAL_ACTIVITY_ID.getValue();
+    private final String paramNameForGLAccount =
+            FinancialActivityAccountsJsonInputParams.GL_ACCOUNT_ID.getValue();
+
+    private final FromJsonHelper fromApiJsonHelper;
+
+    public void validateForCreate(final String json) {
+        validateJSONAndCheckForUnsupportedParams(json);
+
+        final List<ApiParameterError> dataValidationErrors = new ArrayList<>();
+        final DataValidatorBuilder baseDataValidator = getDataValidator(dataValidationErrors);
+
+        final JsonElement element = this.fromApiJsonHelper.parse(json);
+
+        final Integer financialActivityId =
+                this.fromApiJsonHelper.extractIntegerSansLocaleNamed(paramNameForFinancialActivity, element);
+        baseDataValidator.reset().parameter(paramNameForFinancialActivity).value(financialActivityId)
+                .notNull()
+                .isOneOfTheseValues(
+                        FinancialActivity.ASSET_TRANSFER.getValue(),
+                        FinancialActivity.LIABILITY_TRANSFER.getValue(),
+                        FinancialActivity.CASH_AT_MAINVAULT.getValue(),
+                        FinancialActivity.CASH_AT_TELLER.getValue(),
+                        FinancialActivity.OPENING_BALANCES_TRANSFER_CONTRA.getValue(),
+                        FinancialActivity.ASSET_FUND_SOURCE.getValue(),
+                        FinancialActivity.PAYABLE_DIVIDENDS.getValue());
+
+        final Long glAccountId = this.fromApiJsonHelper.extractLongNamed(paramNameForGLAccount, element);
+        baseDataValidator.reset().parameter(paramNameForGLAccount).value(glAccountId)
+                .notNull()
+                .integerGreaterThanZero();
+
+        throwExceptionIfValidationWarningsExist(dataValidationErrors);
+    }
+
+    private DataValidatorBuilder getDataValidator(final List<ApiParameterError> dataValidationErrors) {
+        return new DataValidatorBuilder(dataValidationErrors).resource("financialactivityaccount");
+    }
+
+    public void validateForUpdate(final String json) {
+        validateJSONAndCheckForUnsupportedParams(json);
+
+        final List<ApiParameterError> dataValidationErrors = new ArrayList<>();
+        final DataValidatorBuilder baseDataValidator = getDataValidator(dataValidationErrors);
+
+        final JsonElement element = this.fromApiJsonHelper.parse(json);
+
+        if (this.fromApiJsonHelper.parameterExists(paramNameForFinancialActivity, element)) {
+            final Integer financialActivityId =
+                    this.fromApiJsonHelper.extractIntegerSansLocaleNamed(paramNameForFinancialActivity, element);
+            baseDataValidator.reset().parameter(paramNameForFinancialActivity).value(financialActivityId)
+                    .ignoreIfNull()
+                    .isOneOfTheseValues(/* … same enum set … */);
+        }
+
+        if (this.fromApiJsonHelper.parameterExists(paramNameForGLAccount, element)) {
+            final Long glAccountId = this.fromApiJsonHelper.extractLongNamed(paramNameForGLAccount, element);
+            baseDataValidator.reset().parameter(paramNameForGLAccount).value(glAccountId)
+                    .ignoreIfNull()
+                    .integerGreaterThanZero();
+        }
+
+        throwExceptionIfValidationWarningsExist(dataValidationErrors);
+    }
+
+    private void validateJSONAndCheckForUnsupportedParams(final String json) {
+        if (StringUtils.isBlank(json)) {
+            throw new InvalidJsonException();
+        }
+        final Type typeOfMap = new TypeToken<Map<String, Object>>() {}.getType();
+        this.fromApiJsonHelper.checkForUnsupportedParameters(typeOfMap, json, this.supportedParameters);
+    }
+
+    private void throwExceptionIfValidationWarningsExist(final List<ApiParameterError> dataValidationErrors) {
+        if (!dataValidationErrors.isEmpty()) {
+            throw new PlatformApiDataValidationException(
+                    "validation.msg.validation.errors.exist", "Validation errors exist.", dataValidationErrors);
+        }
+    }
+}
+```
+
+What to notice line-by-line:
+
+<Steps>
+  <Step title="Supported parameter guard runs first">
+    `validateJSONAndCheckForUnsupportedParams(json)` blocks blank bodies and rejects unknown fields. This uses `FromJsonHelper.checkForUnsupportedParameters` — covered in [`/core/serialization-and-json`](/core/serialization-and-json). Unknown parameters throw before the builder is ever instantiated.
+  </Step>
+  <Step title="Validator owns the error list">
+    The `List<ApiParameterError>` is created locally, then the validator uses `new DataValidatorBuilder(dataValidationErrors)` to give the builder shared write-access. This lets the validator decide *when* to throw rather than letting the builder do it.
+  </Step>
+  <Step title="Resource set once, then `.reset()` per chain">
+    `resource("financialactivityaccount")` is set on the *base* builder. Every subsequent chain begins with `.reset()`, which builds a fresh builder over the same error list but re-inherits the resource. Error codes will start `validation.msg.financialactivityaccount.…`.
+  </Step>
+  <Step title="Create vs update divergence">
+    `validateForCreate` uses `.notNull()` (the field is mandatory). `validateForUpdate` wraps the chain in `parameterExists(...)` and uses `.ignoreIfNull()` instead — absent fields are skipped, present-but-null fields are tolerated. This is the canonical pattern for partial-update payloads.
+  </Step>
+  <Step title="Manual throw via `PlatformApiDataValidationException`">
+    Here the validator throws the exception itself instead of calling `baseDataValidator.throwValidationErrors()`. Both paths land at the same `PlatformApiDataValidationExceptionMapper`. The manual form supplies the `validation.msg.validation.errors.exist` envelope code; the builder form uses the no-arg constructor which sets the same code.
+  </Step>
+</Steps>
+
+## Sample response when both chains fail
+
+POST a body with `financialActivityId=99` (not in the enum) and `glAccountId=0`:
+
+```json
+{
+  "developerMessage": "Validation errors exist.",
+  "httpStatusCode": "400",
+  "defaultUserMessage": "Validation errors exist.",
+  "userMessageGlobalisationCode": "validation.msg.validation.errors.exist",
+  "errors": [
+    {
+      "developerMessage": "The parameter `financialActivityId` must be one of [ 100, 200, 101, 102, 103, 201, 202 ] .",
+      "defaultUserMessage": "The parameter `financialActivityId` must be one of [ 100, 200, 101, 102, 103, 201, 202 ] .",
+      "userMessageGlobalisationCode": "validation.msg.financialactivityaccount.financialActivityId.is.not.one.of.expected.enumerations",
+      "parameterName": "financialActivityId",
+      "args": [
+        { "value": "financialActivityId" },
+        { "value": 99 },
+        { "value": [100, 200, 101, 102, 103, 201, 202] }
+      ]
+    },
+    {
+      "developerMessage": "The parameter `glAccountId` must be greater than 0.",
+      "defaultUserMessage": "The parameter `glAccountId` must be greater than 0.",
+      "userMessageGlobalisationCode": "validation.msg.financialactivityaccount.glAccountId.not.greater.than.zero",
+      "parameterName": "glAccountId",
+      "args": [ { "value": "glAccountId" }, { "value": 0 }, { "value": 0 } ]
+    }
+  ]
+}
+```
+
+Both errors come back in **one response** — the cardinal selling point of the builder pattern over throw-on-first-failure validation.
+
+## `ParseAndValidator` base class
+
+Newer command handlers use the small base class in `fineract-core/.../validator/ParseAndValidator.java` to share the JSON-extraction and throw-on-error boilerplate:
+
+```java
+// ParseAndValidator.java
+@Slf4j
+public class ParseAndValidator {
+
+    protected JsonObject extractJsonObject(final FromJsonHelper jsonHelper, final JsonCommand command) {
+        String json = command.json();
+        if (StringUtils.isBlank(json)) {
+            throw new InvalidJsonException();
+        }
+        final JsonElement element = jsonHelper.parse(json);
+        return element.getAsJsonObject();
+    }
+
+    protected void throwExceptionIfValidationWarningsExist(DataValidatorBuilder dataValidator) {
+        if (dataValidator.hasError()) {
+            log.error("Validation errors: {}", dataValidator.getDataValidationErrors());
+            throw new PlatformApiDataValidationException("validation.msg.validation.errors.exist",
+                    "Validation errors exist.", dataValidator.getDataValidationErrors());
+        }
+    }
+
+    protected static void validateRequestBody(String json) {
+        if (StringUtils.isBlank(json)) {
+            throw new InvalidJsonException();
+        }
+    }
+
+    protected void validateForSupportedParameters(final String json, final Collection<String> supportedParameters,
+            final FromJsonHelper fromApiJsonHelper) {
+        final Type typeOfMap = new TypeToken<Map<String, Object>>() {}.getType();
+        fromApiJsonHelper.checkForUnsupportedParameters(typeOfMap, json, supportedParameters);
+    }
+}
+```
+
+Subclassing `ParseAndValidator` collapses the three private helpers seen in the example above into inherited methods. Both styles coexist in the codebase — the older `*DataValidator` classes inline the helpers; the newer ones extend `ParseAndValidator`.
+
+## `arrayPart` / `arrayIndex` — validating nested array elements
+
+When a JSON body contains an array of sub-objects (e.g. `transactions[i].amount`), `parameterAtIndexArray` lets the same builder produce nicely-formatted errors per element:
+
+```java
+// lines 94-98
+public DataValidatorBuilder parameterAtIndexArray(final String arrayPart, final Integer arrayIndex) {
+    this.arrayPart = arrayPart;
+    this.arrayIndex = arrayIndex;
+    return this;
+}
+```
+
+`notNull` / `notBlank` then format the error like:
+
+```java
+// from notBlank, lines 213-217
+if (this.arrayIndex != null && StringUtils.isNotBlank(this.arrayPart)) {
+    validationErrorCode.append(".").append(this.arrayPart);
+    realParameterName = this.parameter + '[' + this.arrayIndex + "][" + this.arrayPart + ']';
+}
+```
+
+Used inside `for (int i = 0; i < array.size(); i++)` loops:
+
+```java
+baseDataValidator.reset()
+        .parameter("transactions")
+        .parameterAtIndexArray("amount", i)
+        .value(amountAtI)
+        .notNull();
+// → error parameterName "transactions[2][amount]"
+// → error code         "validation.msg.{resource}.transactions.amount.cannot.be.blank"
+```
+
+## `failWithCode` / `failWithCodeNoParameterAddedToErrorCode`
+
+For situations where the rule doesn't fit any built-in assertion, the builder offers two **unconditional** failure recorders:
+
+```java
+// lines 127-140
+public void failWithCode(final String errorCode, final Object... defaultUserMessageArgs) {
+    String validationErrorCode = "validation.msg." + this.resource + "." + this.parameter + "." + errorCode;
+    final ApiParameterError error = ApiParameterError.parameterError(validationErrorCode,
+            "Failed data validation due to: " + errorCode + ".", this.parameter, this.value, defaultUserMessageArgs);
+    this.dataValidationErrors.add(error);
+}
+
+public void failWithCodeNoParameterAddedToErrorCode(final String errorCode, final Object... defaultUserMessageArgs) {
+    String validationErrorCode = "validation.msg." + this.resource + "." + errorCode;
+    String defaultEnglishMessage = "Failed data validation due to: " + errorCode + ".";
+    final ApiParameterError error = ApiParameterError.parameterError(validationErrorCode, defaultEnglishMessage,
+            this.parameter, this.value, defaultUserMessageArgs);
+    this.dataValidationErrors.add(error);
+}
+```
+
+These are the escape hatches for custom business rules: compute the rule inline, call `.failWithCode("entity.not.found")` if it fails, then keep going. They are **`void`** — they break the chain. Continue with `.reset()` to start the next chain.
+
+## Constructor sharing patterns
+
+The builder's two constructors enable three idioms found in the codebase:
+
+<AccordionGroup>
+  <Accordion title="Owned list (most common)">
+    ```java
+    final List<ApiParameterError> errors = new ArrayList<>();
+    final DataValidatorBuilder v = new DataValidatorBuilder(errors).resource("foo");
+    // … many chains …
+    if (!errors.isEmpty()) {
+        throw new PlatformApiDataValidationException(errors);
+    }
+    ```
+    The validator owns the list and decides when to throw. Matches the `FinancialActivityAccountDataValidator` style.
+  </Accordion>
+
+  <Accordion title="Self-contained">
+    ```java
+    final DataValidatorBuilder v = new DataValidatorBuilder().resource("foo");
+    // … many chains …
+    v.throwValidationErrors();   // throws iff !errors.isEmpty()
+    ```
+    The builder owns its own list. Simpler call sites — used by code that doesn't need to inspect or pass the error list around.
+  </Accordion>
+
+  <Accordion title="Composed across helpers">
+    ```java
+    // Top level
+    final List<ApiParameterError> errors = new ArrayList<>();
+    final DataValidatorBuilder v = new DataValidatorBuilder(errors).resource("foo");
+    validatePartA(json, errors);
+    validatePartB(json, errors);
+    // — both partA / partB instantiate their own builders over the same list
+    if (!errors.isEmpty()) {
+        throw new PlatformApiDataValidationException(errors);
+    }
+    ```
+    Multi-helper compositions in large validators. `merge(other)` exists for the case where two independent builders need to be unified after the fact.
+  </Accordion>
+</AccordionGroup>
+
+## When to throw early vs. accumulate
+
+The builder is designed for **accumulation** — every UI/UX advantage comes from returning every error at once. Throw early only when:
+
+- A parsing error makes downstream chains nonsensical (`InvalidJsonException` on blank body).
+- A `NumberFormatException` inside `longGreaterThanZero` — it records an error, then immediately calls `throwValidationErrors()` because the chain can no longer continue (see lines 540-548).
+- Resource lookup fails (`*NotFoundException`) — that's a different exception family and not a validation failure.
+
+Otherwise: keep going. The mapper will deliver every accumulated `ApiParameterError` to the client.
+
+## Cross-references
+
+- [`/validation/overview`](/validation/overview) — the bigger picture: how this layer fits next to Jakarta Bean Validation in the request lifecycle.
+- [`/validation/constraints`](/validation/constraints) — the declarative counterpart for typed DTOs.
+- [`/core/serialization-and-json`](/core/serialization-and-json) — `FromJsonHelper`, `JsonCommand`, `parameterExists`, `extractLongNamed`, `extractIntegerSansLocaleNamed`, `checkForUnsupportedParameters` — every primitive a `*DataValidator` calls before the builder.
+- [`/core/exception-mappers`](/core/exception-mappers) — `PlatformApiDataValidationExceptionMapper` and `JakartaValidationExceptionMapper` produce the response.
+- [`/command/overview`](/command/overview) — where `*DataValidator.validateForCreate(...)` / `validateForUpdate(...)` is invoked inside the CQRS handler.

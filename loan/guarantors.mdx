@@ -1,0 +1,378 @@
+---
+title: "Guarantors, Funding Details and Held-Funds Lifecycle"
+sidebarTitle: "Guarantors"
+description: "Guarantor, GuarantorFundingDetails, GuarantorFundingTransaction entities and the Fineract write/read services that hold and release pledged savings."
+---
+
+A loan with `LoanProduct.holdGuaranteeFunds = true` requires one or more **guarantors** whose pledged amounts are held on linked savings accounts until the loan closes. Apache Fineract models this with three JPA entities — `Guarantor`, `GuarantorFundingDetails`, `GuarantorFundingTransaction` — and four services: `GuarantorWritePlatformService` (CRUD over guarantors), `GuarantorDomainService` (the *funds-on-hold* lifecycle), `GuarantorReadPlatformService` (queries) and `GuarantorCommandFromApiJsonDeserializer` (validation). The REST surface is `GuarantorsApiResource`, mounted at `/v1/loans/{loanId}/guarantors`.
+
+Cross references: the product flag and `LoanProductGuaranteeDetails` are in [Loan product API](/loan/loan-product-api); collateral (a separate concept) is at [Collateral management](/loan/loan-collateral-management); guarantor *recovery* (using held funds to pay an overdue loan) is exposed via `LOAN/RECOVERGUARANTEES` in [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| REST | `portfolio/loanaccount/guarantor/api/GuarantorsApiResource.java` | `fineract-provider` |
+| Entity (header) | `portfolio/loanaccount/guarantor/domain/Guarantor.java` | `fineract-provider` |
+| Funding details | `portfolio/loanaccount/guarantor/domain/GuarantorFundingDetails.java` | `fineract-provider` |
+| Funding transaction | `portfolio/loanaccount/guarantor/domain/GuarantorFundingTransaction.java` | `fineract-provider` |
+| Repos | `GuarantorRepository`, `GuarantorFundingRepository`, `GuarantorFundingTransactionRepository` | `fineract-provider` |
+| Write service interface | `portfolio/loanaccount/guarantor/service/GuarantorWritePlatformService.java` | `fineract-loan` |
+| Write impl | `GuarantorWritePlatformServiceJpaRepositoryIImpl.java` | `fineract-provider` |
+| Domain service | `GuarantorDomainService(Impl).java` | `fineract-provider` |
+| Read | `GuarantorReadPlatformService(Impl)` | `fineract-provider` |
+| Validation | `portfolio/loanaccount/guarantor/serialization/GuarantorCommandFromApiJsonDeserializer.java` | `fineract-loan` |
+| Command | `portfolio/loanaccount/guarantor/command/GuarantorCommand.java` | `fineract-loan` |
+| Enums | `domain/GuarantorType`, `domain/GuarantorFundStatusType` | `fineract-loan` |
+| Handlers | `handler/CreateGuarantorCommandHandler`, `UpdateGuarantorCommandHandler`, `DeleteGuarantorCommandHandler` | `fineract-loan` |
+| Recover-from-guarantor handler | `portfolio/loanaccount/handler/RecoverFromGuarantorCommandHandler.java` | `fineract-loan` |
+| DTOs | `data/GuarantorData`, `GuarantorFundingData`, `GuarantorTransactionData`, `GuarantorsRequest` | `fineract-provider` |
+
+## Entity model
+
+### `Guarantor`
+
+```java
+public class Guarantor extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @ManyToOne @JoinColumn(name = "client_reln_cv_id")
+    private CodeValue clientRelationshipType;
+
+    @Column(name = "type_enum", nullable = false)
+    private Integer gurantorType;
+
+    @Column(name = "entity_id")
+    private Long entityId;
+
+    @Column(name = "firstname", length = 50) private String firstname;
+    @Column(name = "lastname",  length = 50) private String lastname;
+    @Column(name = "dob")                    private LocalDate dateOfBirth;
+    @Column(name = "address_line_1", length = 500) private String addressLine1;
+    @Column(name = "address_line_2", length = 500) private String addressLine2;
+    @Column(name = "city",   length = 50) private String city;
+    @Column(name = "state",  length = 50) private String state;
+    @Column(name = "country",length = 50) private String country;
+    @Column(name = "zip",    length = 20) private String zip;
+    @Column(name = "house_phone_number",  length = 20) private String housePhoneNumber;
+    @Column(name = "mobile_number",        length = 20) private String mobilePhoneNumber;
+    @Column(name = "comment", length = 500) private String comment;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean active;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "guarantor",
+               orphanRemoval = true, fetch = FetchType.LAZY)
+    private List<GuarantorFundingDetails> guarantorFundDetails = new ArrayList<>();
+}
+```
+
+Stored in `m_guarantor`. A guarantor is either:
+
+- **External** (`gurantorType = 100` "Customer", `entityId = null`, name/address fields populated).
+- **Existing client** (`entityId = client.id`, name fields synced from client).
+- **Existing staff** (`entityId = staff.id`).
+
+`GuarantorType` enum values: `100 = CUSTOMER`, `200 = CLIENT_RELATION`, `300 = STAFF`.
+
+### `GuarantorFundingDetails`
+
+```java
+public class GuarantorFundingDetails extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "guarantor_id", nullable = false)
+    private Guarantor guarantor;
+
+    @ManyToOne @JoinColumn(name = "account_associations_id", nullable = false)
+    private AccountAssociations accountAssociations; // → SavingsAccount
+
+    @Column(name = "status_enum", nullable = false)
+    private Integer status;
+
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;
+
+    @Column(name = "amount_released_derived", scale = 6, precision = 19)
+    private BigDecimal amountReleased;
+
+    @Column(name = "amount_remaining_derived", scale = 6, precision = 19)
+    private BigDecimal amountRemaining;
+
+    @Column(name = "amount_transfered_derived", scale = 6, precision = 19)
+    private BigDecimal amountTransfered;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "guarantorFundingDetails",
+               orphanRemoval = true, fetch = FetchType.LAZY)
+    private List<GuarantorFundingTransaction> guarantorFundingTransactions = new ArrayList<>();
+}
+```
+
+Stored in `m_guarantor_funding_details`. `status_enum` is `GuarantorFundStatusType`:
+
+| Value | Constant | Meaning |
+| --- | --- | --- |
+| 300 | `ACTIVE` | Funds pledged, hold in place |
+| 400 | `WITHDRAWN` | Guarantor removed before disbursement |
+| 500 | `REJECTED` | Application rejected — hold released |
+| 600 | `COMPLETED` | Loan closed normally — hold released |
+| 700 | `WRITTEN_OFF` | Loan written off — hold partially/fully transferred |
+
+The three "derived" columns are amortising counters: `amount = amountReleased + amountRemaining + amountTransfered` at all times.
+
+### `GuarantorFundingTransaction`
+
+```java
+public class GuarantorFundingTransaction extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "guarantor_fund_detail_id", nullable = false)
+    private GuarantorFundingDetails guarantorFundingDetails;
+
+    @ManyToOne @JoinColumn(name = "loan_transaction_id")
+    private LoanTransaction loanTransaction;
+
+    @ManyToOne @JoinColumn(name = "deposit_on_hold_transaction_id")
+    private DepositAccountOnHoldTransaction depositAccountOnHoldTransaction;
+
+    @Column(name = "is_reversed", nullable = false)
+    private boolean reversed;
+}
+```
+
+Records each interaction between guarantor funds and the loan or the linked savings hold ledger. Each row is paired: every loan transaction that triggers a release writes one row; every disbursement-time hold writes one row keyed by `depositAccountOnHoldTransaction`.
+
+## REST surface — `/v1/loans/{loanId}/guarantors`
+
+```java
+@Path("/v1/loans/{loanId}/guarantors")
+@Component
+@RequiredArgsConstructor
+public class GuarantorsApiResource {
+```
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/template` | `newGuarantorTemplate(loanId)` | `READ_GUARANTOR` |
+| `GET` | `` | List for loan | `READ_GUARANTOR` |
+| `GET` | `/{guarantorId}` | Read one | `READ_GUARANTOR` |
+| `POST` | `` | `createGuarantor` | `CREATE_GUARANTOR` |
+| `PUT` | `/{guarantorId}` | `updateGuarantor` | `UPDATE_GUARANTOR` |
+| `DELETE` | `/{guarantorId}?guarantorFundingId={id}` | `deleteGuarantor` | `DELETE_GUARANTOR` |
+| `GET` | `/accounts/template` | Linked-savings options | `READ_GUARANTOR` |
+
+Create:
+
+```java
+@POST
+public CommandProcessingResult createGuarantor(@PathParam("loanId") final Long loanId,
+        final GuarantorsRequest guarantorsRequest) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+            .createGuarantor(loanId).withJson(toApiJsonSerializer.serialize(guarantorsRequest)).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+Body (`GuarantorsRequest`):
+
+```json
+{
+  "clientRelationshipTypeId": 14,
+  "guarantorTypeId": 100,
+  "firstname": "Ada",
+  "lastname": "Lovelace",
+  "addressLine1": "...",
+  "city": "London", "country": "GB",
+  "savingsId": 47,
+  "amount": 1500.00,
+  "locale": "en"
+}
+```
+
+Delete flow accepts an optional `guarantorFundingId`:
+
+```java
+@DELETE @Path("{guarantorId}")
+public CommandProcessingResult deleteGuarantor(@PathParam("loanId") final Long loanId,
+        @PathParam("guarantorId") final Long guarantorId,
+        @QueryParam("guarantorFundingId") final Long guarantorFundingId) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+            .deleteGuarantor(loanId, guarantorId, guarantorFundingId).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+When `guarantorFundingId` is null the guarantor is removed altogether; otherwise only the targeted funding is detached.
+
+## Command handlers
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "GUARANTOR", action = "CREATE")
+public class CreateGuarantorCommandHandler implements NewCommandSourceHandler {
+    private final GuarantorWritePlatformService writePlatformService;
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        return writePlatformService.createGuarantor(command.getLoanId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GUARANTOR", action = "UPDATE")
+public class UpdateGuarantorCommandHandler implements NewCommandSourceHandler {
+    @Override public CommandProcessingResult processCommand(JsonCommand cmd) {
+        return writePlatformService.updateGuarantor(cmd.getLoanId(), cmd.entityId(), cmd);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GUARANTOR", action = "DELETE")
+public class DeleteGuarantorCommandHandler implements NewCommandSourceHandler {
+    @Override public CommandProcessingResult processCommand(JsonCommand cmd) {
+        return writePlatformService.removeGuarantor(cmd.getLoanId(), cmd.entityId(),
+                cmd.subentityId());
+    }
+}
+```
+
+The `RecoverFromGuarantorCommandHandler` (entity `LOAN`, action `RECOVERGUARANTEES`) is the operator-triggered "burn the held funds to pay this loan" command:
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "RECOVERGUARANTEES")
+public class RecoverFromGuarantorCommandHandler implements NewCommandSourceHandler {
+    private final GuarantorWritePlatformService writePlatformService;
+    @Override public CommandProcessingResult processCommand(JsonCommand cmd) {
+        writePlatformService.recoverFromGuarantors(cmd);
+        return CommandProcessingResult.empty();
+    }
+}
+```
+
+## `GuarantorWritePlatformService`
+
+```java
+public interface GuarantorWritePlatformService {
+    CommandProcessingResult createGuarantor(Long loanId, JsonCommand command);
+    CommandProcessingResult updateGuarantor(Long loanId, Long guarantorId, JsonCommand command);
+    CommandProcessingResult removeGuarantor(Long loanId, Long guarantorId, Long guarantorFundingId);
+    void recoverFromGuarantors(JsonCommand command);
+}
+```
+
+Implementation highlights (`GuarantorWritePlatformServiceJpaRepositoryIImpl`):
+
+`createGuarantor`:
+
+1. Validate via `GuarantorCommandFromApiJsonDeserializer.commandFromApiJson(json)`.
+2. Resolve `Loan`, optional `Client/Staff` for `entityId`, optional `clientRelationshipType` code value, optional `SavingsAccount` for funding.
+3. Reject if loan status is closed / charged off.
+4. If `holdGuaranteeFunds` on the product is true and `amount > 0`, create an `AccountAssociations` row linking the guarantor's `SavingsAccount` to the loan and create a `GuarantorFundingDetails` row with status `ACTIVE`.
+5. Persist `Guarantor`.
+6. Fire `GuarantorAddedBusinessEvent`.
+
+`updateGuarantor` mutates address/contact fields and (if disbursement has not occurred yet) the funding `amount`.
+
+`removeGuarantor`:
+
+- If targeted funding only: detach funding, transitioning its status to `WITHDRAWN` and releasing the savings hold via `GuarantorDomainService.releaseGuarantor`.
+- If whole guarantor: do the same across all fundings and remove the row.
+
+`recoverFromGuarantors` (called via `LOAN/RECOVERGUARANTEES`): iterates over `ACTIVE` fundings whose savings account has on-hold balance, computes the loan's outstanding amount, and:
+
+```text
+for each funding (in deterministic order):
+    transfer = min(funding.amountRemaining, loan.totalOverdue)
+    GuarantorDomainService.transferFundsFromGuarantor(loan)
+    // moves money from savings hold to loan as a repayment
+    funding.amountTransfered += transfer
+    funding.amountRemaining  -= transfer
+    if funding.amountRemaining == 0: status = WRITTEN_OFF
+```
+
+## `GuarantorDomainService`
+
+```java
+public interface GuarantorDomainService {
+    void releaseGuarantor(GuarantorFundingDetails guarantorFundingDetails, LocalDate transactionDate);
+    void validateGuarantorBusinessRules(Loan loan);
+    void assignGuarantor(GuarantorFundingDetails guarantorFundingDetails, LocalDate transactionDate);
+    void transferFundsFromGuarantor(Loan loan);
+}
+```
+
+Hook points (via `BusinessEventNotifierService`):
+
+| Loan lifecycle event | Domain-service callback |
+| --- | --- |
+| Submitted / Approved | `validateGuarantorBusinessRules` ensures `sum(amount) >= principal * minGuaranteePercent` and that linked savings have enough balance |
+| Disbursed | `assignGuarantor` puts an *on-hold* mark on each linked savings account (`DepositAccountOnHoldTransaction.HOLD`) for the funding amount |
+| Repaid (partial / full) | `releaseGuarantor` shaves the hold pro rata so released funds = principal repaid |
+| Closed / written off | `releaseGuarantor` releases the remainder; status moves to `COMPLETED` or `WRITTEN_OFF` |
+| Recover guarantees | `transferFundsFromGuarantor` converts hold into actual transfer + loan repayment |
+
+`releaseGuarantor` writes:
+
+1. A `DepositAccountOnHoldTransaction.RELEASE` on the savings account.
+2. A `GuarantorFundingTransaction` row.
+3. Updates `amountReleased`, `amountRemaining` on the funding details.
+
+## Validator — `GuarantorCommandFromApiJsonDeserializer`
+
+Builds a `GuarantorCommand` POJO and validates:
+
+| Rule | |
+| --- | --- |
+| `guarantorTypeId` required, in {100, 200, 300} | |
+| For external (`100`): `firstname`, `lastname` required | |
+| For client/staff (`200`/`300`): `entityId` required | |
+| `clientRelationshipTypeId` must resolve to a `CodeValue` of code `GuarantorRelationship` | |
+| If product `holdGuaranteeFunds`: `savingsId` + `amount > 0` required | |
+| `amount` decimal must match currency precision | |
+| Address / phone field length caps | |
+
+## Read service
+
+`GuarantorReadPlatformService` exposes:
+
+```java
+List<GuarantorData> retrieveGuarantorsForLoan(Long loanId);
+GuarantorData retrieveGuarantor(Long loanId, Long guarantorId);
+GuarantorData retrieveNewGuarantorDetails(Long loanId);   // template
+List<SavingsAccountData> retrieveGuarantorLinkableSavings(Long entityId);
+```
+
+The template form populates dropdown options from `RELATIONSHIP_GUARANTOR` code values, eligible `SavingsAccount`s on the client, and current `GuarantorType` enum.
+
+## Permissions summary
+
+| Endpoint | Permission |
+| --- | --- |
+| Create | `CREATE_GUARANTOR` |
+| Update | `UPDATE_GUARANTOR` |
+| Delete | `DELETE_GUARANTOR` |
+| Recover | `CREATE_LOAN_RECOVERGUARANTEES` |
+| Read | `READ_GUARANTOR` |
+
+## Business events
+
+| Event | Triggered by |
+| --- | --- |
+| `GuarantorAddedBusinessEvent` | `createGuarantor` |
+| `GuarantorRemovedBusinessEvent` | `removeGuarantor` |
+| `GuarantorUpdatedBusinessEvent` | `updateGuarantor` |
+| `LoanGuaranteeFundsHoldBusinessEvent` | `assignGuarantor` |
+| `LoanGuaranteeFundsReleasedBusinessEvent` | `releaseGuarantor` |
+| `LoanGuaranteeFundsTransferredBusinessEvent` | `transferFundsFromGuarantor` |
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Loan product API](/loan/loan-product-api)
+- [Collateral management](/loan/loan-collateral-management)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

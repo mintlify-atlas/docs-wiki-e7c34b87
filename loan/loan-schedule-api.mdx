@@ -1,0 +1,289 @@
+---
+title: "Loan Schedule API, Preview and Variable Installments"
+sidebarTitle: "Schedule API"
+description: "LoanScheduleApiResource, schedule preview through LoanScheduleCalculationPlatformService, and variable installment exception apply/undo in Apache Fineract."
+---
+
+This page documents how Apache Fineract exposes loan repayment schedule recalculation, preview and variable installment "exception" management to clients. The primary REST surface is `LoanScheduleApiResource` (path `/v1/loans/{loanId}/schedule`), which combines three commands — **calculateLoanSchedule** (preview), **addVariations** (apply schedule exceptions) and **deleteVariations** (undo exceptions) — behind a single `POST` endpoint switched by a `command` query parameter. Calculation itself is delegated to `LoanScheduleCalculationPlatformService` and produces a `LoanScheduleData` value object; persisted changes flow through the command framework to handlers in `org.apache.fineract.portfolio.loanaccount.handler` and ultimately to `LoanScheduleWritePlatformService` and `LoanWritePlatformService`.
+
+Cross references: the overall loan domain is at [Loan overview](/loan/overview); REST surfaces are catalogued in [Loan REST handlers](/loan/loan-rest-handlers); reschedule-request (a higher level workflow that creates *term variations*) is at [Reschedule loans](/loan/reschedule-loans); reAge and reAmortize previews live in [Re-aging and arrears](/loan/loan-arrears-and-reaging) and [Re-amortization](/loan/loan-reamortization).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| Schedule REST | `portfolio/loanaccount/api/LoanScheduleApiResource.java` | `fineract-loan` |
+| Swagger DTOs | `portfolio/loanaccount/api/LoanScheduleApiResourceSwagger.java` | `fineract-loan` |
+| Calculation service interface | `portfolio/loanaccount/loanschedule/service/LoanScheduleCalculationPlatformService.java` | `fineract-loan` |
+| Writes | `portfolio/loanaccount/loanschedule/service/LoanScheduleWritePlatformService.java` | `fineract-loan` |
+| History service | `portfolio/loanaccount/loanschedule/service/LoanScheduleHistoryWritePlatformService.java` | `fineract-loan` |
+| Variable installment validator | `portfolio/loanaccount/serialization/VariableLoanScheduleFromApiJsonValidator.java` | `fineract-loan` |
+| Apply variation handler | `portfolio/loanaccount/handler/LoanScheduleCreateVariationCommandHandler.java` | `fineract-loan` |
+| Delete variation handler | `portfolio/loanaccount/handler/LoanScheduleDeleteVariationCommandHandler.java` | `fineract-loan` |
+| Schedule data DTO | `portfolio/loanaccount/loanschedule/data/LoanScheduleData.java` | `fineract-loan` |
+
+## REST surface: `LoanScheduleApiResource`
+
+```java
+@Path("/v1/loans/{loanId}/schedule")
+@Component
+@Tag(name = "Loan Rescheduling", ...)
+@RequiredArgsConstructor
+public class LoanScheduleApiResource {
+
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "LOAN";
+    private final PlatformSecurityContext context;
+    private final DefaultToApiJsonSerializer<LoanScheduleData> toApiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final LoanScheduleCalculationPlatformService calculationPlatformService;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+```
+
+The single endpoint is:
+
+```java
+@POST
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+public String calculateLoanScheduleOrSubmitVariableSchedule(
+        @PathParam("loanId") final Long loanId,
+        @QueryParam("command") final String commandParam,
+        @Context final UriInfo uriInfo,
+        final String apiRequestBodyAsJson) {
+
+    CommandWrapper commandRequest = null;
+    if (is(commandParam, "calculateLoanSchedule")) {
+        this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+        final LoanScheduleData loanSchedule =
+                this.calculationPlatformService.generateLoanScheduleForVariableInstallmentRequest(
+                        loanId, apiRequestBodyAsJson);
+        final ApiRequestJsonSerializationSettings settings =
+                this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+        return this.toApiJsonSerializer.serialize(settings, loanSchedule, new HashSet<>());
+    } else if (is(commandParam, "addVariations")) {
+        commandRequest = new CommandWrapperBuilder().createScheduleExceptions(loanId)
+                .withJson(apiRequestBodyAsJson).build();
+    } else if (is(commandParam, "deleteVariations")) {
+        commandRequest = new CommandWrapperBuilder().deleteScheduleExceptions(loanId).build();
+    }
+    final CommandProcessingResult result =
+            this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return this.toApiJsonSerializer.serialize(result);
+}
+```
+
+Three behaviours, one verb:
+
+<Tabs>
+<Tab title="calculateLoanSchedule (preview)">
+- **Permission:** READ on `LOAN`.
+- **No write path.** The result is computed on the fly via `LoanScheduleCalculationPlatformService.generateLoanScheduleForVariableInstallmentRequest` and serialised directly — no command is logged, no audit row, no business event.
+- Use this to preview what the schedule would look like *after* a set of installment exceptions, before deciding to apply them.
+</Tab>
+<Tab title="addVariations (apply)">
+- Builds `createScheduleExceptions(loanId)` → routes to `LoanScheduleCreateVariationCommandHandler` via `(entity = "LOAN", action = "CREATESCHEDULEEXCEPTIONS")`.
+- Permission check happens through the standard command-source pipeline (`CREATE_LOAN_CREATESCHEDULEEXCEPTIONS`).
+- Persists `LoanTermVariations` rows linked to the loan and re-projects the schedule.
+</Tab>
+<Tab title="deleteVariations (undo)">
+- Builds `deleteScheduleExceptions(loanId)` → routes to `LoanScheduleDeleteVariationCommandHandler` via `(entity = "LOAN", action = "DELETESCHEDULEEXCEPTIONS")`.
+- Removes previously-applied variations and recomputes the original schedule.
+</Tab>
+</Tabs>
+
+The `is` helper is the trim/equalsIgnoreCase pattern reused across `LoansApiResource`:
+
+```java
+private boolean is(final String commandParam, final String commandValue) {
+    return StringUtils.isNotBlank(commandParam) && commandParam.trim().equalsIgnoreCase(commandValue);
+}
+```
+
+<Warning>
+This endpoint is gated only for **variable installment** loans — the calculation path explicitly calls `generateLoanScheduleForVariableInstallmentRequest`, which requires the underlying `LoanProduct.isAllowVariabeInstallments()` flag (column `allow_variabe_installments`). Loans on standard fixed schedules will reject add/deleteVariations downstream in `VariableLoanScheduleFromApiJsonValidator`.
+</Warning>
+
+## Preview vs. apply contract
+
+| Aspect | `calculateLoanSchedule` | `addVariations` / `deleteVariations` |
+| --- | --- | --- |
+| HTTP | `POST /v1/loans/{id}/schedule?command=calculateLoanSchedule` | `…?command=addVariations` / `…?command=deleteVariations` |
+| Permission | `READ_LOAN` | `CREATE_LOAN_CREATESCHEDULEEXCEPTIONS` / `DELETE_LOAN_DELETESCHEDULEEXCEPTIONS` |
+| Persistence | None — pure compute | Inserts/deletes `m_loan_term_variations`; regenerates schedule |
+| Command logged | No | Yes — visible in `m_portfolio_command_source` |
+| Business events | None | Standard loan modification events |
+| Return shape | `LoanScheduleData` JSON | `CommandProcessingResult` (loan id, command id) |
+| Idempotency | Yes (no state change) | No — each call mutates the schedule history |
+
+## `LoanScheduleCalculationPlatformService`
+
+```java
+public interface LoanScheduleCalculationPlatformService {
+
+    LoanScheduleModel calculateLoanSchedule(JsonQuery query, Boolean validateParams);
+
+    void updateFutureSchedule(LoanScheduleData loanScheduleData, Long loanId);
+
+    LoanScheduleData generateLoanScheduleForVariableInstallmentRequest(Long loanId, String json);
+}
+```
+
+Three operations:
+
+1. **`calculateLoanSchedule(JsonQuery, validateParams)`** — used during loan application before persistence; invoked from `LoansApiResource` with `command=calculateLoanSchedule`. Returns a `LoanScheduleModel` (the projection) rather than `LoanScheduleData` because no loan exists yet.
+2. **`updateFutureSchedule(LoanScheduleData, loanId)`** — applies a pre-computed schedule onto an existing loan (used by reschedule/term-variation flows).
+3. **`generateLoanScheduleForVariableInstallmentRequest(loanId, json)`** — the endpoint backing `command=calculateLoanSchedule` on `LoanScheduleApiResource`. Looks up the loan, applies the requested variations transiently, and returns the projected `LoanScheduleData`.
+
+## Variable installment validator
+
+Apply/undo variation requests are validated by `VariableLoanScheduleFromApiJsonValidator`, which enforces:
+
+- `exceptions`, `locale`, `dateFormat` are mandatory.
+- Each variation row carries `dueDate`, `principalAmount` (or `installmentAmount`), and optionally `modifiedDueDate`.
+- The loan product must permit variable installments (`allow_variabe_installments=true`).
+- Variations cannot cross repayment boundaries or violate `minimum_gap` / `maximum_gap` between installments configured on the product.
+
+## `LoanScheduleData` shape
+
+`LoanScheduleData` is the canonical response DTO across schedule preview, reAge preview, reAmortize preview and `GET /v1/loans/{loanId}?associations=repaymentSchedule`. Key fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `currency` | `CurrencyData` | Loan currency |
+| `loanTermInDays` | `int` | Total term |
+| `totalPrincipalDisbursed` | `BigDecimal` | Sum of principal |
+| `totalPrincipalExpected` | `BigDecimal` | Including any capitalized income |
+| `totalInterestCharged` | `BigDecimal` | |
+| `totalFeeChargesCharged` | `BigDecimal` | |
+| `totalPenaltyChargesCharged` | `BigDecimal` | |
+| `totalRepaymentExpected` | `BigDecimal` | Sum across all periods |
+| `periods` | `Collection<LoanSchedulePeriodData>` | The installment-by-installment projection |
+
+Each `LoanSchedulePeriodData` represents either a disbursement period (`period=0`) or a repayment period and includes `dueDate`, `fromDate`, `obligationsMetOnDate`, `principalDue`, `principalPaid`, `principalWrittenOff`, `principalOutstanding`, `interestDue`, `interestPaid`, `interestWaived`, `interestWrittenOff`, `interestOutstanding`, `feeChargesDue`, `penaltyChargesDue`, and `totalActualCostOfLoanForPeriod`.
+
+## Schedule history
+
+Variation apply and reschedule approvals snapshot the prior schedule into `m_loan_schedule_history`. The `LoanScheduleHistoryWritePlatformService` provides:
+
+- `createAndSaveLoanScheduleArchive(Loan, ...)` — called by `LoanRescheduleRequestWritePlatformService.approve` and by `LoanScheduleWritePlatformService` before applying variations.
+- `createAndSaveLoanScheduleArchiveForUndo(Loan)` — invoked by `deleteVariations`.
+
+This enables the `GET /v1/loans/{loanId}/schedule/history` style queries delivered by `LoanScheduleHistoryReadPlatformService`.
+
+## Embedded schedule endpoints on `LoansApiResource`
+
+Beyond the dedicated `LoanScheduleApiResource`, schedules surface in three other places handled by `LoansApiResource`:
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `POST /v1/loans?command=calculateLoanSchedule` | Pre-application preview during the New Loan UI; returns `LoanScheduleData` without persisting a loan |
+| `GET /v1/loans/{loanId}?associations=repaymentSchedule` | Returns the *current* persisted schedule embedded in `LoanAccountData` |
+| `GET /v1/loans/{loanId}/transactions/reage-preview` | Re-age preview — see [Re-aging](/loan/loan-arrears-and-reaging) |
+| `GET /v1/loans/{loanId}/transactions/reamortization-preview` | Re-amortize preview — see [Re-amortization](/loan/loan-reamortization) |
+
+The `LoansApiResource` snippet for pre-application preview:
+
+```java
+} else if (CommandParameterUtil.is(commandParam, "calculateLoanSchedule")) {
+    // calls calculationPlatformService.calculateLoanSchedule(jsonQuery, true)
+    final LoanScheduleModel model =
+            this.calculationPlatformService.calculateLoanSchedule(query, Boolean.TRUE);
+    return this.loanScheduleToApiJsonSerializer.serialize(settings, model.toData(), new HashSet<>());
+}
+```
+
+The variation endpoints all route through `CommandWrapperBuilder`:
+
+| `CommandWrapperBuilder` method | Entity / Action |
+| --- | --- |
+| `createScheduleExceptions(loanId)` | `LOAN` / `CREATESCHEDULEEXCEPTIONS` |
+| `deleteScheduleExceptions(loanId)` | `LOAN` / `DELETESCHEDULEEXCEPTIONS` |
+
+## Handlers
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "CREATESCHEDULEEXCEPTIONS")
+public class LoanScheduleCreateVariationCommandHandler implements NewCommandSourceHandler {
+    private final LoanScheduleWritePlatformService writePlatformService;
+    @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.addLoanScheduleVariations(command.getLoanId(), command);
+    }
+}
+```
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "DELETESCHEDULEEXCEPTIONS")
+public class LoanScheduleDeleteVariationCommandHandler implements NewCommandSourceHandler {
+    private final LoanScheduleWritePlatformService writePlatformService;
+    @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.deleteLoanScheduleVariations(command.getLoanId());
+    }
+}
+```
+
+Both are stateless and delegate to `LoanScheduleWritePlatformService`, which:
+
+1. Loads the loan + existing `LoanTermVariations`.
+2. Invokes `VariableLoanScheduleFromApiJsonValidator`.
+3. Mutates `m_loan_term_variations`.
+4. Calls `LoanMapper.regenerateScheduleModel(scheduleGeneratorDTO, loan)` to rebuild installments.
+5. Writes a history archive.
+6. Returns `CommandProcessingResultBuilder.with(...).withLoanId(loanId).build()`.
+
+## Body shapes
+
+### `command=calculateLoanSchedule`
+
+```json
+{
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy",
+  "exceptions": [
+    { "dueDate": "21 January 2024", "modifiedDueDate": "28 January 2024", "installmentAmount": 1200.00 },
+    { "dueDate": "21 February 2024", "principalAmount": 0 }
+  ]
+}
+```
+
+Response is `LoanScheduleData` — see fields above.
+
+### `command=addVariations`
+
+Same body schema as `calculateLoanSchedule`. Successful response:
+
+```json
+{ "officeId": 1, "loanId": 123, "resourceId": 123, "changes": { "exceptions": [...] } }
+```
+
+### `command=deleteVariations`
+
+Empty body. Removes all term variations marked as schedule exceptions.
+
+## Permissions
+
+Schedule operations require:
+
+| Operation | Maker-checker permission |
+| --- | --- |
+| `calculateLoanSchedule` | `READ_LOAN` |
+| `addVariations` | `CREATE_LOAN_CREATESCHEDULEEXCEPTIONS` |
+| `deleteVariations` | `DELETE_LOAN_DELETESCHEDULEEXCEPTIONS` |
+
+All three roll up under the standard `LOAN` entity in `m_permission`.
+
+## Interaction with reschedule workflow
+
+The schedule API is a *direct* mutator: a single API call instantly mutates the schedule. The higher-level **reschedule workflow** (see [Reschedule loans](/loan/reschedule-loans)) instead creates a `LoanRescheduleRequest` row in a `Submitted` state, then requires a separate `approve` command to actually rewrite the schedule. Use the schedule API for ad-hoc installment date/amount tweaks; use the reschedule API when you need maker-checker over the whole change package.
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Reschedule loans](/loan/reschedule-loans)
+- [Re-aging and arrears](/loan/loan-arrears-and-reaging)
+- [Re-amortization](/loan/loan-reamortization)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

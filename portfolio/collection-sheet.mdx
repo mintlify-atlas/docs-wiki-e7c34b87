@@ -1,0 +1,327 @@
+---
+title: "Collection Sheet: Mass Repayment for Groups and Individuals"
+sidebarTitle: "Collection Sheet"
+description: "Reference for the CollectionSheet generation and save pipeline, group/center JLG flow, individual variant, and CollectionSheetApiResource."
+---
+
+Apache Fineract supports two operational realities at scale: per-account interactions through the loan and savings resources, and the **collection sheet** — a denormalised view of "everything a loan officer needs to collect today" that an officer fills in once for a whole group or center, then posts back as a single bulk transaction. The collection sheet is the workhorse of microfinance branches and joint-liability-group (JLG) field operations.
+
+The module lives in `org.apache.fineract.portfolio.collectionsheet`. It carries two distinct flows:
+
+- **Group / center JLG flow** — generated from `GroupsApiResource` and `CentersApiResource` at `groups/{groupId}?command=generateCollectionSheet` (server-side) and saved through the same path. The read side returns `JLGCollectionSheetData`.
+- **Individual flow** — exposed by the dedicated `CollectionSheetApiResource` at `/v1/collectionsheet`, used for clients with no group affiliation, returning `IndividualCollectionSheetData` and saving through `saveIndividualCollectionSheet`.
+
+This page documents both flows, the DTOs that crystallise the sheet, the read service that builds them, and the write service that commits the bulk transactions.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `CollectionSheetApiResource` (individual flow) | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.api` |
+| `JLGCollectionSheetData`, `JLGClientData`, `JLGGroupData` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.data` |
+| `IndividualCollectionSheetData`, `IndividualClientData` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.data` |
+| `CollectionSheetRequest`, `DisbursementTransactionsRequest`, `RepaymentTransactionRequest`, `SavingDueTransactionRequest` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.data` |
+| `LoanDueData`, `SavingsDueData` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.data` |
+| `CollectionSheetTransactionDataValidator` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.data` |
+| `CollectionSheet…CommandFromApiJsonDeserializer` (three variants) | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.serialization` |
+| `CollectionSheetReadPlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.service` |
+| `CollectionSheetWritePlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.service` |
+| `SaveIndividualCollectionSheetCommandHandler`, `UpdateCollectionSheetCommandHandler` | `fineract-provider` | `org.apache.fineract.portfolio.collectionsheet.handler` |
+
+There is no entity in this module — the collection sheet is purely **transient**, materialised from current `Loan`, `SavingsAccount` and group state and turned into a set of canonical loan/savings transactions on save.
+
+## Concepts
+
+A collection sheet has three logical sections:
+
+1. **Bulk disbursement** — loans approved but not yet disbursed are listed and may be disbursed on the meeting date.
+2. **Bulk repayment** — outstanding installments due on or before the meeting date are listed with the proposed payment per loan.
+3. **Bulk savings due** — mandatory savings instalments (e.g. for a recurring deposit linked to the meeting calendar) are listed.
+
+When the officer saves the sheet, the write service iterates over all three sections and produces a stream of standard loan/savings transactions, one per row.
+
+## Read service contract
+
+```java
+// fineract-provider/.../portfolio/collectionsheet/service/CollectionSheetReadPlatformService.java
+public interface CollectionSheetReadPlatformService {
+
+    JLGCollectionSheetData generateGroupCollectionSheet(Long groupId, JsonQuery query);
+
+    JLGCollectionSheetData generateCenterCollectionSheet(Long groupId, JsonQuery query);
+
+    IndividualCollectionSheetData generateIndividualCollectionSheet(JsonQuery query);
+}
+```
+
+All three methods take a `JsonQuery` carrying the meeting date and (for JLG) the calendar id, and return a denormalised view ready to render.
+
+## Write service contract
+
+```java
+// fineract-provider/.../portfolio/collectionsheet/service/CollectionSheetWritePlatformService.java
+public interface CollectionSheetWritePlatformService {
+
+    CommandProcessingResult updateCollectionSheet(JsonCommand command);
+
+    CommandProcessingResult saveIndividualCollectionSheet(JsonCommand command);
+}
+```
+
+`updateCollectionSheet` saves the JLG sheet; `saveIndividualCollectionSheet` saves the individual sheet. Each method opens one DB transaction and posts all loan/savings transactions atomically — partial success is not possible.
+
+## `CollectionSheetApiResource` (individual flow)
+
+```java
+// fineract-provider/.../portfolio/collectionsheet/api/CollectionSheetApiResource.java
+@Path("/v1/collectionsheet")
+@Component
+@Tag(name = "Collection Sheet", description = "")
+@RequiredArgsConstructor
+public class CollectionSheetApiResource {
+
+    private final CollectionSheetReadPlatformService collectionSheetReadPlatformService;
+    private final ToApiJsonSerializer<Object> toApiJsonSerializer;
+    private final FromJsonHelper fromJsonHelper;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final PlatformSecurityContext context;
+```
+
+Only one endpoint is exposed, switched by `?command=generateCollectionSheet` or `?command=saveCollectionSheet`:
+
+```java
+@POST
+@Operation(summary = "Generate Individual Collection Sheet | Save Collection Sheet",
+           description = "Generate Individual Collection Sheet:\n\nThis Api retrieves repayment details of all individual loans under a office as on a specified meeting date.\n\nSave Collection Sheet:\n\nThis Api allows the loan officer to perform bulk repayments of individual loans and deposit of mandatory savings on a given meeting date.")
+public Response generateCollectionSheet(@QueryParam("command") final String commandParam,
+                                        CollectionSheetRequest collectionSheetRequest) {
+    final String payload = toApiJsonSerializer.serialize(collectionSheetRequest);
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(payload);
+
+    if (CommandParameterUtil.is(commandParam, GENERATE_COLLECTION_SHEET_COMMAND_VALUE)) {
+        this.context.authenticatedUser().validateHasReadPermission(CollectionSheetConstants.COLLECTIONSHEET_RESOURCE_NAME);
+        final JsonElement parsedQuery = this.fromJsonHelper.parse(payload);
+        final JsonQuery query = JsonQuery.from(payload, parsedQuery, this.fromJsonHelper);
+        return Response.ok(this.collectionSheetReadPlatformService.generateIndividualCollectionSheet(query)).build();
+    } else if (CommandParameterUtil.is(commandParam, SAVE_COLLECTION_SHEET_COMMAND_VALUE)) {
+        final CommandWrapper commandRequest = builder.saveIndividualCollectionSheet().build();
+        return Response.ok(this.commandsSourceWritePlatformService.logCommandSource(commandRequest)).build();
+    }
+    return Response.ok().build();
+}
+```
+
+The unusual single-endpoint design with `?command=…` dispatch matches Fineract's general "everything goes through `PortfolioCommandSourceWritePlatformService`" idiom while still letting the GET-like generate call return a synthesised DTO without persisting anything.
+
+### `CollectionSheetRequest`
+
+```java
+// fineract-provider/.../portfolio/collectionsheet/data/CollectionSheetRequest.java
+@Data
+@NoArgsConstructor
+@Builder
+@AllArgsConstructor
+@FieldNameConstants
+public class CollectionSheetRequest implements Serializable {
+
+    private Long officeId;
+    private String dateFormat;
+    private String locale;
+    private String actualDisbursementDate;
+    private String transactionDate;
+    private DisbursementTransactionsRequest bulkDisbursementTransactions;
+}
+```
+
+When generating, the request only needs `officeId`, `transactionDate` and locale fields. When saving, it carries the populated `bulkDisbursementTransactions`, plus arrays of repayment and savings-due rows in nested DTOs.
+
+### JLG variant — exposed elsewhere
+
+The JLG (group/center) variant is mounted on `GroupsApiResource` and `CentersApiResource` via:
+
+```
+POST /v1/groups/{groupId}?command=generateCollectionSheet
+POST /v1/groups/{groupId}?command=saveCollectionSheet
+```
+
+Both call `CollectionSheetReadPlatformService.generateGroupCollectionSheet(groupId, query)` and `CollectionSheetWritePlatformService.updateCollectionSheet(command)`.
+
+## DTO catalogue
+
+### Generate response — JLG
+
+`JLGCollectionSheetData` carries:
+
+- `dueDate`, `nextDueDate` — meeting cycle reference.
+- `loanProducts` — list of loan products referenced by any pending dues, used to render header columns.
+- `paymentTypeOptions` — the standard `PaymentType` catalogue (see [/portfolio/payment-types](/portfolio/payment-types)).
+- `groups` — `Collection<JLGGroupData>`. Each group includes its `clients` (`JLGClientData`) with their `loans` (`LoanDueData`) and `savings` (`SavingsDueData`).
+
+The query is a join across `m_group`, `m_client`, `m_loan` and `m_loan_repayment_schedule` filtered to installments due on or before the meeting date.
+
+### Generate response — Individual
+
+`IndividualCollectionSheetData` flattens out the structure to:
+
+- `dueDate`, `loanProducts`, `paymentTypeOptions`.
+- `clients` — `Collection<IndividualClientData>`. Each has its own `loans` and `savings`.
+
+The flat form is materialised by `IndividualCollectionSheetLoanFlatData` rows and rolled up in the read service.
+
+### Save request — JLG
+
+The JLG save payload nests an array of `bulkRepaymentTransactions` and a separate `bulkSavingsDueTransactions`. Each repayment row is a `RepaymentTransactionRequest`:
+
+```java
+public class RepaymentTransactionRequest {
+    private Long loanId;
+    private BigDecimal transactionAmount;
+    private Long paymentTypeId;
+    // optional payment detail fields
+    private String accountNumber;
+    private String checkNumber;
+    // ...
+}
+```
+
+Each savings-due row is a `SavingDueTransactionRequest`. The disbursement section is a `DisbursementTransactionsRequest`.
+
+### `LoanDueData` and `SavingsDueData`
+
+`LoanDueData` holds the per-loan due information shown to the officer: `loanId`, `productId`, `dueAmount`, `principalDue`, `interestDue`, `feeChargesDue`, `penaltyChargesDue`, `inArrears`, `accountId`, `clientId`. The officer types in the actual payment, which becomes `transactionAmount`.
+
+`SavingsDueData` holds the savings instalment expected: `savingsId`, `productId`, `dueAmount`, `depositAccountType` (so the read side can distinguish FD/RD/passbook).
+
+## Read implementation
+
+`CollectionSheetReadPlatformServiceImpl` is a single class with three large methods, each materialising a `JdbcTemplate` query through `JLGCollectionSheetFlatData` / `IndividualCollectionSheetLoanFlatData` row mappers, then performing in-memory rollup to nested DTOs. The queries are intentionally denormalised SQL (single-pass over `m_loan` joined to `m_loan_repayment_schedule` etc.) for performance.
+
+`generateIndividualCollectionSheet(JsonQuery query)` (excerpt):
+
+```java
+public IndividualCollectionSheetData generateIndividualCollectionSheet(final JsonQuery query) {
+    // 1. Validate the query (officeId, transactionDate, ...)
+    this.individualCollectionSheetDataValidator.validate(query);
+    // 2. Fetch flat rows for loans, savings, group/center attendance
+    // 3. Roll-up into client -> loans / savings collections
+    // 4. Compose with paymentTypeOptions and loanProducts
+    return data;
+}
+```
+
+The two-step "fetch flat, then roll up in-memory" pattern is used because the rollup involves duplicated client rows when a client has multiple loans/savings; doing it as a JOIN in SQL produces a Cartesian explosion.
+
+## Write implementation
+
+`CollectionSheetWritePlatformServiceJpaRepositoryImpl.saveIndividualCollectionSheet(JsonCommand command)` performs:
+
+1. **Validate** — `CollectionSheetTransactionDataValidator.validateIndividualCollectionSheet(command)` runs structural checks.
+2. **Disburse loans** — for each entry in `bulkDisbursementTransactions`, call `LoanWritePlatformService.disburseLoan(...)`.
+3. **Repay loans** — for each entry, call `LoanWritePlatformService.makeLoanRepayment(...)` with a `LoanTransactionType.REPAYMENT` transaction.
+4. **Deposit savings** — for each savings-due row, call `SavingsAccountWritePlatformService.deposit(...)`.
+5. **Compose result** — return a `CommandProcessingResult` carrying the aggregate counts and the office id.
+
+Each underlying transaction goes through the standard payment-detail pipeline, so `paymentTypeId` and bank fields are honoured per row.
+
+For JLG, `updateCollectionSheet(JsonCommand command)` does the same except it iterates over group-then-client structure and additionally records meeting attendance through `MeetingWritePlatformService.saveOrUpdateAttendance(...)`.
+
+## Validation rules
+
+`CollectionSheetTransactionDataValidator` enforces:
+
+- `transactionDate` is required and parseable using the supplied `dateFormat` and `locale`.
+- `officeId` is required.
+- Each repayment row must have `loanId` and `transactionAmount > 0`.
+- Each savings-due row must have `savingsId` and `transactionAmount ≥ 0`.
+- If `paymentTypeId` is provided on a row, it must resolve to an existing `PaymentType`.
+
+Errors surface as a `PlatformApiDataValidationException` (HTTP 400) with the conventional `errors[]` payload.
+
+## Atomicity
+
+The whole save call runs in one Spring `@Transactional` boundary. If any single loan repayment fails (e.g. amount exceeds outstanding), the entire collection sheet save rolls back. This is deliberate: branch staff expect "either everyone got paid in or nothing did" semantics on a meeting day.
+
+## Permissions and command names
+
+- `READ_COLLECTIONSHEET` — required for the generate flow.
+- `CREATE_COLLECTIONSHEET` — required for save. The command name registered on `CommandWrapperBuilder` is `saveIndividualCollectionSheet` for the individual flow and `updateCollectionSheet` for the JLG flow.
+
+Maker-checker is honoured through the standard `PortfolioCommandSourceWritePlatformService`.
+
+## Performance notes
+
+- The read query for a center with 100 clients × 1 active loan + 1 active savings finishes in tens of milliseconds on indexed columns.
+- The write call's cost is dominated by the number of loan transactions posted (each runs a schedule recalculation and an accounting posting).
+- If you have very large centers (1000+ clients), generation is fast but the save quickly approaches several seconds — consider chunking the save by groups.
+
+## Failure modes
+
+- **HTTP 400** — validation failure, missing `transactionDate`, malformed rows.
+- **HTTP 404** — an unknown `loanId`/`savingsId`/`officeId`/`paymentTypeId` in a row.
+- **HTTP 403** — `LoanCannotBeRepaidException`, `SavingsAccountDormantException` etc. propagated from the underlying write services.
+- **HTTP 500** — DB constraint failures during the bulk post (rare).
+
+## Related batch flows
+
+The collection sheet is the **interactive** bulk path. Two non-interactive batch flows do similar things:
+
+- **Bulk loan repayment via standing instructions** ([/portfolio/standing-instructions](/portfolio/standing-instructions)) — schedule-driven.
+- **COB collection-sheet attendance preparation** — the COB pipeline can pre-build the day's collection sheet so the officer opens a partially-completed form.
+
+## Extensibility
+
+Common extension points:
+
+- **Add a third bulk type** (e.g. "bulk charge waivers"): extend `CollectionSheetRequest` with a new array, add a writer call in `saveIndividualCollectionSheet`, add validator rules and update the deserializer.
+- **Alter how due amounts are computed**: subclass the read service and override `generateIndividualCollectionSheet`. Note that the SQL is the bottleneck; consider materialised views for very large institutions.
+- **Per-row maker-checker**: today the whole sheet is one command. Splitting it requires a redesign — each row would become its own audited command.
+
+## Wire-level example: individual flow
+
+Generate the sheet for a meeting date:
+
+```bash
+curl -u admin:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/collectionsheet?command=generateCollectionSheet' \
+  -d '{
+    "officeId": 1,
+    "transactionDate": "2024-08-01",
+    "dateFormat": "yyyy-MM-dd",
+    "locale": "en"
+  }'
+```
+
+The response carries `IndividualCollectionSheetData`. The officer adjusts the per-row amounts and posts back:
+
+```bash
+curl -u admin:password -X POST \
+  -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/collectionsheet?command=saveCollectionSheet' \
+  -d '{
+    "officeId": 1,
+    "transactionDate": "2024-08-01",
+    "dateFormat": "yyyy-MM-dd",
+    "locale": "en",
+    "bulkRepaymentTransactions": [
+      { "loanId": 12, "transactionAmount": 100, "paymentTypeId": 1 },
+      { "loanId": 14, "transactionAmount": 50,  "paymentTypeId": 1 }
+    ],
+    "bulkSavingsDueTransactions": [
+      { "savingsId": 7, "transactionAmount": 20, "paymentTypeId": 1 }
+    ]
+  }'
+```
+
+The single response is the aggregate `CommandProcessingResult` with the office id and audit row.
+
+## Cross-references
+
+- [/portfolio/groups-and-centers](/portfolio/groups-and-centers) — group/center entities behind the JLG flow.
+- [/portfolio/meetings](/portfolio/meetings) — the calendar that drives `dueDate` selection.
+- [/portfolio/payment-types](/portfolio/payment-types) — `PaymentType` catalogue rendered into the sheet template.
+- [/portfolio/payment-details](/portfolio/payment-details) — per-row bank metadata recorded on each posted transaction.
+- [/loan/loan-repayment-schedule-domain](/loan/loan-repayment-schedule-domain) — outstanding installments queried during sheet generation.
+- [/savings/savings-transactions](/savings/savings-transactions) — bulk savings deposits posted at save time.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour for collection sheet endpoints.
+- [/command/overview](/command/overview) — `PortfolioCommandSourceWritePlatformService` and `CommandWrapperBuilder`.

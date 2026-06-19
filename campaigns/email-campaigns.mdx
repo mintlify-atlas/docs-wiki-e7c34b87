@@ -1,0 +1,309 @@
+---
+title: "Email Campaigns — EmailCampaign Aggregate and REST Surface"
+sidebarTitle: "Email Campaigns"
+description: "Apache Fineract email campaigns: EmailCampaign entity, EmailCampaignApiResource, DIRECT/SCHEDULE/TRIGGERED types and PENDING/ACTIVE/CLOSED transitions."
+---
+
+The Apache Fineract **email campaigns** feature lets a tenant define a reusable email blast that pulls its recipient list from a stretchy SQL report, interpolates a template body per row, and dispatches via SMTP. The aggregate root is `EmailCampaign` (`fineract-provider/src/main/java/org/apache/fineract/infrastructure/campaigns/email/domain/EmailCampaign.java`, table `scheduled_email_campaign`); it is driven from `/v1/email/campaign` through `EmailCampaignApiResource` and `EmailCampaignWritePlatformService`. Materialised messages live in `scheduled_email_messages_outbound` as `EmailMessage` rows and are sent by the `EXECUTE_EMAIL` job (`ExecuteEmailTasklet`).
+
+For the broader subsystem and the matching SMS pipeline see [Campaigns overview](/campaigns/overview). For SMTP configuration see [Email configuration](/campaigns/email-configuration). For the scheduler that owns the dispatch tasklet see [Campaign jobs](/campaigns/campaign-jobs).
+
+## Aggregate — `EmailCampaign`
+
+```java
+@Entity
+@Table(name = "scheduled_email_campaign")
+public class EmailCampaign extends AbstractPersistableCustom<Long> {
+    @Column(name = "campaign_name", nullable = false)      private String campaignName;
+    @Column(name = "campaign_type", nullable = false)      private Integer campaignType;  // DIRECT / SCHEDULE / TRIGGERED
+    @ManyToOne @JoinColumn(name = "business_rule_id")      private Report businessRuleId; // stretchy report -> recipient list
+    @Column(name = "param_value")                          private String paramValue;     // JSON of report params
+    @Column(name = "status_enum", nullable = false)        private Integer status;        // PENDING / ACTIVE / CLOSED
+    @Column(name = "email_subject", nullable = false)      private String emailSubject;
+    @Column(name = "email_message", nullable = false)      private String emailMessage;   // template body
+    @Column(name = "email_attachment_file_format")         private String emailAttachmentFileFormat; // xls/csv/pdf
+    @ManyToOne @JoinColumn(name = "stretchy_report_id")    private Report stretchyReport; // optional attached report
+    @Column(name = "stretchy_report_param_map")            private String stretchyReportParamMap;
+    @Column(name = "recurrence")                           private String recurrence;     // cron-like for SCHEDULE
+    @Column(name = "next_trigger_date")                    private LocalDateTime nextTriggerDate;
+    @Column(name = "last_trigger_date")                    private LocalDateTime lastTriggerDate;
+    @Column(name = "recurrence_start_date")                private LocalDateTime recurrenceStartDate;
+    @Column(name = "approvedon_date")                      private LocalDate approvedOnDate;
+    @Column(name = "closedon_date")                        private LocalDate closureDate;
+    @Column(name = "previous_run_status")                  private String previousRunStatus;
+    @Column(name = "previous_run_error_log")               private String previousRunErrorLog;
+    @Column(name = "previous_run_error_message")           private String previousRunErrorMessage;
+    // audit columns: submittedBy / submittedOnDate / approvedBy / closedBy
+}
+```
+
+Key invariants enforced inside the aggregate:
+
+- `instance(...)` initialises the campaign in `PENDING` (status `100`) regardless of input — a campaign can never be created already active. See `EmailCampaignStatus.PENDING.getValue()` in the factory:
+
+  ```java
+  return new EmailCampaign()
+      .setCampaignName(campaignName)
+      .setStatus(EmailCampaignStatus.PENDING.getValue())
+      .setSubmittedOnDate(submittedOnDate)
+      .setSubmittedBy(submittedBy)
+      ...;
+  ```
+
+- `instance(...)` requires both a `businessRuleId` (the report providing recipients) and a `stretchyReport` (used as an attachment when configured). If `emailAttachmentFileFormatId` is null the file format defaults to id `2` (CSV) via `ScheduledEmailAttachmentFileFormat.instance(2)`.
+- `recurrenceStartDate` is forced to `null` unless the campaign type is `SCHEDULE`; it is captured even when `SCHEDULE` is selected without explicit input, defaulting to `DateUtils.getLocalDateTimeOfTenant()`.
+- `update(JsonCommand)` returns only the changed fields and refuses to mutate trigger metadata that isn't relevant for the current type — recurrence-related fields stay null for `DIRECT`.
+
+## Trigger types — `EmailCampaignType`
+
+```java
+public enum EmailCampaignType {
+    DIRECT(1,    "emailCampaignStatusType.direct"),
+    SCHEDULE(2,  "emailCampaignStatusType.schedule"),
+    TRIGGERED(3, "emailCampaignStatusType.triggered");
+}
+```
+
+| Type | Materialisation moment | Recurrence | Triggered by |
+|---|---|---|---|
+| `DIRECT(1)` | On `activate` command: write all rows to `scheduled_email_messages_outbound` once | none | Operator action |
+| `SCHEDULE(2)` | `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE` polls every active scheduled campaign; when `next_trigger_date <= now`, expand and advance `next_trigger_date` via `CalendarUtils.getNextRecurringDate` | required (cron-like string) | Scheduler |
+| `TRIGGERED(3)` | `EmailCampaignDomainServiceImpl` listens for portfolio business events (`LoanApprovedBusinessEvent`, etc.) and produces a message when a matching event fires | none | Business events |
+
+`EmailCampaignType.isSchedule()` short-circuits which fields are required at creation. Switching a campaign's type via `PUT /v1/email/campaign/{id}` is permitted only while the campaign is `PENDING` — once active, mutating fields throws `EmailCampaignMustBeClosedToEditException`.
+
+## Status machine — `EmailCampaignStatus`
+
+```java
+public enum EmailCampaignStatus {
+    INVALID(0,  "emailCampaignStatus.invalid"),
+    PENDING(100,"emailCampaignStatus.pending"),
+    ACTIVE(300, "emailCampaignStatus.active"),
+    CLOSED(600, "emailCampaignStatus.closed");
+}
+```
+
+Transitions live on `EmailCampaign`:
+
+```java
+public void activate(AppUser currentUser, DateTimeFormatter fmt, LocalDate activationLocalDate) {
+    if (isActive()) {
+        throw new PlatformApiDataValidationException(...);   // error.msg.campaign.already.active
+    }
+    this.approvedOnDate = activationLocalDate;
+    this.approvedBy = currentUser;
+    this.status = EmailCampaignStatus.ACTIVE.getValue();
+    validate();
+}
+
+public void close(AppUser currentUser, DateTimeFormatter fmt, LocalDate closureLocalDate) {
+    if (isClosed()) { throw new PlatformApiDataValidationException(...); /* already.closed */ }
+    this.closureDate = closureLocalDate;
+    this.closedBy = currentUser;
+    this.status = EmailCampaignStatus.CLOSED.getValue();
+}
+
+public void reactivate(AppUser currentUser, DateTimeFormatter fmt, LocalDate reactivateLocalDate) {
+    if (!isClosed()) { throw new PlatformApiDataValidationException(...); /* must.be.closed */ }
+    this.approvedOnDate = reactivateLocalDate;
+    this.approvedBy = currentUser;
+    this.closureDate = null;
+    this.closedBy = null;
+    this.status = EmailCampaignStatus.ACTIVE.getValue();
+    validateReactivate();
+}
+```
+
+`delete` is also gated on `CLOSED`:
+
+```java
+if (!isClosed()) {
+    throw new EmailCampaignMustBeClosedToBeDeletedException(getId());
+}
+```
+
+State diagram:
+
+```
+   POST /v1/email/campaign
+            │
+            ▼
+       ┌─────────┐  command=activate         ┌─────────┐
+       │ PENDING │ ────────────────────────▶ │ ACTIVE  │
+       └─────────┘                           └────┬────┘
+            ▲                                     │ command=close
+   command=reactivate                             ▼
+       ┌─────────┐  ◀──── command=reactivate ────────┐
+       │ CLOSED  │                                    │
+       └────┬────┘                                    │
+            │ DELETE /v1/email/campaign/{id}          │
+            ▼                                         │
+        (removed)                                     │
+                                                      ▼
+                                                  ┌─────────┐
+                                                  │ CLOSED  │
+                                                  └─────────┘
+```
+
+`PENDING → CLOSED` is allowed too (a campaign that was created but never activated can be closed directly), and the matching commands all flow through `PortfolioCommandSourceWritePlatformService`.
+
+## REST surface — `EmailCampaignApiResource`
+
+`@Path("/v1/email/campaign")`. All endpoints are JSON in / JSON out:
+
+| Method | Path | Operation | Command produced |
+|---|---|---|---|
+| `GET` | `/v1/email/campaign` | List campaigns | — |
+| `GET` | `/v1/email/campaign/{resourceId}` | Fetch one | — |
+| `POST` | `/v1/email/campaign` | Create | `EMAIL_CAMPAIGN.CREATE` |
+| `PUT` | `/v1/email/campaign/{resourceId}` | Update | `EMAIL_CAMPAIGN.UPDATE` |
+| `POST` | `/v1/email/campaign/{resourceId}?command=activate` | Activate | `EMAIL_CAMPAIGN.ACTIVATE` |
+| `POST` | `/v1/email/campaign/{resourceId}?command=close` | Close | `EMAIL_CAMPAIGN.CLOSE` |
+| `POST` | `/v1/email/campaign/{resourceId}?command=reactivate` | Reactivate | `EMAIL_CAMPAIGN.REACTIVATE` |
+| `POST` | `/v1/email/campaign/preview` | Preview interpolation against a sample row | — |
+| `GET` | `/v1/email/campaign/template` | UI template (available reports etc.) | — |
+| `GET` | `/v1/email/campaign/{resourceId}/template` | Template scoped to one campaign | — |
+| `DELETE` | `/v1/email/campaign/{resourceId}` | Delete (must be `CLOSED`) | `EMAIL_CAMPAIGN.DELETE` |
+
+The `command` query parameter on the `POST {resourceId}` endpoint is the standard Fineract dispatcher — `activate` / `close` / `reactivate` are routed by `CommandWrapperBuilder` to the matching handler:
+
+```java
+// EmailCampaignApiResource.activate(...)
+final CommandWrapper commandRequest = switch (commandParam) {
+    case "activate"   -> new CommandWrapperBuilder().activateEmailCampaign(campaignId).withJson(apiRequestBodyAsJson).build();
+    case "close"      -> new CommandWrapperBuilder().closeEmailCampaign(campaignId).withJson(apiRequestBodyAsJson).build();
+    case "reactivate" -> new CommandWrapperBuilder().reactivateEmailCampaign(campaignId).withJson(apiRequestBodyAsJson).build();
+    default -> throw new UnrecognizedQueryParamException("command", commandParam, ...);
+};
+```
+
+Each `*CommandHandler` is a thin pass-through:
+
+```java
+@Service
+@CommandType(entity = "EMAIL_CAMPAIGN", action = "ACTIVATE")
+public class ActivateEmailCampaignCommandHandler implements NewCommandSourceHandler {
+    private final EmailCampaignWritePlatformService emailCampaignWritePlatformService;
+    @Transactional
+    @Override public CommandProcessingResult processCommand(JsonCommand command) {
+        return this.emailCampaignWritePlatformService.activateEmailCampaign(command.entityId(), command);
+    }
+}
+```
+
+See [Command handlers](/command/handlers) for how the dispatcher resolves `(entity, action)` pairs.
+
+### Required JSON for create
+
+`EmailCampaignValidator` declares the parameter set (`EmailCampaignValidator.SUPPORTED_PARAMS`). The minimum a create body must contain:
+
+| Field | Type | Notes |
+|---|---|---|
+| `campaignName` | string | Unique per tenant |
+| `campaignType` | int | `1` DIRECT, `2` SCHEDULE, `3` TRIGGERED |
+| `businessRuleId` | long | Id of the `stretchy_report` that returns recipients |
+| `emailSubject` | string | Becomes `EmailMessage.emailSubject` |
+| `emailMessage` | string | Template body — `${columnName}` is replaced from each report row |
+| `paramValue` | string (JSON) | Map of report parameters (e.g. `{"officeId":"1"}`) |
+| `stretchyReportId` | long, optional | If set, the campaign emails an attached report rendered against `stretchyReportParamMap` |
+| `stretchyReportParamMap` | string (JSON), optional | Parameters for the attached report |
+| `recurrence` | string | Required when `campaignType=2`; cron / `RRULE` |
+| `recurrenceStartDate` | date-time | Required when `campaignType=2` |
+| `submittedOnDate`, `dateFormat`, `locale` | meta | Required for date parsing |
+
+`EmailCampaignValidator.validateCreate(...)` rejects requests missing any of these and returns a `PlatformApiDataValidationException` aggregating all field errors.
+
+### Preview
+
+`POST /v1/email/campaign/preview` accepts a `paramValue` JSON and runs the business-rule report with those parameters to return a `PreviewCampaignMessage` containing the first batch of interpolated subject/body pairs. Use this from the UI to validate `${...}` placeholders against the columns the SQL actually returns before activating.
+
+## Write service — `EmailCampaignWritePlatformCommandHandlerImpl`
+
+The write service does six things on behalf of the handlers:
+
+1. **Create** — pulls `Report businessRuleId` from `ReportRepository`, builds the `EmailCampaign` via `EmailCampaign.instance(...)`, persists, returns the new id.
+2. **Update** — applies `EmailCampaign.update(JsonCommand)` and returns the change map; throws `EmailCampaignMustBeClosedToEditException` if the campaign is `ACTIVE`.
+3. **Activate** — `campaign.activate(...)`. For `DIRECT` campaigns this also calls `insertDirectCampaignIntoEmailOutboundTable(...)` immediately, which runs the business-rule SQL via `ReadReportingService.retrieveGenericResultset(...)`, interpolates `emailMessage`/`emailSubject` per row, and inserts one `EmailMessage` per row in `PENDING`.
+4. **Reactivate** — `campaign.reactivate(...)` plus, for `SCHEDULE` campaigns, recompute `next_trigger_date` from `recurrenceStartDate`.
+5. **Close** — `campaign.close(...)`. Materialised `EmailMessage` rows are unaffected.
+6. **Delete** — gated by `EmailCampaign.delete()` which requires `CLOSED`; cascading delete of related rows handled at the JPA level.
+
+For `SCHEDULE` campaigns the trigger-date arithmetic uses `CalendarUtils.getNextRecurringDate(recurrence, lastTrigger, tenantNow)` — the same helper used elsewhere in the platform (savings interest posting, loan reschedules).
+
+## Materialised messages — `EmailMessage`
+
+```java
+@Entity
+@Table(name = "scheduled_email_messages_outbound")
+public class EmailMessage extends AbstractPersistableCustom<Long> {
+    @ManyToOne @JoinColumn(name = "group_id")          private Group group;
+    @ManyToOne @JoinColumn(name = "client_id")         private Client client;
+    @ManyToOne @JoinColumn(name = "staff_id")          private Staff staff;
+    @ManyToOne @JoinColumn(name = "email_campaign_id") private EmailCampaign emailCampaign;
+    @Column(name = "status_enum", nullable = false)    private Integer statusType;   // EmailMessageStatusType
+    @Column(name = "email_address", nullable = false)  private String emailAddress;
+    @Column(name = "email_subject", nullable = false)  private String emailSubject;
+    @Column(name = "message", nullable = false)        private String message;
+    @Column(name = "campaign_name")                    private String campaignName;
+    @Column(name = "submittedon_date")                 private LocalDate submittedOnDate;
+    // ...
+}
+```
+
+`EmailMessageStatusType`:
+
+| Value | Constant | Meaning |
+|---|---|---|
+| `0` | `INVALID` | Row failed validation; not sent |
+| `100` | `PENDING` | Waiting for `ExecuteEmailTasklet` |
+| `200` | `SENT` | Handed to `JavaMailSenderImpl.send(...)` |
+| `300` | `DELIVERED` | Reserved — JavaMail doesn't deliver-confirm; only used by integrations that update externally |
+| `400` | `FAILED` | `MessagingException` raised during send |
+
+`ExecuteEmailTasklet` pages over `PENDING` rows, hands each to `EmailMessageJobEmailServiceImpl.sendEmailWithAttachment(...)`, and flips status to `SENT` (or `FAILED` on exception). Sending logic lives in [Email configuration](/campaigns/email-configuration).
+
+## Template interpolation
+
+The business-rule report's result columns become substitution keys. The replacement happens inside the write service when expanding a campaign into outbound rows:
+
+- The report returns columns such as `id`, `display_name`, `email_address`, `mobile_no`, `office_id` and any computed fields.
+- The campaign `emailMessage` and `emailSubject` strings use `${columnName}` placeholders (case-sensitive, matched against the column header name from `ResultsetColumnHeaderData`).
+- Each result row produces one `EmailMessage` with placeholders replaced; the body becomes `EmailMessage.message`, the subject becomes `EmailMessage.emailSubject`.
+- Rows where the `email_address` column is null or blank are skipped without raising.
+
+The same `${columnName}` convention is used by SMS campaigns against the `mobile_no` column — see [SMS campaigns](/campaigns/sms-campaigns).
+
+## TRIGGERED campaigns — `EmailCampaignDomainServiceImpl`
+
+Campaigns with `campaignType=3` are not materialised by the schedule poller. Instead `EmailCampaignDomainServiceImpl` registers business-event listeners (via `BusinessEventNotifierService`) for the events listed in `paramValue`/`stretchyReportParamMap`; when a matching event fires (for example a loan disbursal), the service runs the business-rule report scoped to the event's entity id, interpolates the template, and inserts an `EmailMessage` ready for `ExecuteEmailTasklet` to send.
+
+See [Business events](/runtime/business-events) for the event catalogue, and [Hooks overview](/hooks/overview) for the broader hook system.
+
+## `previous_run_*` columns
+
+After every materialisation pass the write service updates:
+
+- `previous_run_status` — `"success"` or `"error"`.
+- `previous_run_error_log` — full stack trace when an exception is caught.
+- `previous_run_error_message` — short message extracted from the exception.
+
+These power the UI's "last run" indicator and are surfaced in `EmailCampaignTimeLine`.
+
+## Errors
+
+| Exception | When |
+|---|---|
+| `EmailCampaignNotFound` | `GET/PUT/DELETE` against an unknown id |
+| `EmailCampaignMustBeClosedToEditException` | `PUT` while status is `ACTIVE` or `PENDING` after activation |
+| `EmailCampaignMustBeClosedToBeDeletedException` | `DELETE` while not `CLOSED` |
+| `EmailBusinessRuleNotFound` | `businessRuleId` references an unknown report |
+| `PlatformApiDataValidationException` | `EmailCampaignValidator` rejected the payload, or the campaign rejected the transition (`error.msg.campaign.already.active`, `error.msg.campaign.must.be.closed`, …) |
+
+## Related references
+
+- SMTP server configuration consumed by every send: [Email configuration](/campaigns/email-configuration).
+- The five Spring Batch jobs (`EXECUTE_EMAIL`, `UPDATE_EMAIL_OUTBOUND_WITH_CAMPAIGN_MESSAGE`, etc.): [Campaign jobs](/campaigns/campaign-jobs).
+- The `Report` aggregate that backs `businessRuleId` and `stretchyReport`: [Reports](/dataqueries/reports).
+- The matching SMS pipeline: [SMS campaigns](/campaigns/sms-campaigns).
+- All campaign REST endpoints in one place: [Hooks and messaging APIs](/api/hooks-and-messaging-apis).
+- The dispatcher that fans `EMAIL_CAMPAIGN.*` commands out to handlers: [Command handlers](/command/handlers).

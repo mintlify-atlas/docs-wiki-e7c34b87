@@ -1,0 +1,325 @@
+---
+title: "Web Application Config: Component Scan, Jersey, and CORS"
+sidebarTitle: "Web Config"
+description: "FineractWebApplicationConfiguration imports, auto-config exclusions, JerseyConfig ResourceConfig registration, and the CORS source for both auth modes."
+---
+
+This page describes how Apache Fineract's HTTP surface is composed inside
+`fineract-provider`. Four moving parts come together:
+
+1. `FineractWebApplicationConfiguration` — the top-level `@Configuration` that
+   tells Spring Boot which auto-configurations to skip and where to scan.
+2. `JerseyConfig` — the JAX-RS `ResourceConfig` that registers every
+   `@Path`-annotated bean.
+3. The `CorsConfigurationSource` bean produced by `SecurityConfig` (or
+   `AuthorizationServerConfig`) and applied to the `SecurityFilterChain`.
+4. Spring Boot's embedded Tomcat (selected automatically by the
+   `spring-boot-starter-web` + `spring-boot-starter-jersey` dependencies).
+
+For OAuth2-specific filter chain details, see
+[Provider Security Config](/provider/security-config). For the JAX-RS framework
+overview, see [Jersey JAX-RS](/runtime/jersey-jaxrs).
+
+## FineractWebApplicationConfiguration — the master switch
+
+Source:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/boot/FineractWebApplicationConfiguration.java`
+
+```java
+@Configuration
+@EnableAutoConfiguration(exclude = {
+        DataSourceAutoConfiguration.class,
+        HibernateJpaAutoConfiguration.class,
+        DataSourceTransactionManagerAutoConfiguration.class,
+        GsonAutoConfiguration.class,
+        JdbcTemplateAutoConfiguration.class,
+        LiquibaseAutoConfiguration.class })
+@EnableTransactionManagement
+@EnableWebSecurity
+@EnableConfigurationProperties({ FineractProperties.class, LiquibaseProperties.class })
+@ComponentScan(basePackages = "org.apache.fineract.**")
+@IntegrationComponentScan(basePackages = "org.apache.fineract.**")
+@Conditional(FineractWebApplicationCondition.class)
+@Slf4j
+public abstract class FineractWebApplicationConfiguration implements InitializingBean {
+
+    @Override
+    public void afterPropertiesSet() throws Exception {
+        log.warn("Fineract is running in web application mode");
+    }
+}
+```
+
+### Auto-configuration exclusions
+
+| Excluded class | Why |
+| --- | --- |
+| `DataSourceAutoConfiguration` | Fineract builds its own `HikariDataSource` in `HikariCpConfig` and wraps it in a per-tenant `RoutingDataSource`. Letting Spring Boot create one would mask the routing logic. |
+| `HibernateJpaAutoConfiguration` | Fineract uses EclipseLink — not Hibernate — via `JPAConfig.createJpaVendorAdapter()` returning `EclipseLinkJpaVendorAdapter`. |
+| `DataSourceTransactionManagerAutoConfiguration` | The transaction manager comes from `JpaBaseConfiguration` (inherited by `JPAConfig`), bound to the EclipseLink `EntityManagerFactory`. |
+| `GsonAutoConfiguration` | Fineract has its own `ToApiJsonSerializer<T>` and a configured `GoogleGsonSerializerHelper` with custom date adapters. Letting Boot wire a default `Gson` would shadow these. |
+| `JdbcTemplateAutoConfiguration` | `JdbcConfig` builds `JdbcTemplate` and `NamedParameterJdbcTemplate` explicitly against the `RoutingDataSource`. |
+| `LiquibaseAutoConfiguration` | Liquibase is driven manually by `tenantDatabaseUpgradeService` (`fineract-core`) so it can run per-tenant. The auto-configured single-DataSource Liquibase would clash. |
+
+The non-excluded auto-configurations still fire — Tomcat, Jackson, Jersey,
+Actuator, Cache (when no `CacheManager` is defined), Mail, Multipart and so on.
+
+### Component scan reach
+
+```
+@ComponentScan(basePackages = "org.apache.fineract.**")
+@IntegrationComponentScan(basePackages = "org.apache.fineract.**")
+```
+
+Two scans cover *all* sibling modules. Every Gradle module pulled in by
+`fineract-provider/dependencies.gradle` ends up on the classpath, and any
+`@Service`, `@Component`, `@Repository` annotated class there is registered.
+`@IntegrationComponentScan` is the Spring Integration variant — it discovers
+`@MessagingGateway` interfaces used by the external-event JMS producer and the
+COB batch trigger gateway.
+
+### Why the class is abstract
+
+The Javadoc comment in the source reads:
+
+> The class needs to be abstract for some reason, otherwise the tests start to
+> fail...
+
+In practice, Spring's test slices (e.g. `@SpringBootTest(classes = ...)`)
+subclass this configuration to override conditions. Making the class abstract
+prevents a non-test instance from being instantiated alongside the test
+subclass.
+
+## JerseyConfig — the JAX-RS bridge
+
+Source:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/jersey/JerseyConfig.java`
+
+```java
+@Configuration(proxyBeanMethods = false)
+@ApplicationPath("/api")
+public class JerseyConfig extends ResourceConfig {
+
+    JerseyConfig() {
+        register(org.glassfish.jersey.media.multipart.MultiPartFeature.class);
+        register(new AbstractBinder() {
+            @Override
+            protected void configure() {
+                bind(PageableParamProvider.class).to(ValueParamProvider.class).in(Singleton.class);
+            }
+        });
+        register(org.glassfish.jersey.server.validation.ValidationFeature.class);
+        property(ServerProperties.WADL_FEATURE_DISABLE, true);
+    }
+
+    @Autowired
+    ApplicationContext appCtx;
+
+    @PostConstruct
+    public void setup() {
+        appCtx.getBeansWithAnnotation(Path.class).values().forEach(this::register);
+        appCtx.getBeansWithAnnotation(Provider.class).values().forEach(this::register);
+    }
+}
+```
+
+### What this does
+
+- **`@ApplicationPath("/api")`** — JAX-RS mounts at `/api/**`. The full URL for
+  a typical endpoint becomes `/api/v1/clients`. The
+  `PathPatternRequestMatcher` used by `SecurityConfig` matches the same prefix.
+- **`extends ResourceConfig`** — Jersey's programmatic configuration entry. The
+  Spring Boot `spring-boot-starter-jersey` integration looks up a `ResourceConfig`
+  bean and uses it to drive the Jersey servlet.
+- **`proxyBeanMethods = false`** — micro-optimization; this `@Configuration`
+  exposes no `@Bean` methods, so no CGLIB proxy is needed.
+
+### Features and providers registered up-front
+
+| Registration | Purpose |
+| --- | --- |
+| `MultiPartFeature` | Enables `multipart/form-data` parsing — needed for document uploads, image uploads, bulk import. |
+| `PageableParamProvider` → `ValueParamProvider` | Custom value-param injector that binds `Pageable` query params (`page`, `size`, `sort`) into resource method parameters. |
+| `ValidationFeature` | Enables Bean Validation (`@Valid`, `@NotNull`) on resource method parameters. |
+| `WADL_FEATURE_DISABLE` | Turns off Jersey's WADL generation. Fineract uses Swagger / OpenAPI instead. |
+
+### Dynamic registration of every `@Path` and `@Provider` bean
+
+The clever bit is in `@PostConstruct`:
+
+```java
+appCtx.getBeansWithAnnotation(Path.class).values().forEach(this::register);
+appCtx.getBeansWithAnnotation(Provider.class).values().forEach(this::register);
+```
+
+Jersey normally scans the classpath for `@Path` classes, but Fineract's
+resources are also Spring beans (they have `@Autowired` dependencies). The fix
+is to let Spring instantiate them — Spring's component scan picks them up
+across every Gradle module — and then ask the `ApplicationContext` for every
+`@Path`-annotated bean *instance* and register that *instance* with Jersey.
+
+The downstream effect: `LoansApiResource`, `ClientsApiResource`,
+`JournalEntriesApiResource`, `ConfigureBusinessStepApiResource`, … every
+resource class — wherever it physically lives in the Gradle graph — is
+registered with the single `JerseyConfig`. Same for `@Provider`-annotated
+exception mappers, message-body readers/writers, and so on.
+
+### Where Jersey is *not* invoked
+
+Spring Boot still has its own `DispatcherServlet`. Anything not under `/api`
+falls through to Spring MVC. Examples:
+
+- `/swagger-ui/**` — Spring MVC + springdoc.
+- `/login`, `/oauth2/**` — the OAuth2 authorization server endpoints.
+- `/actuator/**` — Spring Boot Actuator.
+- `/legacy-docs/apiLive.htm` — a static HTML file under `src/main/resources/static`.
+
+The `AuthorizationServerConfig.publicEndpoints` security matcher permits
+exactly this list.
+
+## CORS — built in security configs, applied to filter chains
+
+Cross-Origin Resource Sharing is controlled by the
+`fineract.security.cors.*` properties on `FineractProperties`. The actual
+`CorsConfigurationSource` bean is produced inside both security configurations:
+
+In `SecurityConfig` (basic-auth path):
+
+```java
+@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration config = new CorsConfiguration();
+    FineractProperties.CorsProperties corsConfiguration = fineractProperties.getSecurity().getCors();
+    config.setAllowedOriginPatterns(corsConfiguration.getAllowedOriginPatterns());
+    config.setAllowedMethods(corsConfiguration.getAllowedMethods());
+    config.setAllowedHeaders(corsConfiguration.getAllowedHeaders());
+    config.setExposedHeaders(corsConfiguration.getExposedHeaders());
+    config.setAllowCredentials(corsConfiguration.isAllowCredentials());
+
+    UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/**", config);
+    return source;
+}
+```
+
+And it is opted into the filter chain only when enabled:
+
+```java
+if (fineractProperties.getSecurity().getCors().isEnabled()) {
+    http.cors(Customizer.withDefaults());
+}
+```
+
+`http.cors(Customizer.withDefaults())` resolves the `CorsConfigurationSource`
+bean from the application context, so any subsequent OPTIONS preflight or
+cross-origin request is handled. The `SecurityConfig` filter chain *also*
+explicitly permits all `OPTIONS /api/**` requests:
+
+```java
+auth.requestMatchers(API_MATCHER.matcher(HttpMethod.OPTIONS, "/api/**")).permitAll()
+```
+
+— so OPTIONS bypasses authentication entirely, which is what browsers expect
+for a CORS preflight.
+
+`AuthorizationServerConfig` does the same in its `publicEndpoints`,
+`authorizationServerSecurityFilterChain` and `protectedEndpoints` chains.
+
+### CORS properties
+
+The structure of `FineractProperties.CorsProperties` (and therefore the
+`application.properties` keys) is:
+
+```
+fineract.security.cors.enabled
+fineract.security.cors.allowed-origin-patterns[]
+fineract.security.cors.allowed-methods[]
+fineract.security.cors.allowed-headers[]
+fineract.security.cors.exposed-headers[]
+fineract.security.cors.allow-credentials
+```
+
+The default `application.properties` ships sensible production values
+(`allowed-origin-patterns: "*"`, GET/POST/PUT/DELETE/OPTIONS, etc.). Tighten
+these before exposing the API publicly.
+
+## Tomcat — what fineract-provider does *not* configure
+
+There is no `TomcatServletWebServerFactory` bean in `fineract-provider`. The
+embedded servlet container is whatever Spring Boot picks based on classpath
+content. Because `spring-boot-starter-jersey` and `spring-boot-starter-web`
+both pull Tomcat (the default), Tomcat is what runs.
+
+The two knobs Fineract reads from `ServerProperties` are:
+
+- `server.port` — bound by `spring-boot-starter-web` auto-config.
+- `server.ssl.*` — used by `SecurityConfig` to insert
+  `requiresChannel(... requiresSecure())` when SSL is enabled:
+
+```java
+if (serverProperties.getSsl().isEnabled()) {
+    http.requiresChannel(channel ->
+        channel.requestMatchers(API_MATCHER.matcher("/api/**")).requiresSecure());
+}
+```
+
+For HSTS:
+
+```java
+if (fineractProperties.getSecurity().getHsts().isEnabled()) {
+    http.requiresChannel(channel -> channel.anyRequest().requiresSecure())
+        .headers(headers -> headers.httpStrictTransportSecurity(
+            hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31536000)));
+}
+```
+
+That covers the entire HTTP transport layer configured by `fineract-provider`.
+
+## Servlet filter ordering
+
+The `SecurityFilterChain` chains a long series of custom filters after Spring
+Security's built-ins. The full sequence for the basic-auth chain is (top is
+earliest):
+
+```
+1.  SecurityContextHolderFilter           (Spring Security built-in)
+2.  TenantAwareBasicAuthenticationFilter  (custom — resolves tenant + auth)
+3.  ExceptionTranslationFilter            (Spring Security built-in)
+4.  RequestResponseFilter                 (custom — logs request/response)
+5.  CorrelationHeaderFilter               (custom — X-Correlation-Id MDC)
+6.  CallerIpTrackingFilter                (optional, fineract.ip-tracking.enabled)
+7.  FineractInstanceModeApiFilter         (custom — read/write-only mode gate)
+8.  LoanCOBApiFilter                      (optional — blocks /loans/* during COB)
+9.  ProgressiveLoanModelCheckerFilter     (custom)
+10. IdempotencyStoreFilter                (custom — Idempotency-Key dedup)
+11. TwoFactorAuthenticationFilter         (optional, fineract.security.twoFactor.enabled)
+```
+
+The ordering matters because `CorrelationHeaderFilter` *must* run before
+`CallerIpTrackingFilter` — both write to MDC, and the IP tracker reads the
+correlation ID. See [Logging and Correlation](/runtime/logging-and-correlation).
+
+## Static resources
+
+`fineract-provider/src/main/resources/static/` ships a small set of static
+pages. The relevant ones:
+
+- `apiLive.htm` (under `/legacy-docs/`) — the legacy API documentation HTML.
+- The Swagger UI assets are served by `springdoc` at `/swagger-ui/**`.
+
+Both paths are explicitly opted out of authentication in
+`AuthorizationServerConfig.publicEndpoints` and effectively bypassed in
+`SecurityConfig` (the basic-auth chain's `securityMatcher` is `/api/**`, so any
+non-`/api/*` URL is outside its scope).
+
+## Related pages
+
+- [Provider Overview](/provider/overview) — where this module sits.
+- [Server Application Entrypoint](/provider/server-application-entrypoint) — what
+  imports this configuration.
+- [Provider Security Config](/provider/security-config) — the filter chains
+  built on top.
+- [Jersey JAX-RS](/runtime/jersey-jaxrs) — JAX-RS deep dive across the runtime.
+- [Spring Boot Configuration](/runtime/spring-boot-configuration) — layered
+  property sources.
+- [/security/security-config](/security/security-config) — security architecture.

@@ -1,0 +1,526 @@
+---
+title: "LoanWritePlatformService Active-Loan Operations Guide"
+sidebarTitle: "Write Service"
+description: "Apache Fineract LoanWritePlatformServiceJpaRepositoryImpl: disburse, repay, waive, write-off, charge-off, foreclose, refund, chargeback, adjust."
+---
+
+`LoanWritePlatformService` owns the **post-approval** half of the loan lifecycle in Apache Fineract: disbursement, repayments, waivers, write-offs, charge-off, foreclosure, refunds, charge-payment, chargebacks, transaction adjustments, loan-officer reassignment, transfer-on-hold flows. Once a loan is in status `ACTIVE` (or `OVERPAID` / `CLOSED_*`), every write goes through here.
+
+The interface is in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanWritePlatformService.java`; the JPA implementation is `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/service/LoanWritePlatformServiceJpaRepositoryImpl.java` — 3,659 lines.
+
+For the pre-active half (submit / approve / undo-approval / etc.) see [Application write service](/loan/loan-application-write-service).
+
+## Method-by-method table
+
+The interface declares 30+ methods. Listed below with their command path and one-line summary.
+
+| Method | `?command=` | One-line behaviour |
+| --- | --- | --- |
+| `disburseLoan(loanId, command, isAccountTransfer)` | `disburse` | Move money out, status `APPROVED → ACTIVE`, build `DISBURSEMENT` transaction, regenerate schedule |
+| `disburseLoan(loanId, command, isAccountTransfer, isWithoutAutoPayment)` | `disburseWithoutAutoDownPayment` | Same as above, suppresses auto-down-payment generation |
+| `disburseGLIMLoan(loanId, command)` | `disburse` on `/glimAccount/{glimId}` | Per-child disbursement loop |
+| `undoLoanDisbursal(loanId, command)` | `undodisbursal` | Reverse all disbursement-related transactions, status `ACTIVE → APPROVED` |
+| `undoGLIMLoanDisbursal(loanId, command)` | `undodisbursal` GLIM | Loop |
+| `undoLastLoanDisbursal(loanId, command)` | `undolastdisbursal` | Reverse only the most recent tranche disbursement |
+| `makeLoanRepayment(repaymentTransactionType, loanId, command, isRecoveryRepayment)` | `repayment` / `merchantIssuedRefund` / `payoutRefund` / `goodwillCredit` / `recoverypayment` | Generic repayment-shaped transaction |
+| `makeLoanRepaymentWithChargeRefundChargeType(...)` | `chargeRefund` | Same shape, carries `chargeRefundChargeType` (F/P) |
+| `makeInterestPaymentWaiver(command)` | `interestPaymentWaiver` | Interest waiver as a money-receiving transaction |
+| `makeGLIMLoanRepayment(loanId, command)` | `glimrepayment` | Splits the repayment across child loans |
+| `adjustLoanTransaction(loanId, transactionId, command)` | (no command on `POST /transactions/{txnId}`) | Reverse + create replacement transaction |
+| `chargebackLoanTransaction(loanId, transactionId, command)` | `chargeback` on existing repayment | Create `CHARGEBACK` linked via `LoanTransactionRelation` |
+| `waiveInterestOnLoan(loanId, command)` | `waiveinterest` | Create `WAIVE_INTEREST` |
+| `writeOff(loanId, command)` | `writeoff` | Status `ACTIVE → CLOSED_WRITTEN_OFF`, create `WRITEOFF` |
+| `undoWriteOff(loanId)` | `undowriteoff` | Reverse the write-off |
+| `chargeOff(command)` | `charge-off` | Flip `Loan.chargedOff = true`, create `CHARGE_OFF` |
+| `undoChargeOff(command)` | `undo-charge-off` | Reverse the charge-off |
+| `closeLoan(loanId, command)` | `close` | Force-close (with `transactionAmount` covering balance) |
+| `closeAsRescheduled(loanId, command)` | `close-rescheduled` | Status `CLOSED_RESCHEDULE_OUTSTANDING_AMOUNT` |
+| `creditBalanceRefund(loanId, command)` | `creditBalanceRefund` | Refund the overpayment on an `OVERPAID` loan |
+| `forecloseLoan(loanId, command)` | `foreclosure` | Settle all remaining installments at once |
+| `makeLoanRefund(loanId, command)` | `refundByCash` / `refundbytransfer` | `REFUND` transaction |
+| `makeRefund(loanId, loanTransactionType, command)` | `chargeRefund` etc. | Refund variant routing |
+| `makeManualInterestRefund(loanId, transactionId, command)` | `interest-refund` adjustment | Manual `INTEREST_REFUND` |
+| `markLoanAsFraud(loanId, command)` | `markAsFraud` | Flip `Loan.fraud = true` |
+| `loanReassignment(loanId, command)` | `assignloanofficer` / `unassignloanofficer` | Update `loan_officer_id` |
+| `bulkLoanReassignment(command)` | bulk variant | Loop |
+| `removeLoanOfficer(loanId, command)` | `unassignloanofficer` | Same |
+| `recoverFromGuarantor(loanId)` | `recoverGuarantees` | Pull from guarantor savings |
+| `recalculateInterest(loanId)` / `recalculateInterest(loan)` | (internal) | Triggers `LoanScheduleService.regenerateRepaymentSchedule(...)` |
+| `updateOriginalSchedule(loan)` | (internal) | Snapshot into `LoanRepaymentScheduleHistory` |
+| `initiateLoanTransfer(loan, transferDate)` / `acceptLoanTransfer(...)` / `withdrawLoanTransfer(...)` / `rejectLoanTransfer(...)` | transfer 2PC | Create the matching `INITIATE_TRANSFER`/`APPROVE_TRANSFER`/`WITHDRAW_TRANSFER`/`REJECT_TRANSFER` transactions |
+| `applyMeetingDateChanges(calendar, calendarInstances, ...)` | (internal) | Reschedule installments around new meeting dates |
+| `addAndDeleteLoanDisburseDetails(loanId, command)` | `editDisbursements` | Multi-tranche disbursement detail CRUD |
+| `updateDisbursementDateAndAmountForTranche(loanId, disbursementId, command)` | per-disbursement PUT | Single tranche edit |
+| `bulkLoanDisbursal(command, bulkDisbursalCommand, isAccountTransfer)` | bulk | Loop |
+| `makeLoanBulkRepayment(bulkRepaymentCommand)` | bulk | Loop |
+
+The handler beans that drive each are in `fineract-provider/.../portfolio/loanaccount/handler/` and follow the `@CommandType(entity = "LOAN", action = "...")` pattern documented in [Command pipeline](/command/portfolio-command-source).
+
+## Implementation collaborators
+
+```java
+@Slf4j @RequiredArgsConstructor
+public class LoanWritePlatformServiceJpaRepositoryImpl implements LoanWritePlatformService {
+
+    private final PlatformSecurityContext context;
+    private final LoanTransactionValidator              loanTransactionValidator;
+    private final LoanUpdateCommandFromApiJsonDeserializer loanUpdateCommandFromApiJsonDeserializer;
+    private final LoanRepositoryWrapper                 loanRepositoryWrapper;
+    private final LoanAccountDomainService              loanAccountDomainService;
+    private final NoteRepository                        noteRepository;
+    private final LoanTransactionRepository             loanTransactionRepository;
+    private final LoanTransactionRelationRepository     loanTransactionRelationRepository;
+    private final LoanAssembler                         loanAssembler;
+    private final CalendarInstanceRepository            calendarInstanceRepository;
+    private final PaymentDetailWritePlatformService     paymentDetailWritePlatformService;
+    private final HolidayRepositoryWrapper              holidayRepository;
+    private final ConfigurationDomainService            configurationDomainService;
+    private final WorkingDaysRepositoryWrapper          workingDaysRepository;
+    private final AccountTransfersWritePlatformService  accountTransfersWritePlatformService;
+    private final AccountTransfersReadPlatformService   accountTransfersReadPlatformService;
+    private final AccountAssociationsReadPlatformService accountAssociationsReadPlatformService;
+    private final LoanReadPlatformService               loanReadPlatformService;
+    private final FromJsonHelper                        fromApiJsonHelper;
+    private final CalendarRepository                    calendarRepository;
+    private final LoanScheduleHistoryWritePlatformService loanScheduleHistoryWritePlatformService;
+    private final LoanApplicationValidator              loanApplicationValidator;
+    private final AccountAssociationsRepository         accountAssociationRepository;
+    private final AccountTransferDetailRepository       accountTransferDetailRepository;
+    private final BusinessEventNotifierService          businessEventNotifierService;
+    private final GuarantorDomainService                guarantorDomainService;
+    private final LoanUtilService                       loanUtilService;
+    private final EntityDatatableChecksWritePlatformService entityDatatableChecksWritePlatformService;
+    private final CodeValueRepositoryWrapper            codeValueRepository;
+    private final CashierTransactionDataValidator       cashierTransactionDataValidator;
+    private final GLIMAccountInfoRepository             glimRepository;
+    private final LoanRepository                        loanRepository;
+    private final RepaymentWithPostDatedChecksAssembler repaymentWithPostDatedChecksAssembler;
+    private final PostDatedChecksRepository             postDatedChecksRepository;
+    private final LoanRepaymentScheduleInstallmentRepository loanRepaymentScheduleInstallmentRepository;
+    private final LoanLifecycleStateMachine             loanLifecycleStateMachine;
+    private final AccountLockService                    loanAccountLockService;
+    private final ExternalIdFactory                     externalIdFactory;
+    private final LoanAccrualTransactionBusinessEventService loanAccrualTransactionBusinessEventService;
+    private final ErrorHandler                          errorHandler;
+    private final LoanDownPaymentHandlerService         loanDownPaymentHandlerService;
+    private final LoanTransactionAssembler              loanTransactionAssembler;
+    private final LoanAccrualsProcessingService         loanAccrualsProcessingService;
+    private final LoanOfficerValidator                  loanOfficerValidator;
+    private final LoanDownPaymentTransactionValidator   loanDownPaymentTransactionValidator;
+    private final LoanDisbursementService               loanDisbursementService;
+    private final LoanScheduleService                   loanScheduleService;
+    private final LoanChargeValidator                   loanChargeValidator;
+    private final LoanOfficerService                    loanOfficerService;
+    private final ReprocessLoanTransactionsService      reprocessLoanTransactionsService;
+    private final LoanAccountService                    loanAccountService;
+    private final LoanJournalEntryPoster                journalEntryPoster;
+    private final LoanAdjustmentService                 loanAdjustmentService;
+    private final LoanMapper                            loanMapper;
+    private final LoanTransactionProcessingService      loanTransactionProcessingService;
+    private final LoanBalanceService                    loanBalanceService;
+    private final LoanTransactionService                loanTransactionService;
+```
+
+Two helpers are conceptually important:
+
+- **`LoanAccountDomainService`** wraps "save a loan transaction" so that journal entries, business events, and downstream listeners are all triggered consistently.
+- **`LoanTransactionProcessingService`** picks the right `LoanRepaymentScheduleTransactionProcessor` for the loan's `transactionProcessingStrategyCode` and calls `processLatestTransaction` / `reprocessLoanTransactions` on it.
+
+## Disbursal flow (`disburseLoan`)
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult disburseLoan(final Long loanId, final JsonCommand command,
+        Boolean isAccountTransfer, Boolean isWithoutAutoDownPayment) {
+
+    Loan loan = this.loanAssembler.assembleFrom(loanId);
+    // 1) Validation
+    loanTransactionValidator.validateDisbursement(command, loan);
+    // 2) Resolve amounts from command + loan
+    final LocalDate actualDisbursementDate =
+        command.localDateValueOfParameterNamed("actualDisbursementDate");
+    final BigDecimal transactionAmount =
+        command.bigDecimalValueOfParameterNamed("transactionAmount");
+    // 3) Build payment detail + external id
+    PaymentDetail paymentDetail = paymentDetailWritePlatformService.createAndPersistPaymentDetail(command, …);
+    ExternalId txnExternalId = externalIdFactory.createFromCommand(command, …);
+    // 4) Optionally take charges due at disbursement
+    //    LoanTransaction repaymentAtDisbursement = …; (Type 5)
+    // 5) Build DISBURSEMENT transaction (Type 1)
+    LoanTransaction disbursement = LoanTransaction.disbursement(loan, …, txnExternalId, loanTotalOverpaid);
+    // 6) Call Loan.disburse(...) → updates LoanSummary, status → ACTIVE, regenerates schedule
+    // 7) Auto-down-payment, unless isWithoutAutoDownPayment
+    // 8) Account transfer (if isAccountTransfer)
+    // 9) businessEventNotifierService.notifyPostBusinessEvent(new LoanDisbursalBusinessEvent(loan));
+    // 10) Post journal entries
+    // 11) Return CommandProcessingResult
+}
+```
+
+Key invariants:
+
+- **Status guard**: must be `APPROVED` (single-disburse) or already `ACTIVE` (tranche disbursement).
+- **`Loan.netDisbursalAmount`** is `disbursed − sum(charges due at disbursement)`. Charges of `chargeTime = DISBURSEMENT` (1) auto-generate a `REPAYMENT_AT_DISBURSEMENT` (type 5) transaction.
+- **Auto-down-payment**: if `LoanProduct.enableAutoRepaymentForDownPayment = true` and `isWithoutAutoDownPayment != true`, `LoanDownPaymentHandlerService` creates the `DOWN_PAYMENT` (type 28) transaction immediately.
+- **Schedule regeneration**: for tranche loans, every tranche disbursement re-runs the generator from the disbursement date.
+
+`disburseGLIMLoan` is a thin loop over `findByGlimId(parentLoanId)`. `bulkLoanDisbursal` reads a collection-sheet payload and loops too.
+
+## Repayment flow (`makeLoanRepayment`)
+
+The canonical method:
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult makeLoanRepayment(LoanTransactionType repaymentTransactionType, Long loanId,
+        JsonCommand command, boolean isRecoveryRepayment) {
+    final String chargeRefundChargeType = null;
+    return makeLoanRepaymentWithChargeRefundChargeType(repaymentTransactionType, loanId, command,
+                                                       isRecoveryRepayment, chargeRefundChargeType);
+}
+```
+
+Inside, the work is:
+
+1. Validation (`LoanTransactionValidator.validateRepayment`).
+2. Build a `LoanTransaction` via `LoanTransaction.repaymentType(repaymentType, …)`.
+3. Decide if reverse-replay is needed (back-dated, or interest recalculation enabled, or pre-existing transactions after this date).
+4. If yes: call `reprocessLoanTransactionsService.reprocessLoanTransactions(loan, newTxn)`. If no: call `loanTransactionProcessingService.processLatestTransaction(...)`.
+5. Update `Loan.summary` via `LoanBalanceService`.
+6. Persist the transaction and its `LoanTransactionToRepaymentScheduleMapping` rows.
+7. If the loan is now fully paid → state machine to `CLOSED_OBLIGATIONS_MET`; if overpaid → `OVERPAID`.
+8. Post journal entries (`journalEntryPoster.postJournalEntriesForLoanTransaction`).
+9. Emit business event (`LoanTransactionMakeRepaymentPostBusinessEvent` and similar per-type variants).
+
+The same code path serves `REPAYMENT`, `MERCHANT_ISSUED_REFUND`, `PAYOUT_REFUND`, `GOODWILL_CREDIT`, `RECOVERY_REPAYMENT`, and `INTEREST_PAYMENT_WAIVER` — the `LoanTransactionType` enum value is the only difference.
+
+### Interest-payment-waiver special path
+
+The path for `makeInterestPaymentWaiver(command)` has a small wrinkle:
+
+```java
+private void recalculateLoanWithInterestPaymentWaiverTxn(Loan loan, LoanTransaction newWaiver) {
+    LocalDate recalculateFrom = null;
+    LocalDate transactionDate = newWaiver.getTransactionDate();
+    if (loan.isInterestBearingAndInterestRecalculationEnabled()) {
+        recalculateFrom = transactionDate;
+    }
+    final ScheduleGeneratorDTO scheduleGeneratorDTO =
+        this.loanUtilService.buildScheduleGeneratorDTO(loan, recalculateFrom, null);
+
+    newWaiver.updateLoan(loan);
+
+    final boolean isLatest = loanTransactionService.isChronologicallyLatestRepaymentOrWaiver(loan, newWaiver);
+    final LoanRepaymentScheduleInstallment currentInst =
+        loan.fetchLoanRepaymentScheduleInstallmentByDueDate(transactionDate);
+    boolean reprocess = true;
+    if (!loan.isForeclosure() && isLatest && DateUtils.isEqualBusinessDate(transactionDate)
+            && currentInst != null
+            && currentInst.getTotalOutstanding(loan.getCurrency())
+                          .isEqualTo(newWaiver.getAmount(loan.getCurrency()))) {
+        reprocess = false;
+    }
+    if (isLatest && (!reprocess || !loan.isInterestBearingAndInterestRecalculationEnabled()) && !loan.isForeclosure()) {
+        loanTransactionProcessingService.processLatestTransaction(
+            loan.getTransactionProcessingStrategyCode(), newWaiver,
+            new TransactionCtx(loan.getCurrency(), loan.getRepaymentScheduleInstallments(),
+                               loan.getActiveCharges(), new MoneyHolder(loan.getTotalOverpaidAsMoney()),
+                               null, loan.getActiveLoanTermVariations()));
+        // …
+    }
+}
+```
+
+The takeaway: when interest recalculation is enabled, **every** transaction touching interest may cascade into a full reschedule from the transaction date forward.
+
+## Adjust / replay (`adjustLoanTransaction`)
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult adjustLoanTransaction(Long loanId, Long transactionId, JsonCommand command) { … }
+```
+
+The "adjustment" is really "reverse + re-create":
+
+1. Find the original `LoanTransaction`. Reject if already reversed or if it's not one of the adjustable types.
+2. Call `originalTxn.reverse(reversalExternalId)`. (`reversed = true`, `reversedOnDate = today`, mappings cleared.)
+3. Build a new replacement transaction from `command` (same type as the original by default — unless the caller specified a different type).
+4. Trigger `reprocessLoanTransactions(...)` because the change is back-dated.
+5. Link both via `LoanTransactionRelation.linkToTransaction(newTxn, originalTxn, ADJUSTMENT)`.
+6. Persist, journal-post, business-event (`LoanAdjustTransactionBusinessEvent`).
+
+The `LoanAdjustmentService` is delegated to for the heavy plumbing.
+
+## Chargeback (`chargebackLoanTransaction`)
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult chargebackLoanTransaction(Long loanId, Long transactionId, JsonCommand command) { … }
+```
+
+Builds a `LoanTransaction.chargeback(...)` (type 25) that re-debits the principal of an earlier repayment. `LoanTransactionRelation.linkToTransaction(chargeback, originalRepayment, CHARGEBACK)` is recorded so audit can walk back. The chargeback amount cannot exceed the repayment's principal portion.
+
+## Write-off / undo-write-off
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult writeOff(Long loanId, JsonCommand command) {
+    // 1) validate (transaction date >= last user transaction, not already written off, not closed)
+    // 2) loan.closeAsWrittenOff(...) → state machine to CLOSED_WRITTEN_OFF; LoanTransaction.writeoff(...)
+    // 3) reverse accrued-but-unposted accruals after the write-off date
+    // 4) journalEntryPoster.postJournalEntriesForLoanTransaction
+    // 5) business event LoanCloseAsWriteOffBusinessEvent
+}
+
+@Override
+public CommandProcessingResult undoWriteOff(Long loanId) {
+    // 1) Find the most recent WRITEOFF transaction; reverse it.
+    // 2) Restore status to ACTIVE
+    // 3) Re-accrue (loanAccrualsProcessingService.reprocessAccruals)
+    // 4) Re-replay subsequent transactions
+}
+```
+
+## Charge-off / undo-charge-off
+
+```java
+@Override @Transactional
+public CommandProcessingResult chargeOff(JsonCommand command) {
+    loanTransactionValidator.validateChargeOffTransaction(command.json());
+
+    final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+    final ExternalId txnExternalId  = externalIdFactory.createFromCommand(command, "externalId");
+    final AppUser currentUser       = getAppUserIfPresent();
+
+    Loan loan = loanAssembler.assembleFrom(command.getLoanId());
+    if (!loan.isOpen()) { throw new GeneralPlatformDomainRuleException("error.msg.loan.is.not.active", …); }
+    if (loan.isChargedOff()) { throw new GeneralPlatformDomainRuleException("error.msg.loan.is.already.charged.off", …); }
+    if (DateUtils.isBefore(transactionDate, loan.getLastUserTransactionDate())) { … }
+    if (DateUtils.isDateInTheFuture(transactionDate)) { … }
+    if (loan.hasMonetaryActivityAfter(transactionDate)) { … }
+
+    businessEventNotifierService.notifyPreBusinessEvent(new LoanChargeOffPreBusinessEvent(loan));
+
+    if (command.hasParameter("chargeOffReasonId")) {
+        Long chargeOffReasonId = command.longValueOfParameterNamed("chargeOffReasonId");
+        CodeValue chargeOffReason = this.codeValueRepository
+            .findOneByCodeNameAndIdWithNotFoundDetection("ChargeOffReasons", chargeOffReasonId);
+        loan.markAsChargedOff(transactionDate, currentUser, chargeOffReason);
+    } else {
+        loan.markAsChargedOff(transactionDate, currentUser, null);
+    }
+
+    // Reverse all ACCRUAL / ACCRUAL_ADJUSTMENT transactions after the charge-off date
+    loan.getLoanTransactions().stream()
+        .filter(lt -> lt.isAccrual() || lt.isAccrualAdjustment())
+        .filter(t -> loan.getLoanProductRelatedDetail().isInterestRecognitionOnDisbursementDate()
+                ? !DateUtils.isBefore(t.getTransactionDate(), transactionDate)
+                : DateUtils.isAfter(t.getTransactionDate(), transactionDate))
+        .forEach(t -> {
+            t.reverse();
+            journalEntryPoster.postJournalEntriesForLoanTransaction(t, false, false);
+        });
+
+    // Create CHARGE_OFF transaction (type 27)
+    LoanTransaction chargeOff = LoanTransaction.chargeOff(loan, transactionDate, txnExternalId);
+    loanTransactionRepository.saveAndFlush(chargeOff);
+
+    journalEntryPoster.postJournalEntriesForLoanTransaction(chargeOff, false, false);
+
+    businessEventNotifierService.notifyPostBusinessEvent(new LoanChargeOffPostBusinessEvent(chargeOff));
+    return new CommandProcessingResultBuilder().withLoanId(loan.getId()).build();
+}
+```
+
+Note that **charge-off doesn't change `loanStatus`** — the loan stays `ACTIVE`. It flips `Loan.chargedOff = true`, sets `chargedOffOnDate`, and triggers an accounting reclass via the journal entry poster. See [Accounting processors](/accounting/accounting-processors) for the reclass mapping.
+
+## Goodwill credit / merchant-issued refund
+
+These are not in their own methods — they piggyback on `makeLoanRepayment` with the corresponding `LoanTransactionType`:
+
+```java
+// Resource:
+} else if (CommandParameterUtil.is(commandParam, "goodwillCredit")) {
+    commandRequest = builder.loanGoodwillCreditTransaction(resolvedLoanId).build();
+} else if (CommandParameterUtil.is(commandParam, "merchantIssuedRefund")) {
+    commandRequest = builder.loanMerchantIssuedRefundTransaction(resolvedLoanId).build();
+} else if (CommandParameterUtil.is(commandParam, "payoutRefund")) {
+    commandRequest = builder.loanPayoutRefundTransaction(resolvedLoanId).build();
+}
+
+// Handler:
+loanWritePlatformService.makeLoanRepayment(LoanTransactionType.GOODWILL_CREDIT, loanId, command, false);
+```
+
+The transaction's monetary effect is identical to a repayment; only the type field on `LoanTransaction` differs. This matters for accounting (different journal mappings) and for reporting.
+
+## Foreclosure
+
+`forecloseLoan(loanId, command)` settles the entire remaining balance in one transaction:
+
+1. Validate (loan must be active, not charge-off, no future transactions).
+2. Compute total outstanding (`Loan.getTotalOutstanding`).
+3. Build a `REPAYMENT` for that exact amount.
+4. Process via `LoanRepaymentScheduleTransactionProcessor`.
+5. Mark all future installments `obligationsMet = true`, `obligationsMetOnDate = today`.
+6. Set `Loan.loanSubStatus = FORECLOSED`, state machine `→ CLOSED_OBLIGATIONS_MET`.
+7. Emit `LoanForeclosurePostBusinessEvent`.
+
+## Loan reassignment (officer change)
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult loanReassignment(Long loanId, JsonCommand command) {
+    // 1) Find loan, close current officer assignment history
+    // 2) Open a new LoanOfficerAssignmentHistory row
+    // 3) Set loan.loanOfficer = new
+    // 4) Emit LoanReassignmentBusinessEvent
+}
+```
+
+`bulkLoanReassignment(command)` does the same for an array of `loanIds` in one transaction.
+
+## Disbursement detail editing
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult addAndDeleteLoanDisburseDetails(Long loanId, JsonCommand command) { … }
+
+@Transactional
+@Override
+public CommandProcessingResult updateDisbursementDateAndAmountForTranche(Long loanId, Long disbursementId, JsonCommand command) { … }
+```
+
+Both call `LoanDisbursementService` which:
+
+1. Parses the JSON array of tranches.
+2. Compares against `Loan.disbursementDetails`.
+3. Adds new rows; marks removed rows for deletion (must be unrealised, i.e. `actualDisbursementDate = null`).
+4. Regenerates the schedule.
+5. Persists.
+
+The REST handler is [Loan disbursement API](/loan/loan-disbursement-api).
+
+## Refund (`makeLoanRefund`, `makeRefund`)
+
+Two flavours:
+
+- **`makeLoanRefund(loanId, command)`** → builds a `REFUND` (type 16). The `?command=refundByCash` and `?command=refundbytransfer` map here; the latter triggers an account transfer.
+- **`makeRefund(loanId, loanTransactionType, command)`** → polymorphic, used for `CHARGE_REFUND`, `INTEREST_REFUND`, etc.
+
+`makeManualInterestRefund(loanId, transactionId, command)` builds an `INTEREST_REFUND` (type 33) that is linked back to a specific original repayment via `LoanTransactionRelation` of type `RELATED`.
+
+## Credit-balance refund
+
+For loans in status `OVERPAID`:
+
+```java
+@Transactional
+@Override
+public CommandProcessingResult creditBalanceRefund(Long loanId, JsonCommand command) { … }
+```
+
+Creates a `CREDIT_BALANCE_REFUND` (type 20) for the overpaid amount; if the refund amount equals `Loan.totalOverpaid`, the state machine moves to `CLOSED_OBLIGATIONS_MET`. Otherwise the loan stays `OVERPAID` with a smaller `totalOverpaid`.
+
+## Mark as fraud
+
+```java
+@Override @Transactional
+public CommandProcessingResult markLoanAsFraud(Long loanId, JsonCommand command) {
+    // 1) Loan loan = retrieveLoanBy(loanId)
+    // 2) loan.setFraud(true)
+    // 3) businessEventNotifierService.notifyPostBusinessEvent(new LoanMarkAsFraudBusinessEvent(loan))
+}
+```
+
+The flag is consumed by accounting (different journal mapping) and by COB (`AbstractLoanItemProcessor` may skip fraud-flagged loans).
+
+## Charge writes
+
+The loan-write-service also handles charge-mutation that is not exposed through the dedicated `LoanChargeWritePlatformService`. Specifically:
+
+- **Charge waiver against a charge transaction** (when the wave is triggered through `?command=waive` on `/transactions`).
+- **Charge-off impact on charges** (mark accrued charges reversed if applicable).
+
+`LoanChargeWritePlatformServiceImpl` (in `fineract-provider/.../service/`) handles the dedicated charge endpoints. See [Loan charges API](/loan/loan-charges-api).
+
+## Transaction boundary
+
+Every public method is `@Transactional` and `@Override`. Optimistic locking on `Loan.version` + `LoanTransaction.version` enforces concurrency safety; conflicts surface as HTTP 409 (see [Error handling](/runtime/error-handling)).
+
+For long-running paths (foreclosure, mass-replay) the implementation uses `AccountLockService.acquireLoanLock(loanId)` to serialise mutation of a single loan across requests.
+
+## Re-process service
+
+`ReprocessLoanTransactionsService` is the bridge between this service and the transaction processors:
+
+```java
+public interface ReprocessLoanTransactionsService {
+    void reprocessTransactions(Loan loan);
+    void reprocessLoanTransactions(Loan loan, LoanTransaction newTransaction);
+    ChangedTransactionDetail reprocessLoanTransactionsForChargeOff(Loan loan, LocalDate chargeOffDate);
+    // …
+}
+```
+
+It is invoked on every back-dated mutation and every charge-off / undo-charge-off. The processor's `reprocessLoanTransactions(...)` does the actual reverse-replay. See [Transaction processors](/loan/transaction-processors).
+
+## Journal entry posting
+
+`LoanJournalEntryPoster` is called after every successful mutation:
+
+```java
+journalEntryPoster.postJournalEntriesForLoanTransaction(loanTransaction, isAccountTransfer, isLoanProductChargeRefundAccountingEnabled);
+journalEntryPoster.postJournalEntriesForLoanChargeOff(loan, chargeOffTransaction);
+journalEntryPoster.postJournalEntriesForUndoChargeOff(loan, reversedChargeOffTransaction);
+```
+
+Internally it delegates to the `AccountingProcessorForLoan` chain — see [Accounting processors](/accounting/accounting-processors).
+
+## Business events
+
+Every public method ends with `businessEventNotifierService.notifyPostBusinessEvent(...)`. The catalogue (selection):
+
+- `LoanDisbursalBusinessEvent`, `LoanUndoDisbursalBusinessEvent`
+- `LoanTransactionMakeRepaymentPostBusinessEvent`
+- `LoanInterestWaiverBusinessEvent`
+- `LoanCloseAsWriteOffBusinessEvent`, `LoanUndoWrittenOffBusinessEvent`
+- `LoanChargeOffPreBusinessEvent`, `LoanChargeOffPostBusinessEvent`, `LoanUndoChargeOffBusinessEvent`
+- `LoanForeclosurePostBusinessEvent`
+- `LoanAdjustTransactionBusinessEvent`
+- `LoanChargebackTransactionBusinessEvent`
+- `LoanReassignmentBusinessEvent`
+- `LoanMarkAsFraudBusinessEvent`
+- `LoanRefundPostBusinessEvent`
+
+Listeners subscribe via Spring's event-bus. See [Business events](/core/business-events).
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Application write service" icon="file-pen" href="/loan/loan-application-write-service">
+    The pre-active half (submit, modify, approve, undo-approval, reject, withdraw).
+  </Card>
+  <Card title="Loan transactions" icon="arrow-right-arrow-left" href="/loan/loan-transactions">
+    Every `LoanTransactionType` created by this service.
+  </Card>
+  <Card title="Transaction processors" icon="filter" href="/loan/transaction-processors">
+    How `processLatestTransaction` and `reprocessLoanTransactions` allocate amounts.
+  </Card>
+  <Card title="Loans API" icon="globe" href="/loan/loans-api">
+    The REST endpoints (`POST /v1/loans/{loanId}?command=...`) that dispatch into this service.
+  </Card>
+  <Card title="Loan transactions API" icon="globe" href="/loan/loan-transactions-api">
+    The `POST /v1/loans/{loanId}/transactions?command=...` switchboard.
+  </Card>
+  <Card title="Accounting processors" icon="book" href="/accounting/accounting-processors">
+    `LoanJournalEntryPoster` and the per-type journal mappings.
+  </Card>
+</CardGroup>

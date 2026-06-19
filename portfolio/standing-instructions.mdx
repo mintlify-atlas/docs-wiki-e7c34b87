@@ -1,0 +1,353 @@
+---
+title: "Standing Instructions: Recurring Transfers and Scheduled Job"
+sidebarTitle: "Standing Instructions"
+description: "Reference for AccountTransferStandingInstruction, the EXECUTE_STANDING_INSTRUCTIONS Spring Batch job and the StandingInstructionApiResource."
+---
+
+# Standing Instructions
+
+Standing instructions are recurring `AccountTransfer`s. They live as
+configuration rows in `m_account_transfer_standing_instructions`, ride
+on top of an `AccountTransferDetails` row that records the endpoints,
+and are executed periodically by the `EXECUTE_STANDING_INSTRUCTIONS`
+Spring Batch job. The most common use is "deduct the loan instalment
+from this savings account whenever it falls due".
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `AccountTransferStandingInstruction` entity | `fineract-provider` | `org.apache.fineract.portfolio.account.domain` |
+| `StandingInstructionStatus`, `StandingInstructionType`, `StandingInstructionPriority` | `fineract-provider` | `org.apache.fineract.portfolio.account.domain` |
+| `StandingInstructionAssembler` | `fineract-provider` | `org.apache.fineract.portfolio.account.domain` |
+| `StandingInstructionApiResource`, `StandingInstructionHistoryApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.account.api` |
+| `StandingInstructionWritePlatformService(Impl)`, `StandingInstructionReadPlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.account.service` |
+| `ExecuteStandingInstructionsTasklet`, `ExecuteStandingInstructionsConfig` | `fineract-provider` | `org.apache.fineract.portfolio.account.jobs.executestandinginstructions` |
+| `JobName.EXECUTE_STANDING_INSTRUCTIONS` | `fineract-core` | `org.apache.fineract.infrastructure.jobs.service` |
+
+See [Account Transfers](/portfolio/account-transfers) for the one-shot
+transfer mechanics this builds on, and [/jobs/overview](/jobs/overview)
+for the Spring Batch job harness.
+
+## Enumerations
+
+### StandingInstructionStatus
+
+```java
+public enum StandingInstructionStatus {
+    INVALID(0,  "standingInstructionStatus.invalid"),
+    ACTIVE(1,   "standingInstructionStatus.active"),
+    DISABLED(2, "standingInstructionStatus.disabled"),
+    DELETED(3,  "standingInstructionStatus.deleted");
+}
+```
+
+The job only runs over `ACTIVE` (`status = 1`) rows; `DELETED` is a soft
+delete.
+
+### StandingInstructionType
+
+```java
+public enum StandingInstructionType {
+    INVALID(0, "standingInstructionType.invalid"),
+    FIXED(1,   "standingInstructionType.fixed"),
+    DUES(2,    "standingInstructionType.dues");
+}
+```
+
+- `FIXED` — transfer a constant `amount` each cycle.
+- `DUES` — read the linked loan's dues (principal + interest + fees +
+  penalties for the next instalment) and transfer that amount.
+
+### StandingInstructionPriority
+
+```java
+public enum StandingInstructionPriority {
+    INVALID(0), URGENT(1), HIGH(2), MEDIUM(3), LOW(4);
+}
+```
+
+Used to order execution when multiple SIs compete for the same source
+balance.
+
+## Entity
+
+```java
+@Entity
+@Table(name = "m_account_transfer_standing_instructions",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "name" }, name = "name") })
+public class AccountTransferStandingInstruction extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "account_transfer_details_id")
+    private AccountTransferDetails accountTransferDetails;
+
+    @Column(name = "name")              private String name;
+    @Column(name = "priority")          private Integer priority;
+    @Column(name = "instruction_type")  private Integer instructionType;
+    @Column(name = "status")            private Integer status;
+    @Column(name = "amount", scale = 6, precision = 19)
+    private BigDecimal amount;
+    @Column(name = "valid_from")        private LocalDate validFrom;
+    @Column(name = "valid_till")        private LocalDate validTill;
+    @Column(name = "recurrence_type")   private Integer recurrenceType;
+    @Column(name = "recurrence_frequency") private Integer recurrenceFrequency;
+    @Column(name = "recurrence_interval")  private Integer recurrenceInterval;
+    @Column(name = "recurrence_on_day")    private Integer recurrenceOnDay;
+    @Column(name = "recurrence_on_month")  private Integer recurrenceOnMonth;
+    @Column(name = "last_run_date")        private LocalDate latsRunDate;
+}
+```
+
+### Field map
+
+| Column | Java field | Notes |
+| --- | --- | --- |
+| `account_transfer_details_id` | `accountTransferDetails` | FK — supplies from/to office, client and account |
+| `name` | `name` | Unique label for the SI |
+| `priority` | `priority` | `StandingInstructionPriority` |
+| `instruction_type` | `instructionType` | `StandingInstructionType` |
+| `status` | `status` | `StandingInstructionStatus` |
+| `amount` | `amount` | Only meaningful when `instructionType = FIXED` |
+| `valid_from` / `valid_till` | validity window | Defaults: `today`, `null` (open-ended) |
+| `recurrence_type` | `recurrenceType` | `AccountTransferRecurrenceType` (`PERIODIC` / `AS_PER_DUES`) |
+| `recurrence_frequency` | `recurrenceFrequency` | `PeriodFrequencyType` (DAYS/WEEKS/MONTHS/YEARS) |
+| `recurrence_interval` | `recurrenceInterval` | Every N units |
+| `recurrence_on_day` / `recurrence_on_month` | day-of-month / month anchors | Used in monthly/yearly schedules |
+| `last_run_date` | `latsRunDate` | Updated by the tasklet on each successful execution (note the historical column spelling) |
+
+## StandingInstructionApiResource
+
+Mounted at `/v1/standinginstructions`:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/standinginstructions/template` | Template for the create form (eligible accounts, transferType options) | `READ_STANDINGINSTRUCTION` |
+| `POST` | `/v1/standinginstructions` | Create | `CREATE_STANDINGINSTRUCTION` |
+| `PUT` | `/v1/standinginstructions/{id}?command=update\|delete` | Update or soft-delete | per command |
+| `GET` | `/v1/standinginstructions?externalId=&offset=&limit=&orderBy=&sortOrder=&transferType=&clientName=&clientId=&fromAccountId=&fromAccountType=` | Paged list | `READ_STANDINGINSTRUCTION` |
+| `GET` | `/v1/standinginstructions/{id}` | Single (with optional `?associations=transactions,template,all`) | `READ_STANDINGINSTRUCTION` |
+| Various | `/v1/standinginstructionrunhistory…` | Execution history (see `StandingInstructionHistoryApiResource`) | `READ_STANDINGINSTRUCTION` |
+
+Note that update / delete are both `PUT` with a `?command=` switch
+because the resource follows the legacy convention of using `PUT` for
+soft state changes:
+
+```java
+final CommandWrapper commandRequest = COMMAND_HANDLER_REGISTRY.execute(
+    commandParam, standingInstructionId, serializedUpdatesRequest,
+    new UnrecognizedQueryParamException("command", commandParam));
+```
+
+Recognised `command` values: `update`, `delete`.
+
+### Create
+
+```http
+POST /v1/standinginstructions
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "Loan #445 monthly auto-debit",
+  "fromOfficeId": 1, "fromClientId": 109,
+  "fromAccountType": 2, "fromAccountId": 77,
+
+  "toOfficeId": 1, "toClientId": 109,
+  "toAccountType": 1, "toAccountId": 445,
+
+  "transferType": 2,
+  "priority": 2,
+  "instructionType": 2,
+  "status": 1,
+  "amount": 0,
+
+  "validFrom": "27 January 2025",
+  "recurrenceType": 1,
+  "recurrenceFrequency": 2,
+  "recurrenceInterval": 1,
+  "recurrenceOnMonthDay": "15",
+
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Notes:
+
+- `transferType = 2` is `LOAN_REPAYMENT` (`AccountTransferType`).
+- `instructionType = 2` (`DUES`) makes the amount irrelevant; the job
+  reads the loan dues each cycle.
+- `recurrenceType = 1` (`PERIODIC`) means run on the schedule;
+  `recurrenceType = 2` would mean "run whenever the loan has a due
+  amount" — driven by `AccountTransferRecurrenceType`.
+
+### Update
+
+```http
+PUT /v1/standinginstructions/{id}?command=update
+```
+
+```json
+{
+  "status": 2,
+  "amount": 50.00
+}
+```
+
+`command=update` changes scalar fields. `command=delete` flips `status =
+DELETED` (3); the row stays for audit.
+
+## EXECUTE_STANDING_INSTRUCTIONS job
+
+The Spring Batch job is registered as `EXECUTE_STANDING_INSTRUCTIONS`
+(see `JobName.EXECUTE_STANDING_INSTRUCTIONS`). It is configured by
+`ExecuteStandingInstructionsConfig`:
+
+```java
+@Bean
+public Job executeStandingInstructionsJob() {
+    return new JobBuilder(JobName.EXECUTE_STANDING_INSTRUCTIONS.name(), jobRepository)
+        .start(executeStandingInstructionsStep())
+        .incrementer(new RunIdIncrementer())
+        .build();
+}
+
+@Bean
+public ExecuteStandingInstructionsTasklet executeStandingInstructionsTasklet() {
+    return new ExecuteStandingInstructionsTasklet(
+            standingInstructionReadPlatformService,
+            jdbcTemplate,
+            sqlGenerator,
+            accountTransfersWritePlatformService);
+}
+```
+
+The job has a single step (`Tasklet`) and is wired into the scheduler at
+the configured cron (see [/jobs/overview](/jobs/overview) for the
+scheduling matrix).
+
+### Tasklet algorithm
+
+```java
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    Collection<StandingInstructionData> instructionData =
+        standingInstructionReadPlatformService.retrieveAll(
+            StandingInstructionStatus.ACTIVE.getValue());
+
+    List<Throwable> errors = new ArrayList<>();
+    for (StandingInstructionData data : instructionData) {
+        boolean isDueForTransfer = false;
+        AccountTransferRecurrenceType recurrenceType = data.getRecurrenceType();
+        StandingInstructionType        instructionType = data.getInstructionType();
+        LocalDate transactionDate = DateUtils.getBusinessLocalDate();
+
+        if (recurrenceType.isPeriodicRecurrence()) {
+            final ScheduledDateGenerator g = new DefaultScheduledDateGenerator();
+            PeriodFrequencyType freq = data.getRecurrenceFrequency();
+            LocalDate startDate = data.getValidFrom();
+            if (freq.isMonthly()) {
+                startDate = startDate.withDayOfMonth(data.getRecurrenceOnDay());
+                if (DateUtils.isBefore(startDate, data.getValidFrom()))
+                    startDate = startDate.plusMonths(1);
+            } else if (freq.isYearly()) {
+                startDate = startDate.withDayOfMonth(data.getRecurrenceOnDay())
+                                     .withMonth(data.getRecurrenceOnMonth());
+                if (DateUtils.isBefore(startDate, data.getValidFrom()))
+                    startDate = startDate.plusYears(1);
+            }
+            isDueForTransfer = g.isDateFallsInSchedule(freq, data.getRecurrenceInterval(),
+                                                       startDate, transactionDate);
+        }
+
+        BigDecimal transactionAmount = data.getAmount();
+        if (PortfolioAccountType.LOAN.equals(data.getToAccountType())
+            && (recurrenceType.isDuesRecurrence()
+                || (isDueForTransfer && instructionType.isDuesAmoutTransfer()))) {
+            StandingInstructionDuesData dues = standingInstructionReadPlatformService
+                    .retriveLoanDuesData(data.getToAccount().getId());
+            if (data.getInstructionType().isDuesAmoutTransfer()) {
+                transactionAmount = dues.totalDueAmount();
+            }
+            if (recurrenceType.isDuesRecurrence()) {
+                isDueForTransfer = isDueForTransfer(dues);
+            }
+        }
+
+        if (isDueForTransfer && transactionAmount != null
+                              && transactionAmount.compareTo(BigDecimal.ZERO) > 0) {
+            AccountTransferDTO dto = new AccountTransferDTO(transactionDate, transactionAmount,
+                data.getFromAccountType(), data.getToAccountType(),
+                data.getFromAccount().getId(), data.getToAccount().getId(),
+                data.getName() + " Standing instruction trasfer ",
+                null, null, null, null, data.toTransferType(), null, null,
+                data.getTransferType().getValue(), null, null, ExternalId.empty(),
+                null, null, /*fromSavingsAccount=*/ null,
+                /*isRegularTransaction=*/ true,
+                /*isExceptionForBalanceCheck=*/ false);
+
+            boolean transferCompleted = transferAmount(errors, dto, data.getId());
+            if (transferCompleted) {
+                jdbcTemplate.update(
+                    "UPDATE m_account_transfer_standing_instructions SET last_run_date = ? where id = ?",
+                    transactionDate, data.getId());
+            }
+        }
+    }
+    if (!errors.isEmpty()) throw new JobExecutionException(errors);
+    return RepeatStatus.FINISHED;
+}
+```
+
+Key behaviours:
+
+- Reads only `ACTIVE` SIs.
+- For `PERIODIC`, calls `DefaultScheduledDateGenerator
+  .isDateFallsInSchedule(freq, interval, startDate, today)` — the same
+  generator used by the loan repayment schedule (see
+  [Calendar](/portfolio/calendar)).
+- For `AS_PER_DUES`, queries the loan dues snapshot and only fires when
+  there is actually an outstanding amount.
+- When `instructionType = DUES`, the amount is replaced by the loan's
+  computed total due (principal + interest + fees + penalties).
+- Catches `PlatformApiDataValidationException`,
+  `InsufficientAccountBalanceException` and
+  `AbstractPlatformServiceUnavailableException` per row, collecting them
+  into a per-job error list; the job throws `JobExecutionException`
+  only after the entire batch completes (so one bad SI does not block
+  the others).
+- On success, the row's `last_run_date` is bumped via a direct JDBC
+  update.
+
+## Execution history
+
+`StandingInstructionHistoryApiResource` exposes the execution log:
+
+```text
+GET /v1/standinginstructionrunhistory?fromDate=&toDate=&clientId=&standingInstructionId=
+```
+
+The history table (`m_account_transfer_standing_instructions_history`)
+records each execution attempt with its status (success / failure) and
+the resulting `account_transfer_transaction_id`.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `StandingInstructionNotFoundException` | Bad `standingInstructionId` |
+| `AccountTransferNotFoundException` | Underlying transfer detail vanished |
+| `InsufficientAccountBalanceException` | Source savings has insufficient balance during execution |
+| `PlatformApiDataValidationException` | Validation on create/update |
+| `JobExecutionException` | Wraps per-row errors from the batch run |
+
+## Cross-references
+
+- [Account Transfers](/portfolio/account-transfers) — one-shot transfer
+  mechanics
+- [Calendar](/portfolio/calendar) — shared `ScheduledDateGenerator`
+  semantics for periodicity
+- [Loan overview](/loan/overview) — loan-dues snapshot used by `DUES`
+  instructions
+- [Savings overview](/savings/overview) — withdrawal mechanics on the
+  source side
+- [Jobs overview](/jobs/overview) — Spring Batch harness, scheduling
+- [Portfolio APIs index](/api/portfolio-apis)

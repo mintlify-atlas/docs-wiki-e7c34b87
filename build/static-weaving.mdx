@@ -1,0 +1,268 @@
+---
+title: "EclipseLink Static Weaving for JPA Entities at Build Time"
+sidebarTitle: "Static Weaving"
+description: "How Fineract enhances JPA entities at build time with EclipseLink static weaving: per-module persistence.xml, the static-weaving.gradle hook, and runtime JPA configuration."
+---
+
+Apache Fineract uses EclipseLink as its JPA provider, and every module that owns JPA entities has its bytecode statically woven during `compileJava`. This means lazy-loading proxies, change-tracking weavers, fetch-group support, and Indirect Set/List implementations are baked into the compiled `.class` files instead of being applied at class-load time by a JVM agent. The setup is implemented in `static-weaving.gradle` at the repo root and fanned out by the convention block in the top-level `build.gradle`.
+
+## Why static weaving?
+
+EclipseLink supports three weaving modes:
+
+| Mode | When | Cost |
+| --- | --- | --- |
+| **Dynamic** | At class-load time, via the JPA agent and an `EntityManagerFactory` callback. | Slower startup; subtle issues when classes are loaded before the persistence unit is built (Spring proxies, `ClassGraph`, AOT). |
+| **Static** | At build time, by running `org.eclipse.persistence.tools.weaving.jpa.StaticWeave` against the compiled classes. | Slightly slower compile; perfectly clean runtime; works without `-javaagent`. |
+| **None** | Disabled. | Loss of lazy-loading and change tracking — not used. |
+
+Fineract chose static so that the produced JAR is self-contained — it just works under Spring Boot, in a Docker container, or in IDE-run tests with no agent flags.
+
+The constraint, mentioned in the comment block of `build.gradle`, is that the woven classes contain `synthetic` fields and methods that confuse `-Werror`:
+
+```
+// -Werror needs to be disabled because EclipseLink's static weaving doesn't generate warning-free code
+// and during an IntelliJ recompilation, it fails
+```
+
+## Where the script lives
+
+The script is `static-weaving.gradle` at the repository root. It is referenced from `build.gradle`:
+
+```groovy
+// Apply static weaving configuration to all subprojects
+subprojects { subproject ->
+    apply from: rootProject.file('static-weaving.gradle')
+}
+```
+
+This means every subproject — Apache and custom alike — gets the same hook applied. The script itself is a no-op for projects that don't qualify.
+
+## The full script
+
+`static-weaving.gradle`:
+
+```groovy
+// Wait until after project evaluation to ensure all plugins are applied
+project.afterEvaluate {
+    // Only configure if this is a Java project
+    if (!project.plugins.hasPlugin('java')) {
+        logger.info("ℹ Skipping static weaving configuration for non-Java project: ${project.name}")
+        return
+    }
+
+    // Check if the module contains JPA entities
+    def persistenceXmlFile = file("src/main/resources/jpa/static-weaving/module/${project.name}/persistence.xml")
+    def hasJpaEntities = persistenceXmlFile.exists()
+
+    if (hasJpaEntities) {
+        logger.info("Configuring EclipseLink static weaving for ${project.name}")
+
+        compileJava.doLast {
+            def source = sourceSets.main.java.classesDirectory.get()
+
+            File weavingRoot = new File(temporaryDir, "static-weaving")
+            File metaInf = new File(weavingRoot, "META-INF")
+            metaInf.mkdirs()
+
+            copy {
+                from persistenceXmlFile.toPath()
+                into metaInf.toPath()
+                duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+            }
+
+            javaexec {
+                description = 'Performs EclipseLink static weaving of entity classes'
+                mainClass.set("org.eclipse.persistence.tools.weaving.jpa.StaticWeave")
+                classpath = project.sourceSets.main.runtimeClasspath
+                args = [
+                    "-persistenceinfo",
+                    weavingRoot.absolutePath,
+                    source,
+                    source
+                ]
+            }
+        }
+
+        logger.info("✓ EclipseLink static weaving configured for ${project.name}")
+    } else {
+        logger.info("ℹ No JPA entities found in ${project.name}, skipping static weaving configuration")
+    }
+}
+```
+
+### Walk-through
+
+1. **`project.afterEvaluate { … }`** — defers everything until plugins (notably `java`) have been applied.
+2. **Plugin guard** — if `java` is not on the project, exit early. This protects `fineract-doc` (Asciidoctor only), `:custom:docker` (Jib only), and any `settings.gradle`-only directories.
+3. **Persistence-unit discovery** — looks for a file at the deterministic path `src/main/resources/jpa/static-weaving/module/<project.name>/persistence.xml`. The folder layout intentionally mirrors `${project.name}` so that the file path is unique per module and can be safely copied next to `META-INF/`.
+4. **`compileJava.doLast { … }`** — the weaving runs as the **last** action of `compileJava`. By that point all classes in `build/classes/java/main/` exist. The action:
+    - Creates `<tmpDir>/static-weaving/META-INF/persistence.xml` (a staging directory under `temporaryDir`).
+    - Copies the module's `persistence.xml` into the staging area.
+    - Runs `org.eclipse.persistence.tools.weaving.jpa.StaticWeave` via `javaexec` with the project's runtime classpath. Note that the runtime classpath includes EclipseLink, which was added as a `buildscript` classpath entry in the root `build.gradle`:
+
+```groovy
+buildscript {
+    dependencies {
+        classpath 'org.eclipse.persistence:eclipselink:4.0.6'
+        // …
+    }
+}
+```
+
+The `StaticWeave` CLI signature is `[-loglevel <level>] [-persistenceinfo <dir>] <source> <target>`. Fineract uses the same directory for source and target (`source, source`), meaning the woven classes overwrite the un-woven ones in place. The `-persistenceinfo` flag tells the weaver where to find the staging `META-INF/persistence.xml` listing which classes to weave.
+
+## What `persistence.xml` looks like
+
+Each weaving descriptor is a standard JPA descriptor with one persistence-unit named `jpa-pu` and the EclipseLink `static` weaving property:
+
+```xml
+<persistence version="2.0"
+             xmlns="http://java.sun.com/xml/ns/persistence">
+    <persistence-unit name="jpa-pu" transaction-type="RESOURCE_LOCAL">
+        <provider>org.eclipse.persistence.jpa.PersistenceProvider</provider>
+
+        <!--  fineract-core module: -->
+        <class>org.apache.fineract.accounting.glaccount.domain.GLAccount</class>
+        <class>org.apache.fineract.commands.domain.CommandSource</class>
+        <class>org.apache.fineract.infrastructure.codes.domain.Code</class>
+        <class>org.apache.fineract.infrastructure.codes.domain.CodeValue</class>
+        <class>org.apache.fineract.infrastructure.core.domain.AbstractAuditableCustom</class>
+        <class>org.apache.fineract.organisation.office.domain.Office</class>
+        <class>org.apache.fineract.portfolio.client.domain.Client</class>
+        <class>org.apache.fineract.useradministration.domain.AppUser</class>
+        <!--  … many more  -->
+
+        <exclude-unlisted-classes>false</exclude-unlisted-classes>
+        <properties>
+            <property name="eclipselink.weaving" value="static" />
+            <property name="eclipselink.weaving.internal" value="false"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+```
+
+A comment in the file pins down the role of this descriptor:
+
+> This file is only used for static weaving, nothing more. You can find the runtime configuration in the JPAConfig class.
+
+In other words **this `persistence.xml` is never read at runtime**. Spring builds the `EntityManagerFactory` programmatically in `JPAConfig.java`:
+
+```java
+return factoryBuilder.dataSource(getDataSource())
+    .properties(vendorProperties)
+    .persistenceUnit("jpa-pu")
+    .packages(packagesToScan)
+    .build();
+```
+
+The persistence-unit name `jpa-pu` is shared so the woven metadata aligns with the runtime PU. The list of packages to scan is derived dynamically.
+
+## Modules with weaving today
+
+Run the heuristic `find . -name persistence.xml -not -path '*/build/*'` and you get one descriptor per JPA-bearing module. Class counts as of writing:
+
+| Module | Entity classes listed |
+| --- | --- |
+| `fineract-accounting` | 51 |
+| `fineract-branch` | 55 |
+| `fineract-charge` | 44 |
+| `fineract-cob` | 41 |
+| `fineract-core` | 39 |
+| `fineract-investor` | 116 |
+| `fineract-loan` | 108 |
+| `fineract-loan-origination` | 110 |
+| `fineract-progressive-loan` | 111 |
+| `fineract-provider` | 251 |
+| `fineract-rates` | 41 |
+| `fineract-report` | 39 |
+| `fineract-savings` | 78 |
+| `fineract-tax` | 43 |
+| `fineract-working-capital-loan` | 118 |
+
+`fineract-provider` has the largest list because it still owns aggregates that pre-date the module split (collateral, scheduled jobs, business events, etc.). The numbers are useful when sanity-checking that a new entity actually made it into the woven set.
+
+## How to add a new JPA entity
+
+1. Place the `@Entity` class under the module's `src/main/java/`.
+2. Open `src/main/resources/jpa/static-weaving/module/<module-name>/persistence.xml`.
+3. Add `<class>fully.qualified.name.YourEntity</class>` next to the other entries (alphabetical by package is the de-facto convention).
+4. Add the entity's package to whatever `packagesToScan` source the runtime uses (typically the entity sits under a package that is already in the scan list, so this is a no-op).
+5. Rebuild: `./gradlew :<module>:compileJava`. Look for `Configuring EclipseLink static weaving for <module>` in the `--info` log.
+
+If you forget step 2 the entity will work in tests (Spring's runtime weaving may still apply) but **lazy associations will not enhance** and you may see `org.eclipse.persistence.exceptions.ValidationException` messages about un-woven proxies in production.
+
+## How to start a brand-new module that owns entities
+
+The `STATIC_WEAVING.md` file in the repo root summarises this in three lines:
+
+> 1. Add JPA entities to `src/main/java`.
+> 2. Ensure there's a `persistence.xml` file in `src/main/resources/jpa/static-weaving/module/[module-name]/`.
+> 3. The build will automatically detect and apply static weaving.
+
+The file system layout must match `<project.name>` exactly. For a module included as `include ':fineract-foo'`, the path is `fineract-foo/src/main/resources/jpa/static-weaving/module/fineract-foo/persistence.xml`. The script substitutes `${project.name}` literally, so any mismatch (e.g. `fineract_foo` vs `fineract-foo`) silently disables weaving.
+
+## Runtime: how the woven classes are used
+
+`JPAConfig.java` in `fineract-provider` constructs the `EntityManagerFactory`:
+
+```java
+@Bean
+public LocalContainerEntityManagerFactoryBean entityManagerFactory(
+        EntityManagerFactoryBuilder factoryBuilder,
+        DataSource dataSource,
+        DatabaseTypeResolver databaseTypeResolver) {
+    Map<String, Object> vendorProperties = vendorProperties();
+    String[] packagesToScan = jpaPackagesToScan();
+    return factoryBuilder.dataSource(getDataSource())
+        .properties(vendorProperties)
+        .persistenceUnit("jpa-pu")
+        .packages(packagesToScan)
+        .build();
+}
+```
+
+Spring Boot's `LocalContainerEntityManagerFactoryBean` registers a `ClassFileTransformer` for EclipseLink, but because the bytecode is **already woven**, the transformer effectively becomes a no-op. The `EntityManagerFactoryCustomizer` collection (`Collection<EntityManagerFactoryCustomizer>`) lets modules contribute additional EclipseLink properties (caching, query hints, multi-tenant resolvers).
+
+The `vendorProperties()` call sets `eclipselink.weaving=static` so EclipseLink will refuse to weave at runtime and trust the static metadata. Combined with `<property name="eclipselink.weaving.internal" value="false"/>` in the descriptor, this prevents accidental double-weaving.
+
+## Per-module isolation
+
+Each module has its **own** persistence descriptor (`module/<name>/persistence.xml`). This is intentional:
+
+- `fineract-loan` is woven against the `Loan`, `LoanCharge`, `LoanTransaction`, … classes that it ships.
+- `fineract-investor` is woven against `ExternalAsset`, `ExternalAssetOwner`, … without dragging in loan classes.
+- `fineract-provider` is woven against the legacy aggregates that have not been split out yet.
+
+If you weave a class that lives in another module, the StaticWeave classpath (`sourceSets.main.runtimeClasspath`) still has access to it but only the classes inside that module's `build/classes/java/main` get overwritten. So each `compileJava` produces a self-contained set of woven `.class` files.
+
+## Skipping weaving locally
+
+The script keys off the presence of `persistence.xml`. To temporarily disable weaving in a workspace (e.g. when reproducing a bug in raw bytecode), rename the file:
+
+```sh
+mv fineract-loan/src/main/resources/jpa/static-weaving/module/fineract-loan/persistence.xml{,.bak}
+./gradlew :fineract-loan:compileJava --rerun-tasks
+```
+
+You will see `ℹ No JPA entities found in fineract-loan, skipping static weaving configuration` in the log. Remember to revert before committing — CI will produce a runtime that misbehaves under load.
+
+## Interaction with Spotless and ErrorProne
+
+The woven `.class` files do not flow back into source, so Spotless / ErrorProne / Checkstyle never see them. SpotBugs **does** see them — that is why `config/spotbugs/exclude.xml` masks the synthetic `_persistence_*` members that EclipseLink injects.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| `LazyInitializationException`-like failures at runtime | The entity is missing from the module's `persistence.xml`. |
+| `Cannot find class … for staticWeave` during build | The entity is listed in `persistence.xml` but does not exist on the classpath. Check the module dependency graph in [module graph](/overview/module-graph). |
+| `compileJava` finishes but a downstream `bootJar` fails with `NoClassDefFoundError: org/eclipse/persistence/internal/weaving/PersistenceWeaved` | A custom module is shipping un-woven entities. Add a `persistence.xml` under that module's resources. |
+| Weaving runs **on every** compile even for unchanged sources | `compileJava.doLast` does not declare its own task inputs. This is intentional — the cost is small and skipping it can hide stale weaving. |
+
+## Related
+
+- [Multi-module build](/build/gradle-multi-module) — where the `subprojects { apply from: 'static-weaving.gradle' }` hook is declared.
+- [buildSrc conventions](/build/build-src) — the broader convention plugin layer.
+- [Repository layout](/overview/repository-layout) — locate the per-module `persistence.xml` files.
+- [Testing overview](/testing/overview) — running tests against statically-woven entities under Spring Boot.

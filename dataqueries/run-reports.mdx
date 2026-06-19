@@ -1,0 +1,292 @@
+---
+title: "Run Reports — Executing Stretchy SQL and Pentaho Reports"
+sidebarTitle: "Run Reports"
+description: "Apache Fineract run-reports: RunreportsApiResource, GenericDataService, SQL parameter substitution, SqlValidator and the export format negotiation."
+---
+
+Apache Fineract executes reports through one endpoint: `GET /v1/runreports/{reportName}` (`RunreportsApiResource`). The endpoint resolves the report's type from `stretchy_report`, looks up the matching `ReportingProcessService` from `ReportingProcessServiceProvider`, and delegates execution. For SQL-backed reports (`report_type` ∈ `Table` / `Chart` / `SMS`), the workhorse is `DatatableReportingProcessService` → `ReadReportingServiceImpl.retrieveGenericResultset(name, type, queryParams)` → `GenericDataService.fillGenericResultSet(sql)`. Parameter substitution and identifier quoting are bracketed by `SqlValidator` / `SqlInjectionPreventerService` so request input cannot tunnel additional SQL.
+
+For the catalogue surface see [Reports](/dataqueries/reports); for the plug-in surface see [Report provider](/report/report-provider).
+
+## REST surface — `RunreportsApiResource`
+
+`@Path("/v1/runreports")`:
+
+| Method | Path | Operation |
+|---|---|---|
+| `GET` | `/v1/runreports/availableExports/{reportName}` | List export targets supported by the report's service |
+| `GET` | `/v1/runreports/{reportName}` | Execute the report and stream the response |
+
+`runReport(...)` is annotated:
+
+```java
+@GET
+@Path("{reportName}")
+@Timed(value = "fineract.report.execution",
+       description = "Time taken to execute reports",
+       extraTags = { "component", "reporting" })
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON, "text/csv", "application/vnd.ms-excel", "application/pdf", "text/html" })
+```
+
+The Micrometer `@Timed` annotation registers a histogram per execution under the `fineract.report.execution` metric — see the runtime metrics overview for how to surface this.
+
+## URL contract
+
+A typical run-report URL:
+
+```
+GET /v1/runreports/Client%20Listing?R_officeId=1&R_fromDate=2024-01-01&R_toDate=2024-12-31&output-type=CSV
+```
+
+| Element | Source | Meaning |
+|---|---|---|
+| `{reportName}` | path parameter | The `stretchy_report.report_name` value (URL-encoded; spaces become `%20`) |
+| `R_*` | query parameters | Per-report parameters; the prefix `R_` separates them from the control parameters below |
+| `exportCSV` | query parameter | `true` to stream CSV instead of JSON |
+| `parameterType` | query parameter | `true` to fetch a parameter lookup row instead of a report row (see "Parameter lookups" below) |
+| `output-type` | query parameter | `HTML` / `XLS` / `CSV` / `PDF` — preferred output for Pentaho reports |
+| `enable-business-date` | query parameter | Optional Pentaho convention — pushes the tenant business date as a Pentaho parameter |
+| `obligDateType`, `decimalChoice` | query parameter | Pentaho-specific control parameters |
+
+The `R_*` convention is the Fineract-wide standard for reporting parameters; the prefix is stripped before substitution into the SQL body. So `R_officeId=1` becomes the substitution `${officeId} = "1"`.
+
+## Execution flow
+
+```java
+// RunreportsApiResource.processReportRequest(reportName, uriInfo)
+MultivaluedMap<String,String> queryParams = new MultivaluedStringMap();
+queryParams.putAll(uriInfo.getQueryParameters());
+
+final boolean parameterTypeValue = ApiParameterHelper.parameterType(queryParams);
+checkUserPermissionForReport(reportName, parameterTypeValue);
+
+String reportType = readExtraDataAndReportingService.getReportType(reportName, parameterTypeValue);
+ReportingProcessService service = reportingProcessServiceProvider.findReportingProcessService(reportType);
+if (service == null) {
+    throw new PlatformServiceUnavailableException("err.msg.report.service.implementation.missing",
+        ReportingProcessServiceProvider.SERVICE_MISSING + reportType, reportType);
+}
+return service.processRequest(reportName, queryParams);
+```
+
+Walkthrough:
+
+1. **Authorise.** `checkUserPermissionForReport(reportName, parameterTypeValue)` — for non-parameter requests the caller must hold `READ_<reportName>`. Parameter lookups (`parameterType=true`) skip the per-report permission check because they only return UI drop-down content. Unauthorised callers get a `NoAuthorizationException`.
+2. **Resolve the report's type string.** `ReadReportingService.getReportType(reportName, parameterType)`:
+   - For `parameterType=true` returns the literal `"Table"` (parameter lookups are always table-shaped).
+   - Otherwise runs `SELECT coalesce(report_type,'') AS report_type FROM stretchy_report WHERE report_name = ?` and returns the column value; throws `ReportNotFoundException` if not found.
+3. **Look up the service.** `ReportingProcessServiceProvider.findReportingProcessService(reportType)` returns the `@ReportService(type=...)` implementation. For SQL-backed reports this is `DatatableReportingProcessService` (`@ReportService(type = { "Table", "Chart", "SMS" })`).
+4. **Hand off.** `service.processRequest(reportName, queryParams)` returns a JAX-RS `Response` — JSON for normal calls, CSV/XLS/PDF/S3 outcomes for export calls.
+
+## `DatatableReportingProcessService.processRequest`
+
+```java
+@Service
+@ReportService(type = { "Table", "Chart", "SMS" })
+public class DatatableReportingProcessService extends AbstractReportingProcessService {
+
+    private final List<DatatableReportExportService> exportServices;
+
+    @Override
+    public Response processRequest(String reportName, MultivaluedMap<String,String> queryParams) {
+        DatatableExportTargetParameter exportMode =
+            DatatableExportTargetParameter.resolverExportTarget(queryParams);
+        final String parameterTypeValue =
+            ApiParameterHelper.parameterType(queryParams) ? "parameter" : "report";
+        final Map<String,String> reportParams = getReportParams(queryParams);
+        ResponseHolder response = findReportExportService(exportMode)
+            .orElseThrow(() -> new GeneralPlatformDomainRuleException(
+                "error.msg.report.export.mode.unavailable",
+                "Export mode %s unavailable".formatted(exportMode.name())))
+            .export(reportName, queryParams, reportParams, parameterTypeValue);
+        // build Response from response.status / contentType / fileName / headers / entity
+    }
+}
+```
+
+Two important details:
+
+- **Export-target negotiation.** `DatatableExportTargetParameter.resolverExportTarget(queryParams)` walks `CSV / PDF / S3 / JSON / PRETTY_JSON` and picks the first one whose corresponding query-parameter (`exportCSV` / `exportPDF` / `exportS3` / `exportJSON` / `pretty`) is `true`. If none match, the default is `JSON`. See [Datatable export](/dataqueries/datatable-export) for the full target table.
+- **Two execution shapes.** `parameterTypeValue` is `"parameter"` if `parameterType=true` is in the query, `"report"` otherwise. This is the `type` argument forwarded all the way to `ReadReportingServiceImpl.getSQLtoRun(name, type, queryParams)`, which routes to either `stretchy_report` or `stretchy_parameter` for the SQL body. The valid `type` strings are enforced against the `ReportType` enum (`REPORT("report")`, `PARAMETER("parameter")`) — see [Reports](/dataqueries/reports#reporttype-enum--sql-injection-whitelist).
+
+`getReportParams(queryParams)` builds a `Map<String,String>` of all parameters whose key starts with `R_` (stripping the prefix), suitable for SQL substitution.
+
+## Parameter substitution rules — `getSQLtoRun`
+
+The single substitution helper for SQL-backed reports is `ReadReportingServiceImpl.getSQLtoRun(name, type, queryParams)`:
+
+```java
+private String getSQLtoRun(final String name, final String type, final Map<String,String> queryParams) {
+    String sql = getSql(name, type);                              // load from stretchy_report / stretchy_parameter
+
+    for (Map.Entry<String,String> entry : queryParams.entrySet()) {
+        sql = this.genericDataService.replace(sql, entry.getKey(), entry.getValue());
+    }
+
+    final AppUser currentUser = this.context.authenticatedUser();
+    sql = this.genericDataService.replace(sql, "${currentUserHierarchy}",
+                                           currentUser.getOffice().getHierarchy());
+    sql = this.genericDataService.replace(sql, "${currentUserId}",
+                                           currentUser.getId().toString());
+    sql = this.genericDataService.replace(sql, "${currentDate}",
+                                           sqlGenerator.currentBusinessDate());
+    sql = StringUtils.replaceIgnoreCase(sql, "NOW()",         sqlGenerator.currentTenantDateTime());
+    sql = StringUtils.replaceIgnoreCase(sql, "curdate()",     sqlGenerator.currentBusinessDate());
+    sql = StringUtils.replaceIgnoreCase(sql, "CURRENT_DATE",  sqlGenerator.currentBusinessDate());
+    sql = this.genericDataService.wrapSQL(sql);
+
+    return sql;
+}
+```
+
+Substitution table:
+
+| Token | Source | When |
+|---|---|---|
+| `${officeId}`, `${fromDate}`, `${anyName}` | Matching `R_<anyName>` query parameter | Per-call, looped via `queryParams.entrySet()` |
+| `${currentUserHierarchy}` | `currentUser.getOffice().getHierarchy()` | Always; lets reports filter by office tree |
+| `${currentUserId}` | `currentUser.getId()` | Always; lets reports filter by "reports allowed to this user" rows |
+| `${currentDate}` | `DatabaseSpecificSQLGenerator.currentBusinessDate()` | Always |
+| `NOW()`, `curdate()`, `CURRENT_DATE` (case-insensitive) | Tenant business date/time | Always |
+
+After substitution, `genericDataService.wrapSQL(sql)` applies database-specific wrapping (e.g. casting in Postgres) before the query runs.
+
+⚠️ **The substitution is plain string replacement, not parameterised binding.** Report SQL is platform-defined (saved by an authenticated operator with `CREATE_REPORT`), so the *body* is trusted; the *parameter values* arrive through the query string, and the report author is responsible for using them in safe positions (typically `WHERE office_id = '${officeId}'` for integers, single-quoted for strings). Numerical parameters that get used unquoted are a SQL-injection risk unless the report author validates them; this is why the operator workflow for adding reports requires elevated permissions.
+
+The report-execution path **also** runs `SqlValidator` on a number of identifier inputs (column names, sort orders, etc.) before stitching them into queries — see the next section.
+
+## Identifier safety — `SqlValidator` and `SqlInjectionPreventerService`
+
+Two complementary helpers are used across the dataqueries surface:
+
+| Helper | Used for | Method |
+|---|---|---|
+| `SqlInjectionPreventerService` | Quoting identifiers in SQL string construction | `quoteIdentifier(name)` — wraps in db-specific quotes |
+| `SqlValidator` | Validating that an identifier (column / table / order direction) is free of dangerous characters | `validateSQLInput(input)` — throws on `;`, `--`, comment markers, `OR 1=1`, etc. |
+
+`ReadReportingServiceImpl` uses `SqlInjectionPreventerService` to quote `stretchy_report` / `stretchy_parameter` identifiers when assembling the SQL body lookup query. `DatatableReadServiceImpl` and `DatatableUtil` use `SqlValidator` to validate datatable names and column references arriving from request input (the `columnFilter`, `order`, `resultColumns` query parameters). The two services are wired into `DataQueriesAutoConfiguration`:
+
+```java
+// fineract-provider/.../infrastructure/dataqueries/starter/DataQueriesAutoConfiguration.java
+public DatatableReadServiceImpl datatableReadService(... final SqlValidator sqlValidator, final SearchUtil searchUtil, ...) { ... }
+```
+
+See [SQL injection prevention](/security/sql-injection-prevention) for the full primitives.
+
+## Output payload — `GenericResultsetData`
+
+When the export mode is JSON (the default), `ReadReportingServiceImpl.retrieveGenericResultset(...)` returns `GenericResultsetData`:
+
+```java
+public final class GenericResultsetData {
+    private final List<ResultsetColumnHeaderData> columnHeaders;
+    private final List<ResultsetRowData>          data;
+}
+```
+
+`GenericDataServiceImpl.fillGenericResultSet(sql)` materialises this:
+
+```java
+@Override
+public GenericResultsetData fillGenericResultSet(final String sql) {
+    final SqlRowSet rs = this.jdbcTemplate.queryForRowSet(sql);  // NOSONAR
+    final List<ResultsetColumnHeaderData> columnHeaders = new ArrayList<>();
+    final SqlRowSetMetaData rsmd = rs.getMetaData();
+    for (int i = 0; i < rsmd.getColumnCount(); i++) {
+        // map columnType -> JdbcJavaType, then to DisplayType (DECIMAL/INTEGER/DATE/...)
+    }
+    // walk rows, coerce each value per its DisplayType (DATE/DATETIME/TIME/DECIMAL),
+    // wrap into ResultsetRowData
+    return new GenericResultsetData(columnHeaders, rows);
+}
+```
+
+The same payload shape is used by datatable reads (`DatatableReadService.retrieveDataTableGenericResultSet(...)`) and the export services — JSON consumers always get a column-header + row-data pair, never a free-form array.
+
+### JSON response shape
+
+```json
+{
+  "columnHeaders": [
+    { "columnName": "office",  "isColumnNullable": false, "columnType": "VARCHAR", "columnLength": 100,
+      "columnDisplayType": "STRING", "isColumnPrimaryKey": false, "columnValues": [], "columnCode": null },
+    { "columnName": "active_clients", "columnType": "BIGINT", "columnDisplayType": "INTEGER",
+      "columnLength": null, "isColumnNullable": true, "isColumnPrimaryKey": false, "columnValues": [], "columnCode": null }
+  ],
+  "data": [
+    { "row": ["Head Office", "1234"] },
+    { "row": ["Branch A",    "567"]  }
+  ]
+}
+```
+
+The `columnDisplayType` field is the platform's hint to UI renderers — `INTEGER`, `DECIMAL`, `DATE`, `DATETIME`, `TIME`, `TEXT`, `BOOLEAN`, `CODELOOKUP`. Code-lookup columns include their resolved labels in `columnValues`.
+
+## Parameter lookups
+
+Many UI dropdowns (office picker, currency picker, etc.) are themselves reports stored in `stretchy_parameter`. To fetch one:
+
+```
+GET /v1/runreports/OfficeIdSelectOne?parameterType=true
+```
+
+The `parameterType=true` query flag:
+
+- Skips the per-report `READ_<reportName>` permission check.
+- Routes `ReadReportingServiceImpl.getSql(name, "parameter")` to the `stretchy_parameter` table instead of `stretchy_report`.
+- Always treats the response as a `Table` report (parameter lookups have no chart subtype).
+
+The response is the same `GenericResultsetData` JSON shape, typically two columns (`id`, `display_name`) that the UI binds to the dropdown.
+
+## Available exports
+
+`GET /v1/runreports/availableExports/{reportName}` returns:
+
+```json
+[ { "name": "CSV", "value": "exportCSV" },
+  { "name": "JSON", "value": "exportJSON" },
+  { "name": "S3", "value": "exportS3" } ]
+```
+
+The list is built from `DatatableExportTargetParameter.values()` filtered by whether a `DatatableReportExportService` supports each target — so when S3 is not configured the list silently drops `S3`. See [Datatable export](/dataqueries/datatable-export) for what each service does.
+
+## Examples from the bundled platform
+
+| URL | Effect |
+|---|---|
+| `GET /v1/runreports/Client%20Listing?R_officeId=1` | Run `Client Listing` for office id 1; default JSON response |
+| `GET /v1/runreports/Client%20Listing?R_officeId=1&exportCSV=true` | Same, exported as CSV |
+| `GET /v1/runreports/OfficeIdSelectOne?parameterType=true` | Run the `OfficeIdSelectOne` parameter lookup |
+| `GET /v1/runreports/Expected%20Payments%20By%20Date%20-%20Formatted?R_endDate=2024-04-30&R_loanOfficerId=-1&R_officeId=1&R_startDate=2024-04-16&output-type=PDF` | Run a Pentaho report and request PDF output |
+
+## Pentaho dispatch path
+
+When `report_type = "Pentaho Reports"`, `ReportingProcessServiceProvider` returns the Pentaho `@ReportService` adapter. That adapter calls `ReadReportingServiceImpl.generatePentahoReportAsOutputStream(reportName, outputType, ...)` which:
+
+1. Loads `{reportName}.prpt` from `${fineract.content.filesystem.rootFolder}/{reportName}.prpt`.
+2. Wires the parameters from the query string into the Pentaho report's parameter table.
+3. Renders to `ByteArrayOutputStream` in the requested format (`HTML` / `PDF` / `XLS` / `CSV`).
+4. The adapter wraps the stream in a JAX-RS `Response` with the matching `Content-Type` and `Content-Disposition`.
+
+Pentaho rendering is out-of-tree; the bundled `fineract-provider` does not ship a Pentaho engine. See [Report provider](/report/report-provider) for how to add one.
+
+## Errors
+
+| Exception | HTTP | Trigger |
+|---|---|---|
+| `ReportNotFoundException` | 404 | `reportName` not in `stretchy_report` |
+| `NoAuthorizationException` | 403 | Caller lacks `READ_<reportName>` for a non-parameter request |
+| `PlatformServiceUnavailableException` | 503 | No `ReportingProcessService` registered for the report's `report_type` (`err.msg.report.service.implementation.missing`) |
+| `GeneralPlatformDomainRuleException` | 400 | `exportS3` requested but the S3 export service is not configured (`error.msg.report.export.mode.unavailable`) |
+| `IllegalArgumentException` | 400 | `getSql(...)` invoked with an unknown `type` (only reachable internally; not directly from the run endpoint) |
+| `DataAccessException` | 500 | Underlying JDBC error during execution (commonly bad parameter producing a SQL syntax error) |
+
+## Related references
+
+- The `Report` aggregate and the `READ_<reportName>` permission rows: [Reports](/dataqueries/reports).
+- The export targets and how each output is rendered: [Datatable export](/dataqueries/datatable-export).
+- The plug-in surface for `ReportingProcessService`: [Report provider](/report/report-provider).
+- The scheduled wrapper that emails report outputs: [Report mailing job](/report/report-mailing-job).
+- The SQL identifier-safety helpers used across the path: [SQL injection prevention](/security/sql-injection-prevention).
+- The REST view of all data and reporting endpoints: [Reports and data APIs](/api/reports-and-data-apis).

@@ -1,0 +1,307 @@
+---
+title: "Document Management Module Overview and File Map"
+sidebarTitle: "Overview"
+description: "Tour of the Apache Fineract fineract-document module — Document and Image entities, ContentStore abstraction, detectors, and policies."
+---
+
+The Apache Fineract `fineract-document` Gradle module is the platform's file-storage subsystem. It does two distinct jobs: (1) attaching named, described files (PDFs, scans, spreadsheets) to portfolio entities such as clients, loans, savings, groups, staff, and client identifiers — modelled as the `Document` JPA aggregate — and (2) holding a single avatar image per entity — modelled as the `Image` aggregate. Both flows persist metadata in `m_document` / `m_image` and stream the bytes through a pluggable `ContentStoreService` backed by either the local filesystem or Amazon S3.
+
+<Info>
+The module lives at `fineract-document/src/main/java/org/apache/fineract/infrastructure` and is split between two top-level packages: `contentstore` (the low-level byte store — detectors, policies, processors, services) and `documentmanagement` (the JPA entities, JAX-RS resources, command handlers, and business events). A small shared interface — `EntityImageIdAdapter` — lives in `fineract-core` so portfolio modules can opt into the avatar machinery without depending on `fineract-document`.
+</Info>
+
+## Package layout
+
+```text
+fineract-document/src/main/java/org/apache/fineract/infrastructure
+├── contentstore                                  ─ Byte-store abstraction
+│   ├── config/ContentStoreConfig.java            ─ Thread pool for async processors
+│   ├── data/ContentStoreType.java                ─ FILE_SYSTEM (1) / S3 (2)
+│   ├── detector
+│   │   ├── ContentDetector.java                  ─ SPI
+│   │   ├── ContentDetectorContext.java
+│   │   ├── ContentDetectorManager.java
+│   │   ├── DefaultContentDetectorManager.java    ─ wraps TikaContentDetector
+│   │   ├── FileContentDetector.java              ─ JDK Files.probeContentType
+│   │   └── TikaContentDetector.java              ─ Apache Tika
+│   ├── exception
+│   │   ├── ContentDetectorException.java
+│   │   ├── ContentPathSanitizerException.java
+│   │   ├── ContentPolicyException.java
+│   │   ├── ContentProcessorException.java
+│   │   └── ContentStoreException.java
+│   ├── policy
+│   │   ├── ContentPolicy.java                    ─ SPI
+│   │   ├── ContentPolicyContext.java
+│   │   ├── DefaultPreUploadContentPolicy.java    ─ Traversal + Whitelist
+│   │   ├── DefaultPostUploadContentPolicy.java   ─ Mime
+│   │   ├── DefaultDownloadContentPolicy.java     ─ Traversal
+│   │   ├── DefaultDeleteContentPolicy.java       ─ Traversal
+│   │   ├── MimeContentPolicy.java                ─ inline ↔ extension match
+│   │   ├── TraversalContentPolicy.java           ─ ../ defence
+│   │   └── WhitelistContentPolicy.java           ─ regex + mime allowlists
+│   ├── processor                                 ─ Composable byte transforms
+│   │   ├── ContentProcessor.java                 ─ SPI w/ .then(other)
+│   │   ├── ContentProcessorContext.java
+│   │   ├── Base64{Encoder,Decoder}ContentProcessor.java
+│   │   ├── DataUrl{Encoder,Decoder}ContentProcessor.java
+│   │   ├── Gzip{Encoder,Decoder}ContentProcessor.java
+│   │   ├── ImageResizeContentProcessor.java      ─ Thumbnailator
+│   │   └── SizeContentProcessor.java
+│   ├── service
+│   │   ├── ContentStoreService.java              ─ SPI
+│   │   ├── FileContentStoreService.java          ─ @ConditionalOnProperty filesystem.enabled
+│   │   └── S3ContentStoreService.java            ─ @ConditionalOnProperty s3.enabled
+│   └── util
+│       ├── ContentPathRandomizer.java            ─ random subfolder for filesystem
+│       ├── ContentPathSanitizer.java             ─ Path.normalize
+│       ├── ContentPipe.java
+│       ├── DefaultContentPathRandomizer.java
+│       └── DefaultContentPathSanitizer.java
+├── documentmanagement                            ─ JPA + JAX-RS layer
+│   ├── api
+│   │   ├── DocumentApiConstants.java             ─ param-name constants
+│   │   ├── DocumentApiResource.java              ─ /v1/{entityType}/{entityId}/documents
+│   │   ├── FileUploadValidator.java              ─ multipart validator
+│   │   ├── ImageApiConstants.java
+│   │   └── ImagesApiResource.java                ─ /v1/{entityType}/{entityId}/images
+│   ├── command
+│   │   ├── DocumentCommand.java                  ─ @Deprecated legacy POJO
+│   │   ├── Document{Create,Update,Delete}Command.java
+│   │   └── Image{Create,Delete}Command.java
+│   ├── data
+│   │   ├── DocumentContent.java                  ─ stream + content-type + size
+│   │   ├── Document{Create,Update,Delete}{Request,Response}.java
+│   │   ├── DocumentData.java                     ─ read-side DTO
+│   │   └── Image{Create,Delete}{Request,Response}.java
+│   ├── domain
+│   │   ├── Document.java                         ─ @Table("m_document") Spring Data JDBC
+│   │   ├── DocumentRepository.java               ─ ListCrudRepository
+│   │   ├── Image.java                            ─ @Table("m_image")
+│   │   └── ImageRepository.java
+│   ├── exception
+│   │   ├── DocumentInvalidRequestException.java
+│   │   └── DocumentNotFoundException.java
+│   ├── handler
+│   │   ├── Document{Create,Update,Delete}CommandHandler.java
+│   │   └── Image{Create,Delete}CommandHandler.java
+│   ├── mapping
+│   │   └── DocumentMapper.java                   ─ MapStruct
+│   └── service
+│       ├── Document{Read,Write}PlatformService.java
+│       ├── Document{Read,Write}PlatformServiceImpl.java
+│       ├── Image{Read,Write}PlatformService.java
+│       └── Image{Read,Write}PlatformServiceImpl.java
+└── event/business/domain/document
+    ├── DocumentBusinessEvent.java
+    ├── DocumentCreatedBusinessEvent.java
+    └── DocumentDeletedBusinessEvent.java
+```
+
+## Conceptual flow
+
+```mermaid
+flowchart LR
+    subgraph API["JAX-RS layer"]
+        DOC[DocumentApiResource\n/v1/{entityType}/{entityId}/documents]
+        IMG[ImagesApiResource\n/v1/{entityType}/{entityId}/images]
+    end
+
+    subgraph Cmd["Command pipeline"]
+        CR[DocumentCreateCommand]
+        UP[DocumentUpdateCommand]
+        DL[DocumentDeleteCommand]
+        ICR[ImageCreateCommand]
+        IDL[ImageDeleteCommand]
+        H[*CommandHandler]
+    end
+
+    subgraph Svc["Platform services"]
+        DWS[DocumentWritePlatformService]
+        IWS[ImageWritePlatformService]
+        DRS[DocumentReadPlatformService]
+        IRS[ImageReadPlatformService]
+    end
+
+    subgraph Store["ContentStoreService\n(one bean active)"]
+        FS[FileContentStoreService\nFILE_SYSTEM=1]
+        S3[S3ContentStoreService\nS3=2]
+    end
+
+    subgraph Gate["Policies + detection"]
+        TIKA[TikaContentDetector]
+        PRE[DefaultPreUploadContentPolicy\n= Traversal + Whitelist]
+        POST[DefaultPostUploadContentPolicy\n= Mime]
+        DEL[DefaultDeleteContentPolicy]
+        DLD[DefaultDownloadContentPolicy]
+    end
+
+    subgraph DB["Database"]
+        MDOC[m_document]
+        MIMG[m_image]
+    end
+
+    DOC --> CR & UP & DL --> H
+    IMG --> ICR & IDL --> H
+    H --> DWS & IWS
+    DWS --> Store
+    IWS --> Store
+    DOC -.read.-> DRS --> Store
+    IMG -.read.-> IRS --> Store
+    Store --> PRE & POST & DEL & DLD
+    Store --> TIKA
+    DWS --> MDOC
+    IWS --> MIMG
+```
+
+## Test coverage
+
+The module ships a representative test suite under `fineract-document/src/test/java`:
+
+| Test class | What it exercises |
+| --- | --- |
+| `FileContentDetectorTest` | The JDK `Files.probeContentType` fallback path. |
+| `TikaContentDetectorTest` | Stream-driven and filename-driven Tika detection paths, including the `inputStreamEnabled` opt-in. |
+| `MimeContentPolicyTest` | Claimed-vs-detected MIME mismatch rollback. |
+| `TraversalContentPolicyTest` | `../` defence patterns. |
+| `ContentProcessorTest` | Base64, data-URL, gzip, and resize processor composition. |
+| `FileContentStoreServiceTest` | Upload / download / delete against an in-memory file root. |
+| `ImageReadPlatformServiceImplTest` | Reads via `EntityImageIdAdapter` dispatch. |
+| `ImageWritePlatformServiceImplTest` | Writes via `EntityImageIdAdapter` dispatch. |
+
+The S3 backend is intentionally not tested with a real network call; integration testing against MinIO or LocalStack is done in the platform-level integration test module.
+
+## REST surface at a glance
+
+| Path template | JAX-RS class | Notes |
+| --- | --- | --- |
+| `/v1/{entityType}/{entityId}/documents` | `DocumentApiResource` | Multipart upload. `entityType` ∈ {`clients`, `loans`, `savings`, `groups`, `staff`, `client_identifiers`}. |
+| `/v1/{entityType}/{entityId}/documents/{documentId}` | `DocumentApiResource` | GET / PUT / DELETE a single document. |
+| `/v1/{entityType}/{entityId}/documents/{documentId}/attachment` | `DocumentApiResource` | Stream the binary attachment. |
+| `/v1/{entityType}/{entityId}/images` | `ImagesApiResource` | Avatar — POST / PUT / DELETE; GET supports base64 or octet-stream output and resize. |
+
+Both resources share the `entityType` / `entityId` path-variable convention. `entityType` is the URL slug for a domain entity (e.g. `clients`); it is persisted on the `Document` row as `parent_entity_type` and on the `Image` row indirectly via the `EntityImageIdAdapter` that knows how to write the foreign key.
+
+## Exception hierarchy
+
+| Exception | Layer | Cause |
+| --- | --- | --- |
+| `DocumentNotFoundException` | documentmanagement | `findById` miss, or wrong `(entityType, entityId)`. |
+| `DocumentInvalidRequestException` | documentmanagement | Wraps write-time failures (validation, I/O, policy). |
+| `ContentStoreException` | contentstore | Underlying I/O or S3 failure. |
+| `ContentPolicyException` | contentstore | Pre-/post-upload / download / delete policy refused. |
+| `ContentDetectorException` | contentstore | Tika failure. |
+| `ContentPathSanitizerException` | contentstore | Sanitizer refused the path. |
+| `ContentProcessorException` | contentstore | Processor (resize / base64 / gzip) failed. |
+
+All exceptions are unchecked. The first three are surfaced as `400` / `404` / `500` by the global exception mapper; the policy ones consistently map to `400`.
+
+## ContentStoreService abstraction
+
+Every byte that flows through the module passes through the small `ContentStoreService` SPI:
+
+```java
+public interface ContentStoreService {
+    String EXTENSION_REGEX = "^.+\\..+$";
+    String DELIMITER       = "/";
+
+    InputStream  download(String path);
+    String       upload  (String path, InputStream is, String mimeType);
+    void         delete  (String path);
+    ContentStoreType getType();
+    default String getDelimiter() { return DELIMITER; }
+}
+```
+
+Two implementations are present: `FileContentStoreService` (`@ConditionalOnProperty(name = "fineract.content.filesystem.enabled", havingValue = "true")`) and `S3ContentStoreService` (`@ConditionalOnProperty(name = "fineract.content.s3.enabled", havingValue = "true")`). Exactly one must be enabled at runtime. They are detailed in [S3 and filesystem storage](s3-and-filesystem-storage).
+
+## Database tables
+
+| Table | Bound entity | Purpose | Mapping |
+| --- | --- | --- | --- |
+| `m_document` | `Document` | One row per attached file. Columns: `parent_entity_type`, `parent_entity_id`, `name`, `file_name`, `size`, `type`, `description`, `location`, `storage_type_enum`. | Spring Data JDBC `@Table("m_document")`. |
+| `m_image` | `Image` | One row per avatar. Columns: `location`, `storage_type_enum`. The link back to the owning entity lives on the parent row (`m_client.image_id`, `m_staff.image_id`, etc.). | Spring Data JDBC `@Table("m_image")`. |
+
+Both tables live in the same Fineract tenant database; neither carries a SQL FK to portfolio tables because the platform deliberately keeps the documents subsystem agnostic to which portfolio modules are deployed. Referential integrity is a convention enforced by the write services.
+
+## Common entity types
+
+The `parent_entity_type` column accepts any string but practically takes one of:
+
+| Value | Owning table | URL slug | Adapter |
+| --- | --- | --- | --- |
+| `clients` | `m_client` | `clients` | `ClientImageIdAdapter` |
+| `staff` | `m_staff` | `staff` | `StaffImageIdAdapter` |
+| `loans` | `m_loan` | `loans` | (documents only) |
+| `savings` | `m_savings_account` | `savings` | (documents only) |
+| `groups` | `m_group` | `groups` | (documents only) |
+| `client_identifiers` | `m_client_identifier` | `client_identifiers` | (documents only) |
+
+The string is also the URL slug used in the JAX-RS path template `/v1/{entityType}/{entityId}/documents`, so callers never need to translate between user-facing path segments and database values.
+
+## Versioning and history
+
+Neither `m_document` nor `m_image` tracks history natively — there are no `*_history` tables and no `revision` column on the entities. The only forms of versioning available are:
+
+1. **Backend-level versioning** — when the active `ContentStoreService` is `S3ContentStoreService` and the configured bucket has S3 versioning enabled, every overwrite preserves the prior object version. Administrators can recover deleted documents via the AWS console / SDK.
+2. **Business events for create / delete** — subscribers can log to an external audit store.
+
+If full history is a requirement, you must either layer versioning in via a custom `ContentStoreService` decorator or persist a copy of each blob to a separate archive bucket on `DocumentDeletedBusinessEvent`.
+
+## Storage type enum
+
+`ContentStoreType` is the enum that gets persisted onto each `Document.storage_type_enum` / `Image.storage_type_enum` so the read path can later route the location string back to the right store:
+
+```java
+public enum ContentStoreType {
+    FILE_SYSTEM(1),
+    S3(2);
+}
+```
+
+Older legacy code still mentions a third variant (DB-backed BLOB storage); in current Fineract that mode has been removed and only `FILE_SYSTEM` and `S3` are wired.
+
+## Detector and policy layers
+
+Independent of which backend handles the bytes, every upload, download, and delete passes through two layers of safety:
+
+1. **Detector layer** — `ContentDetectorManager` (default impl wraps `TikaContentDetector`) is responsible for deriving a canonical MIME type and file extension from either the filename or the byte stream. Apache Tika provides the underlying magic-byte sniffing.
+2. **Policy layer** — four aggregate beans (`DefaultPreUploadContentPolicy`, `DefaultPostUploadContentPolicy`, `DefaultDownloadContentPolicy`, `DefaultDeleteContentPolicy`) gate the four operations. Each delegates to atomic policies: `TraversalContentPolicy` (no `../`), `WhitelistContentPolicy` (filename regex + MIME allowlist), `MimeContentPolicy` (Tika re-verification post-upload).
+
+The full chain is documented in [Detector and policies](detector-and-policies).
+
+## Command pipeline integration
+
+Document and image writes use Fineract's modern `CommandPipeline` (`org.apache.fineract.command.core.CommandPipeline`) rather than the older `PortfolioCommandSourceWritePlatformService`:
+
+```mermaid
+flowchart LR
+    Res[DocumentApiResource\nImagesApiResource] -->|new XxxCommand + setPayload| Pipe[CommandPipeline]
+    Pipe -->|@CommandHandler dispatch| Handler[Document/Image*CommandHandler]
+    Handler --> Service[Document/Image*WritePlatformService]
+    Service --> Store[ContentStoreService]
+    Service --> Bus[BusinessEventNotifierService]
+```
+
+Commands carry a strongly-typed `payload` (`DocumentCreateRequest`, `DocumentUpdateRequest`, `DocumentDeleteRequest`, `ImageCreateRequest`, `ImageDeleteRequest`) built from the JAX-RS layer. The handler simply forwards the payload to the matching platform service.
+
+## Business events
+
+Each successful document write publishes a `BusinessEvent` on Fineract's notifier bus:
+
+| Event | When |
+| --- | --- |
+| `DocumentCreatedBusinessEvent` | After `createDocument(...)` commits. |
+| `DocumentDeletedBusinessEvent` | After `deleteDocument(...)` commits. |
+
+Both carry a `DocumentData` payload. Subscribers register `BusinessEventListener<DocumentCreatedBusinessEvent>` beans to react. Note: no update event is published yet (there is a `// TODO` in `DocumentWritePlatformServiceImpl.updateDocument`).
+
+## Where to go next
+
+- **[Document management domain](document-management-domain)** — the `Document` and `Image` Spring Data JDBC entities, `DocumentRepository`, and the legacy `DocumentCommand` POJO.
+- **[Document API](document-api)** — endpoint-by-endpoint reference for `DocumentApiResource`, including the multipart shape.
+- **[Images API](images-api)** — `ImagesApiResource` and the data-URL / base64 encoding pipeline.
+- **[Content store](content-store)** — the `ContentStoreService` interface, factory selection, and `ContentStoreType`.
+- **[S3 and filesystem storage](s3-and-filesystem-storage)** — backend-specific configuration and permissions.
+- **[Detector and policies](detector-and-policies)** — Apache Tika detection, whitelist policies, traversal defence, size enforcement.
+- See also: [Portfolio / Clients](/portfolio/clients), [API / Document APIs](/api/document-apis), [Organisation / Offices](/organisation/offices).

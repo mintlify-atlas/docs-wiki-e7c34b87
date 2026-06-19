@@ -1,0 +1,396 @@
+---
+title: "Docker Compose Profiles for Local Fineract Stacks"
+sidebarTitle: "Compose Profiles"
+description: "Every docker-compose-*.yml at the Fineract repository root: which database, message broker, observability stack, manager/worker topology, and frontend each profile spins up."
+---
+
+Apache Fineract ships **twelve** `docker-compose-*.yml` profiles at the repository root, each one composing different combinations of database (MariaDB / PostgreSQL / MySQL), message broker (none / ActiveMQ / Kafka / Kafka-MSK), observability (none / Grafana-Loki-Prometheus-Tempo), worker topology (single-node / manager-and-workers), and frontend (none / Mifos community app / Mifos web-app). They all extend the lower-level service definitions under `config/docker/compose/` and pull their environment from `config/docker/env/*.env`. This page enumerates each profile, lists its services, and shows when to use which.
+
+## How the profiles compose
+
+There are two layers:
+
+1. **Profile files at the repo root** (`docker-compose.yml`, `docker-compose-postgresql.yml`, …). These are the entry points you invoke with `docker compose -f <file> up`. They typically only contain `extends:` blocks that reference the building blocks.
+2. **Building-block files under `config/docker/compose/`**:
+    - `mariadb.yml` — single MariaDB 12.2 container with initialization scripts.
+    - `postgresql.yml` — PostgreSQL 18.3 container.
+    - `activemq.yml` — Apache ActiveMQ Classic 5.18.3 broker.
+    - `fineract.yml` — the `fineract` service (Jib-built image, healthcheck, volumes, logback override).
+    - `fineract-custom.yml` — variant that uses the `fineract-custom:latest` image built by `:custom:docker:jibDockerBuild`.
+    - `observability.yml` — Loki, Prometheus, Grafana, Tempo.
+    - `logging-loki.yml` — Loki log driver template.
+
+The env files (`config/docker/env/*.env`) carry tenant credentials, Hikari tuning, JVM options, broker URLs, and the Loki / Tempo / Prometheus endpoints.
+
+The `fineract` building block (`config/docker/compose/fineract.yml`) is the canonical service definition:
+
+```yaml
+services:
+  fineract:
+    image: fineract:latest
+    user: "${FINERACT_USER}:${FINERACT_GROUP}"
+    volumes:
+      - ${PWD}/config/docker/logback/logback-override.xml:/app/logback-override.xml
+      - ${PWD}/config/docker/aws/etc/credentials:/etc/aws/credentials:ro
+      - ${PWD}/build/fineract/logs:/var/logs/fineract:rw
+    healthcheck:
+      test: ["CMD", 'sh', '-c', 'while ! nc -z "localhost" 8443; do sleep 1; done;' ]
+      timeout: 1s
+      retries: 60
+```
+
+The image is the one produced by `./gradlew :fineract-provider:jibDockerBuild` (see [Dockerfile & Jib](/build/dockerfile-and-jib)).
+
+## Profile reference
+
+The table below summarises every root-level compose file:
+
+| File | DB | Broker | Topology | Observability | Frontend | Use when |
+| --- | --- | --- | --- | --- | --- | --- |
+| `docker-compose.yml` | MariaDB | none | single `fineract` | none | none | Quickstart: classic stack on MariaDB. |
+| `docker-compose-mariadb.yml` | MariaDB only | n/a | DB only | none | none | Run a DB locally while running `bootRun` from your IDE. |
+| `docker-compose-mysql.yml` | MySQL 8 only | n/a | DB only | none | none | Same as above but MySQL 8. |
+| `docker-compose-postgresql.yml` | PostgreSQL | none | single `fineract` | none | none | Postgres equivalent of the default stack. |
+| `docker-compose-postgresql-activemq.yml` | PostgreSQL | ActiveMQ | `fineract-manager` + 2× `fineract-worker` | none | none | Multi-node COB + remote job execution against ActiveMQ. |
+| `docker-compose-postgresql-test-activemq.yml` | PostgreSQL | ActiveMQ | single `fineract` | none | none | CI: run integration tests against ActiveMQ-backed events without splitting manager/worker. |
+| `docker-compose-postgresql-kafka.yml` | PostgreSQL | Kafka (Apache 4.1) | manager + 2 workers | none | none | Same as activemq variant but Kafka-based. |
+| `docker-compose-postgresql-kafka-msk.yml` | PostgreSQL | Kafka MSK (IAM) | manager + 2 workers | none | none | Pre-prod against an AWS MSK cluster (uses `aws.env` + `kafka-client-msk.env`). |
+| `docker-compose-development.yml` | MariaDB | none | single `fineract` (with debug port) | Loki + Prometheus + Grafana + Tempo | none | Local development with full observability + JDWP on 5000. |
+| `docker-compose-custom.yml` | MariaDB | none | single `fineract` using `fineract-custom:latest` | none | none | Run the Docker image that includes all custom modules. |
+| `docker-compose-community-app.yml` | n/a | n/a | UI only | n/a | `openmf/community-app:latest` on port 9090 | Add the legacy Mifos community UI on top of any backend profile. |
+| `docker-compose-web-app.yml` | n/a | n/a | UI only | n/a | `openmf/web-app:master` on port 4200 | Add the modern Mifos web app on top of any backend profile. |
+
+Compose files are designed to be combined. To run Fineract + Mifos web app + Loki you can do:
+
+```sh
+docker compose \
+  -f docker-compose-development.yml \
+  -f docker-compose-web-app.yml \
+  up
+```
+
+The `-f` flag is order-sensitive — the second file overlays / extends services from the first.
+
+## Per-profile detail
+
+### `docker-compose.yml` — default MariaDB stack
+
+```yaml
+services:
+  db:
+    extends:
+      file: ./config/docker/compose/mariadb.yml
+      service: mariadb
+  fineract:
+    extends:
+      file: ./config/docker/compose/fineract.yml
+      service: fineract
+    ports:
+      - "8443:8443"
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-mariadb.env
+```
+
+| Service | Image | Ports | Env files |
+| --- | --- | --- | --- |
+| `db` | `mariadb:12.2` | 3306 (host) | `mysql.env` |
+| `fineract` | `fineract:latest` | 8443 (https) + 5000 (JDWP) | `fineract.env`, `fineract-common.env`, `fineract-mariadb.env` |
+
+Use this when you want the simplest possible "spin up everything" workflow. Default credentials are in `mariadb.env` / `fineract-common.env`.
+
+### `docker-compose-mariadb.yml` — DB only
+
+Spins up only the MariaDB 12.2 container. Mounts custom `server_collation.cnf` and `mariadb_compat.cnf` so collation matches what Liquibase expects, and runs the SQL bootstrap from `docker-entrypoint-initdb.d/`. Healthcheck uses `healthcheck.sh --su-mysql --connect --innodb_initialized`. Use it when you want to run Fineract from your IDE (`./gradlew :fineract-provider:bootRun`) with a real database.
+
+### `docker-compose-mysql.yml` — MySQL alternative
+
+Same shape as the MariaDB-only file but pulls `mysql:8` and uses `mysql.env`. Use this to verify MySQL-specific behaviour before opening a PR against the MySQL CI matrix.
+
+### `docker-compose-postgresql.yml` — Postgres stack
+
+```yaml
+services:
+  db:
+    extends:
+      file: ./config/docker/compose/postgresql.yml
+      service: postgresql
+  fineract:
+    extends:
+      file: ./config/docker/compose/fineract.yml
+      service: fineract
+    ports:
+      - "8443:8443"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-postgresql.env
+```
+
+| Service | Image | Ports | Env files |
+| --- | --- | --- | --- |
+| `db` | `postgres:18.3` | 5432 (host) | `postgresql.env` |
+| `fineract` | `fineract:latest` | 8443 | `fineract.env`, `fineract-common.env`, `fineract-postgresql.env` |
+
+The PG init script in `config/docker/postgresql/docker-entrypoint-initdb.d/01-init.sh` creates the `fineract_tenants` and `fineract_default` databases.
+
+### `docker-compose-postgresql-activemq.yml` — manager + workers + ActiveMQ
+
+The flagship "distributed" profile:
+
+| Service | Image | Replicas | Ports | Env files |
+| --- | --- | --- | --- | --- |
+| `activemq` | `symptoma/activemq:5.18.3` | 1 | 6161 (console), 61616 (broker) | n/a |
+| `db` | `postgres:18.3` | 1 | 5432 | `postgresql.env` |
+| `fineract-manager` | `fineract:latest` | 1 | 8443 | `fineract-manager.env`, `fineract-common.env`, `fineract-postgresql.env`, `activemq.env` |
+| `fineract-worker` | `fineract:latest` | 2 | 8444–8445 (mapped from 8443) | `fineract-worker.env`, `fineract-common.env`, `fineract-postgresql.env`, `activemq.env` |
+
+Workers `depends_on: fineract-manager: service_healthy`, so they only start once the manager has bootstrapped the schema and Liquibase changelogs. ActiveMQ Classic carries job-execution events and external business events. The manager flips into pure-coordinator mode (no Spring Batch worker steps) via `fineract-manager.env`; workers do the opposite.
+
+### `docker-compose-postgresql-test-activemq.yml` — single-node ActiveMQ for CI
+
+```yaml
+services:
+  activemq: { … }
+  db: { … }
+  fineract:
+    ports: ["8443:8443"]
+    env_file:
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-postgresql.env
+      - ./config/docker/env/activemq.env
+```
+
+Used by the integration-test runner when it wants ActiveMQ-emitted events but does not want to coordinate three containers.
+
+### `docker-compose-postgresql-kafka.yml` — manager + workers + Kafka
+
+```yaml
+services:
+  kafka:
+    image: "apache/kafka:4.1.1-rc2"
+    ports: ["9092:9092"]
+    env_file: [./config/docker/env/kafka-server.env]
+  db: { … }
+  fineract-manager: { …, env_file includes kafka-client.env }
+  fineract-worker:  { deploy: { replicas: 2 }, … }
+```
+
+Same topology as the ActiveMQ variant, but the broker is Apache Kafka 4.1 in KRaft mode. Use when validating the Kafka-based external-event publisher (`fineract-investor` and the event-bus modules).
+
+### `docker-compose-postgresql-kafka-msk.yml` — AWS MSK variant
+
+Drops the local `kafka` container and points the manager + workers at AWS MSK using IAM auth:
+
+```yaml
+fineract-manager:
+  env_file:
+    - ./config/docker/env/fineract-manager.env
+    - ./config/docker/env/fineract-common.env
+    - ./config/docker/env/fineract-postgresql.env
+    - ./config/docker/env/aws.env
+    - ./config/docker/env/kafka-client-msk.env
+```
+
+`aws.env` provides `AWS_REGION` / `AWS_ROLE_ARN`; `kafka-client-msk.env` provides the bootstrap servers and `sasl.client.callback.handler.class=software.amazon.msk.auth.iam.IAMClientCallbackHandler`. You also need to mount AWS credentials at `/etc/aws/credentials` (the building block does so via the `${PWD}/config/docker/aws/etc/credentials` volume).
+
+### `docker-compose-development.yml` — full observability + JDWP
+
+This is the richest profile. It overlays Loki, Prometheus, Grafana, and Tempo on top of the default MariaDB stack and pipes container logs into Loki via the Docker `loki` driver:
+
+```yaml
+x-logging: &default-logging
+  driver: loki
+  options:
+    loki-url: 'http://localhost:3100/api/prom/push'
+    loki-pipeline-stages: |
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3}'
+      - regex:
+          expression: '^(?P<date>\d{4}-\d{2}-\d{2}) (?P<time>\d{2}:\d{2}:\d{2}.\d{3}) (?P<message>(?s:.*))$$'
+
+services:
+  loki:        { extends: { file: observability.yml, service: loki }       }
+  prometheus:  { depends_on: [loki], extends: { … service: prometheus } }
+  grafana:     { depends_on: [loki], extends: { … service: grafana }    }
+  tempo:       { depends_on: [loki], extends: { … service: tempo }      }
+  db:          { … logging: *default-logging }
+  fineract:
+    container_name: fineract-development
+    ports: ["8443:8443", "5000:5000"]
+    env_file:
+      - ./config/docker/env/aws.env
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-mariadb.env
+      - ./config/docker/env/tracing.env
+      - ./config/docker/env/oltp.env
+      - ./config/docker/env/prometheus.env
+      - ./config/docker/env/debug.env
+    logging: *default-logging
+    networks:
+      default:
+        aliases: [fineract-server]
+```
+
+Services and ports:
+
+| Service | Image | Host ports |
+| --- | --- | --- |
+| `loki` | `grafana/loki:2.9.2` | 3100 |
+| `prometheus` | `prom/prometheus:v2.47.2` | 9090 |
+| `grafana` | `grafana/grafana-oss:10.2.0` | 3000 |
+| `tempo` | `grafana/tempo:2.2.4` | 14268, 3200, 9095, 4317, 4318, 9411 |
+| `db` | `mariadb:12.2` | 3306 |
+| `fineract` | `fineract:latest` | 8443, 5000 (JDWP) |
+
+The `debug.env` file enables JDWP on `5000` so you can attach an IntelliJ remote debugger. Tempo exposes OTLP gRPC/HTTP receivers (4317/4318); `tracing.env` configures the OpenTelemetry agent baked into the image. Grafana auto-provisions Loki and Prometheus datasources via mounted volumes.
+
+### `docker-compose-custom.yml` — fineract-custom image
+
+```yaml
+services:
+  db: { …mariadb extension… }
+  fineract:
+    extends:
+      file: ./config/docker/compose/fineract-custom.yml
+      service: fineract
+    ports: ["8443:8443"]
+    env_file:
+      - ./config/docker/env/fineract.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-mariadb.env
+```
+
+The `fineract-custom.yml` building block overrides the image:
+
+```yaml
+services:
+  fineract:
+    image: ${IMAGE_NAME:-fineract-custom:latest}
+```
+
+So you can do `IMAGE_NAME=acme/fineract-acme:1.2.3 docker compose -f docker-compose-custom.yml up` to run a downstream-built image. The default is the local `fineract-custom:latest` produced by `./gradlew :custom:docker:jibDockerBuild` (see [custom modules](/build/custom-modules)).
+
+### `docker-compose-community-app.yml` — legacy UI overlay
+
+```yaml
+services:
+  community-app:
+    image: openmf/community-app:latest
+    container_name: mifos-ui
+    restart: always
+    ports:
+      - 9090:80
+```
+
+Single container, no DB, no backend. You combine it with one of the backend profiles. The legacy app expects `/fineract-provider` to be reachable; you can wire it through with a reverse proxy or run a separate dev session.
+
+### `docker-compose-web-app.yml` — modern UI overlay
+
+```yaml
+services:
+  community-app:
+    image: openmf/web-app:master
+    container_name: mifos-web-app
+    restart: always
+    ports:
+      - 4200:80
+```
+
+The newer Angular-based web app. Same shape: image-only, overlay onto your backend stack.
+
+## Environment matrix
+
+The `config/docker/env/*.env` files are reused across profiles:
+
+| File | Purpose |
+| --- | --- |
+| `fineract.env` | Single-node defaults (sets `FINERACT_NODE_ID=1`). |
+| `fineract-manager.env` | Marks the node as a manager (no batch worker steps). |
+| `fineract-worker.env` | Marks the node as a worker. |
+| `fineract-common.env` | Hikari pool sizing, SSL, default tenant, JVM options including `-agentlib:jdwp=…` and the `--add-opens` flags. |
+| `fineract-mariadb.env` / `fineract-postgresql.env` | JDBC URL, driver class, dialect. |
+| `mariadb.env` / `mysql.env` / `postgresql.env` | Root password, default DB names for the DB container. |
+| `activemq.env` | Broker URL `tcp://activemq:61616`. |
+| `kafka-server.env` | Kafka broker configuration (KRaft). |
+| `kafka-client.env` | Client bootstrap servers `kafka:9092`. |
+| `kafka-client-msk.env` | MSK IAM authentication. |
+| `aws.env` | AWS region + STS role variables. |
+| `cloudwatch.env` | CloudWatch metrics exporter switches. |
+| `oltp.env` | Open Telemetry exporter configuration. |
+| `tracing.env` | OTEL collector endpoint. |
+| `prometheus.env` | Prometheus scrape configuration. |
+| `debug.env` | Enables JDWP on 5000. |
+
+`fineract-common.env` is where most JVM tunables live:
+
+```env
+JAVA_TOOL_OPTIONS="-Xmx1G -XX:MinRAMPercentage=25 -XX:MaxRAMPercentage=80 \
+  -XX:TieredStopAtLevel=1 -XX:+UseContainerSupport -XX:+UseStringDeduplication \
+  -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5000 \
+  --add-exports=java.naming/com.sun.jndi.ldap=ALL-UNNAMED \
+  --add-opens=java.base/java.lang=ALL-UNNAMED \
+  …"
+```
+
+The `--add-opens` flags mirror those in `gradle.properties` — EclipseLink, Bouncy Castle and Jackson all need reflective access on JDK 21.
+
+## Volumes and bind mounts
+
+The `fineract.yml` building block mounts three host paths:
+
+```yaml
+volumes:
+  - ${PWD}/config/docker/logback/logback-override.xml:/app/logback-override.xml
+  - ${PWD}/config/docker/aws/etc/credentials:/etc/aws/credentials:ro
+  - ${PWD}/build/fineract/logs:/var/logs/fineract:rw
+```
+
+| Mount | Purpose |
+| --- | --- |
+| `logback-override.xml` → `/app/logback-override.xml` | Replaces the embedded logback config. The image's Spring Boot bootstrap picks `LOGBACK_OVERRIDE_FILE=/app/logback-override.xml`. |
+| `aws/etc/credentials` → `/etc/aws/credentials` (ro) | Mounts AWS credentials when running the MSK or S3 profiles. |
+| `build/fineract/logs` → `/var/logs/fineract` (rw) | Persists rolled log files outside the container. Created by Gradle when you first build. |
+
+## Healthchecks
+
+Every backend profile waits for the database healthcheck (`db: condition: service_healthy`) before starting Fineract. The Fineract healthcheck is the trivial TCP probe baked into `fineract.yml`:
+
+```yaml
+healthcheck:
+  test: ["CMD", 'sh', '-c', 'while ! nc -z "localhost" 8443; do sleep 1; done;']
+  timeout: 1s
+  retries: 60
+```
+
+i.e. wait up to ~60 seconds for the HTTPS port. Spring Boot's `/actuator/health/liveness` and `/actuator/health/readiness` endpoints are wired up in production via the [Kubernetes manifests](/build/kubernetes-manifests) — the compose stack stops at the port probe.
+
+## Choosing a profile
+
+| Goal | Profile |
+| --- | --- |
+| Run Fineract for the first time | `docker-compose.yml` |
+| Local development with hot-reload from your IDE | `docker-compose-mariadb.yml` or `docker-compose-postgresql.yml` (DB only) |
+| Local development with full observability + debugger | `docker-compose-development.yml` |
+| Validate manager + worker code paths | `docker-compose-postgresql-activemq.yml` or `-kafka.yml` |
+| Run downstream / customer image | `docker-compose-custom.yml` |
+| Add a UI on top | `+ docker-compose-web-app.yml` (or `community-app`) |
+| Pre-prod against AWS MSK | `docker-compose-postgresql-kafka-msk.yml` |
+
+## Related
+
+- [Dockerfile & Jib](/build/dockerfile-and-jib) — how the `fineract:latest` image referenced by every profile is built.
+- [Kubernetes manifests](/build/kubernetes-manifests) — the production equivalent of these compose stacks.
+- [Custom modules](/build/custom-modules) — where the `fineract-custom:latest` image comes from.
+- [Repository layout](/overview/repository-layout) — where each compose file and env file lives.
+- [Testing overview](/testing/overview) — which profile each test suite expects.

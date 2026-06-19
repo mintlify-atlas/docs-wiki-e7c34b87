@@ -1,0 +1,331 @@
+---
+title: "Currencies and Monetary — Money, MonetaryCurrency, Tenant Whitelist"
+sidebarTitle: "Currencies & Monetary"
+description: "Fineract ApplicationCurrency, OrganisationCurrency, embeddable MonetaryCurrency, the Money value object, rounding rules and CurrenciesApiResource whitelist."
+---
+
+In Apache Fineract every monetary amount carries its **currency** with it — there is no implicit "base currency". Loan principal, savings balances, fee charges, GL journal lines, fee waivers, even the inter-office cash transfers all flow through one of three currency types: the catalogue `ApplicationCurrency`, the per-tenant whitelist `OrganisationCurrency`, and the embeddable `MonetaryCurrency`. The arithmetic itself happens on the immutable `Money` value object. This page maps all four to their JPA columns, walks through `Money` rounding (including the unusual `inMultiplesOf` rule), and documents `/v1/currencies` for the tenant whitelist.
+
+<Note>
+All four classes live in `fineract-core/.../organisation/monetary/`. The JAX-RS resource is also in `fineract-core` (unusually — most resources are in `fineract-provider`), because currency configuration is one of the very few things every other module needs to read during boot.
+</Note>
+
+## Module layout
+
+| Class | Module | Role |
+| --- | --- | --- |
+| `ApplicationCurrency` (`m_currency`) | `fineract-core` | Master catalogue of currencies known to the platform |
+| `OrganisationCurrency` (`m_organisation_currency`) | `fineract-core` | The subset enabled for **this** tenant |
+| `MonetaryCurrency` | `fineract-core` | `@Embeddable` tuple `(code, digitsAfterDecimal, inMultiplesOf)` stored alongside amounts |
+| `Money` | `fineract-core` | Immutable value object — amount + `CurrencyData` |
+| `CurrencyData` | `fineract-core` | DTO mirror of `MonetaryCurrency` plus display metadata |
+| `MoneyHelper` | `fineract-core` | Static rounding / `MathContext` provider |
+| `ApplicationCurrencyRepository` / `…Wrapper` | `fineract-core` | Catalogue access |
+| `OrganisationCurrencyRepository` / `…Wrapper` | `fineract-core` | Whitelist access |
+| `MoneySerializer` / `MoneyDeserializer` | `fineract-core` | Gson adapters |
+| `CurrenciesApiResource` | `fineract-core` | `/v1/currencies` — get/update whitelist |
+| `CurrencyUpdateCommand` / `…Handler` | `fineract-core` | Whitelist write command |
+| `CurrencyWritePlatformServiceJpaRepositoryImpl` | `fineract-provider` | Diff old vs. new whitelist, raise `CurrencyInUseException` |
+
+## `ApplicationCurrency` — the catalogue
+
+```java
+// fineract-core/.../monetary/domain/ApplicationCurrency.java
+@Entity
+@Table(name = "m_currency")
+public class ApplicationCurrency extends AbstractPersistableCustom<Long> {
+    @Column(name = "code",          nullable = false, length = 3) private String code;
+    @Column(name = "decimal_places", nullable = false)             private Integer decimalPlaces;
+    @Column(name = "currency_multiplesof")                          private Integer inMultiplesOf;
+    @Column(name = "name", nullable = false, length = 50)          private String name;
+    @Column(name = "internationalized_name_code", nullable = false, length = 50) private String nameCode;
+    @Column(name = "display_symbol", length = 10)                  private String displaySymbol;
+    // …
+    public OrganisationCurrency toOrganisationCurrency() {
+        return new OrganisationCurrency(this.code, this.name, this.decimalPlaces, this.inMultiplesOf,
+                                        this.nameCode, this.displaySymbol);
+    }
+}
+```
+
+The bootstrap loads ~160 ISO 4217 currencies into `m_currency`. Each row carries:
+
+| Column | Notes |
+| --- | --- |
+| `code` | ISO three-letter code — `USD`, `EUR`, `INR`, … |
+| `decimal_places` | 0, 2, or 3 depending on the currency |
+| `currency_multiplesof` | Optional — if set (with `decimal_places=0`), amounts are rounded to multiples of this number. Used for currencies like IDR where cash typically circulates in `1000`s. |
+| `name` | English long form, e.g. `"US Dollar"` |
+| `internationalized_name_code` | Localisation key, e.g. `"currency.USD"` |
+| `display_symbol` | Glyph, e.g. `"$"` |
+
+## `OrganisationCurrency` — per-tenant whitelist
+
+```java
+@Entity
+@Table(name = "m_organisation_currency")
+public class OrganisationCurrency extends AbstractPersistableCustom<Long> {
+    @Column(name = "code", nullable = false, length = 3) private String code;
+    @Column(name = "decimal_places", nullable = false)    private Integer decimalPlaces;
+    @Column(name = "currency_multiplesof")                 private Integer inMultiplesOf;
+    @Column(name = "name", nullable = false, length = 50) private String name;
+    @Column(name = "internationalized_name_code", nullable = false, length = 50) private String nameCode;
+    @Column(name = "display_symbol", length = 10)         private String displaySymbol;
+
+    public final MonetaryCurrency toMonetaryCurrency() {
+        return new MonetaryCurrency(this.code, this.decimalPlaces, this.inMultiplesOf);
+    }
+}
+```
+
+`m_organisation_currency` is a copy of the `ApplicationCurrency` row, made when an admin adds a currency to the tenant. The duplication is intentional: it lets a tenant **override** `decimal_places` or `inMultiplesOf` per their internal policy without mutating the global catalogue.
+
+The default seed inserts a single row — `USD` — for the bootstrap tenant. Adding `EUR` and `INR` is what `PUT /v1/currencies` does.
+
+## `MonetaryCurrency` — the embeddable tuple
+
+```java
+@Getter
+@Embeddable
+public class MonetaryCurrency {
+
+    @Column(name = "currency_code", length = 3, nullable = false) private String code;
+    @Column(name = "currency_digits", nullable = false)            private int digitsAfterDecimal;
+    @Column(name = "currency_multiplesof")                         private Integer inMultiplesOf;
+
+    @Getter(AccessLevel.PRIVATE)
+    private transient CurrencyData currencyData;
+
+    public MonetaryCurrency(final String code, final int digitsAfterDecimal, final Integer inMultiplesOf) { … }
+
+    public static MonetaryCurrency fromApplicationCurrency(ApplicationCurrency app) {
+        return new MonetaryCurrency(app.getCode(), app.getDecimalPlaces(), app.getCurrencyInMultiplesOf());
+    }
+
+    public static MonetaryCurrency fromCurrencyData(final CurrencyData currencyData) {
+        return new MonetaryCurrency(currencyData);
+    }
+}
+```
+
+This is the tuple that gets `@Embedded` on most domain rows — loan, savings account, journal entry, charge, office transaction, …:
+
+```java
+// example: OfficeTransaction
+@Embedded
+private MonetaryCurrency currency;
+```
+
+Persisting it adds three columns to the host table: `currency_code`, `currency_digits`, `currency_multiplesof`. Note `decimalPlaces` is the schema column name in `m_currency` but `currency_digits` is the column name when embedded — same value, different name (historical).
+
+## `Money` — the immutable value object
+
+```java
+public class Money implements Comparable<Money> {
+
+    private final BigDecimal amount;
+    private final CurrencyData currency;
+    private final transient MathContext mc;
+
+    private Money(final CurrencyData currency, final BigDecimal amount, final MathContext mc) {
+        this.currency = currency;
+        this.mc = mc;
+        final BigDecimal amountZeroed = defaultToZeroIfNull(amount);
+        BigDecimal amountScaled = amountZeroed.stripTrailingZeros();
+
+        // round monetary amounts into multiples of say 20/50.
+        if (currency.getInMultiplesOf() != null
+                && currency.getDecimalPlaces() == 0
+                && currency.getInMultiplesOf() > 0
+                && MathUtil.isGreaterThanZero(amountScaled)) {
+            amountScaled = roundToMultiplesOf(amountScaled, currency.getInMultiplesOf());
+        }
+        this.amount = amountScaled.setScale(currency.getDecimalPlaces(), getMc().getRoundingMode());
+    }
+}
+```
+
+Key properties:
+
+| Concern | Behaviour |
+| --- | --- |
+| Immutability | Every arithmetic method returns a **new** `Money`; the instance is final. |
+| Scale | Final amount is `setScale(decimalPlaces, RoundingMode)`. The `MathContext` comes from `MoneyHelper.getMathContext()` which honours the global config `rounding-mode` (default `HALF_EVEN`). |
+| `inMultiplesOf` rule | Applied **only** when `decimalPlaces == 0` AND `inMultiplesOf > 0`. e.g. an IDR amount of `12_345` with `inMultiplesOf = 100` becomes `12_300`. Currencies with decimal places ignore this column. |
+| Currency safety | Arithmetic between different `code`s raises an `IllegalArgumentException` via `checkCurrencyEqual(...)`. |
+
+Common factories and operators (excerpted):
+
+```java
+public static Money zero(MonetaryCurrency currency)            { … }
+public static Money of(MonetaryCurrency currency, BigDecimal a){ … }
+public Money plus (Money other)        { … }
+public Money minus(Money other)        { … }
+public Money multipliedBy(BigDecimal)  { … }
+public Money dividedBy(BigDecimal, RoundingMode) { … }
+public static Money total(Money... monies)        { … }
+public boolean isGreaterThan(Money other)         { … }
+public boolean isLessThan   (Money other)         { … }
+public boolean isZero()                            { … }
+public BigDecimal getAmountDefaultedToNullIfZero() { … }
+```
+
+`Money` does not implement `equals`/`hashCode` on the amount alone — currency is part of identity. Tests should compare with `Money.equals(...)` and not `BigDecimal.equals(...)`.
+
+### `MoneyHelper`
+
+```java
+public final class MoneyHelper {
+    public static MathContext getMathContext()  { … }
+    public static RoundingMode getRoundingMode() { … }
+}
+```
+
+The `MathContext` precision is `19` (matching `numeric(19, 6)` on the DB) and the rounding mode is whatever the global configuration `rounding-mode` resolves to (`HALF_EVEN` by default). See [configuration properties](/core/configuration-properties).
+
+### Gson adapters
+
+`MoneySerializer` writes a `Money` as the raw `BigDecimal` of `getAmount()` (currency travels in a sibling field of the parent JSON). `MoneyDeserializer` reads the same, then asks the parent context for the currency. This is why `Money` rarely appears as a stand-alone JSON object in the public API.
+
+## `CurrenciesApiResource` — `/v1/currencies`
+
+```java
+@Path("/v1/currencies")
+@Component
+@Tag(name = "Currency",
+     description = "Application related configuration around viewing/updating the currencies permitted for use within the MFI.")
+@RequiredArgsConstructor
+public class CurrenciesApiResource {
+    private final OrganisationCurrencyReadPlatformService readPlatformService;
+    private final CommandPipeline                         commandPipeline;
+}
+```
+
+| Method | Path | Handler | Command | Permission |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/currencies` | `retrieveCurrencies` | — | `READ_CURRENCY` |
+| PUT | `/v1/currencies` | `updateCurrencies` | `CurrencyUpdateCommand` | `UPDATE_CURRENCY` (+`_CHECKER`) |
+
+### `GET /v1/currencies`
+
+```java
+@GET
+@Operation(summary = "Retrieve Currency Configuration",
+           description = "Returns the list of currencies permitted for use AND the list of currencies not selected (but available for selection).")
+public CurrencyConfigurationData retrieveCurrencies() {
+    return readPlatformService.retrieveCurrencyConfiguration();
+}
+```
+
+Response shape (`CurrencyConfigurationData`):
+
+```json
+{
+  "selectedCurrencyOptions": [
+    { "code": "USD", "name": "US Dollar", "decimals": 2, "inMultiplesOf": 0,
+      "displaySymbol": "$", "nameCode": "currency.USD" }
+  ],
+  "currencyOptions": [
+    { "code": "EUR", "name": "Euro",       "decimals": 2, "inMultiplesOf": 0,
+      "displaySymbol": "€", "nameCode": "currency.EUR" },
+    { "code": "INR", "name": "Indian Rupee","decimals": 2, "inMultiplesOf": 0,
+      "displaySymbol": "₹", "nameCode": "currency.INR" }
+    // …all other catalogue entries…
+  ]
+}
+```
+
+- `selectedCurrencyOptions` — the per-tenant whitelist (`m_organisation_currency`), the only currencies that may appear on new products and accounts.
+- `currencyOptions` — the catalogue minus the selected ones; what an admin may *add*.
+
+`?fields=selectedCurrencyOptions` is a useful sparse-field request for clients that only need the whitelist.
+
+### `PUT /v1/currencies`
+
+```java
+@PUT
+public CurrencyUpdateResponse updateCurrencies(@Valid CurrencyUpdateRequest request) {
+    final var command = new CurrencyUpdateCommand();
+    command.setPayload(request);
+    final Supplier<CurrencyUpdateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+Body:
+
+```java
+public class CurrencyUpdateRequest {
+    @NotNull  @NotEmpty
+    private List<String> currencies;
+}
+```
+
+```json
+{ "currencies": ["USD", "EUR", "INR"] }
+```
+
+The body **replaces** the whitelist with the supplied set. The write service:
+
+1. Loads existing `OrganisationCurrency` rows.
+2. Computes the set difference.
+3. For each removed code, checks whether any **product, account, journal, or charge** references it. If so → `CurrencyInUseException` (HTTP 409, `error.msg.currency.in.use`).
+4. For each added code, looks up the catalogue row in `m_currency`. Missing → `CurrencyNotFoundException` (HTTP 404, `error.msg.currency.not.found`).
+5. Persists the new set and returns the changes.
+
+Response:
+
+```json
+{
+  "currencyCodes": ["USD", "EUR", "INR"],
+  "changes": { "currencies": ["USD", "EUR", "INR"] }
+}
+```
+
+## Repository wrappers
+
+| Wrapper | Method | Raises |
+| --- | --- | --- |
+| `ApplicationCurrencyRepositoryWrapper` | `findOneWithNotFoundDetection(code)` | `CurrencyNotFoundException` |
+| `OrganisationCurrencyRepositoryWrapper` | `findOneWithNotFoundDetection(code)` | `OrganizationalCurrencyNotFoundException` |
+
+Most domain write paths (loan create, savings create, charge create, …) resolve the currency through `OrganisationCurrencyRepositoryWrapper` so they implicitly enforce the whitelist:
+
+```java
+OrganisationCurrency org = orgCurrencyWrapper.findOneWithNotFoundDetection(code);
+MonetaryCurrency embeddable = org.toMonetaryCurrency();
+```
+
+## Exceptions
+
+| Exception | HTTP | Message key |
+| --- | --- | --- |
+| `CurrencyNotFoundException` | 404 | `error.msg.currency.not.found` |
+| `OrganizationalCurrencyNotFoundException` | 404 | `error.msg.organisation.currency.not.found` |
+| `CurrencyInUseException` | 409 | `error.msg.currency.in.use` |
+| `InvalidCurrencyException` | 400 | `error.msg.currency.invalid` |
+
+## How `Money` plumbs into other modules
+
+- **Loan**: `m_loan` has `principal_amount`, `arrears_tolerance_amount`, `total_outstanding_derived`, etc., all decorated with `@Embedded MonetaryCurrency currency`. Every arithmetic step uses `Money.plus/minus/multipliedBy`.
+- **Savings**: same pattern on `m_savings_account` and every `m_savings_account_transaction`.
+- **Charge**: `m_charge.amount` carries its own currency; many fees are denominated in a different currency than the host product (e.g. USD fee on an INR loan), which is why `Money` does not implicitly convert.
+- **Journal entry**: `m_journal_entry.currency_code` joins back to `m_organisation_currency` so the GL is whitelist-bound too.
+- **Office transactions**: `OfficeTransaction.currency` is the embedded `MonetaryCurrency` — see [offices](/organisation/offices).
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_CURRENCY` | List/retrieve currency configuration |
+| `UPDATE_CURRENCY`, `UPDATE_CURRENCY_CHECKER` | Replace the whitelist + maker–checker |
+
+## See also
+
+- [Offices](/organisation/offices) — `OfficeTransaction.currency` is an embedded `MonetaryCurrency`.
+- [Provisioning criteria](/organisation/provisioning-criteria) — definitions inherit the loan product's currency.
+- [Organisation shared domain](/core/organisation-shared-domain) — package map.
+- [Configuration properties](/core/configuration-properties) — `rounding-mode`.
+- [Serialization and JSON](/core/serialization-and-json) — Gson adapters for `Money`.
+- [Organisation APIs](/api/organisation-apis) — Swagger payloads for `/v1/currencies`.
+- [Security overview](/security/overview) — `CURRENCY` permission resource.

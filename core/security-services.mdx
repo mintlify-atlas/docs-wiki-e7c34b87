@@ -1,0 +1,289 @@
+---
+title: "Security Services — Core SPIs and SQL Safety"
+sidebarTitle: "Security SPIs"
+description: "Reference for fineract-core security interfaces: PlatformSecurityContext, password encoders, RandomPasswordGenerator, SqlValidator, SqlInjectionPreventerService."
+---
+
+`fineract-core` ships the **security service-provider interfaces** that anything below the API layer depends on: the contract that lets a service ask "who is logged in?", encode a password before persistence, validate a free-form SQL fragment, or escape a database identifier before injecting it into a dynamic statement. The implementations of these interfaces — Spring Security filters, JWT decoders, BCrypt encoders, password-policy validators — live in `fineract-security` so different deployments can swap them out (basic auth vs. OAuth2 vs. CAS) without touching the rest of the codebase. This page is the reference for the **SPIs and helpers** that ship in core.
+
+<Note>
+The interfaces here are deliberately small and stable. The Spring Security configuration, authentication filters, and JWT support live in `fineract-security`. See [Security overview](/security/overview) for the runtime side.
+</Note>
+
+## Package layout
+
+| Subpackage                                | Purpose                                                              |
+| ----------------------------------------- | -------------------------------------------------------------------- |
+| `infrastructure/security/service/`        | Public service interfaces (one per concern)                          |
+| `infrastructure/security/domain/`         | `PlatformUser` minimal user contract                                 |
+| `infrastructure/security/exception/`      | Security-specific runtime exceptions                                 |
+| `infrastructure/security/utils/`          | Default implementations + SQL safety helpers                         |
+
+## `PlatformUser` — minimal user contract
+
+```java
+// infrastructure/security/domain/PlatformUser.java
+public interface PlatformUser extends UserDetails { /* marker over Spring's UserDetails */ }
+```
+
+`AppUser` ([Users domain](/core/useradministration-domain)) implements this. `BasicPasswordEncodablePlatformUser` is a trivial detached value used by the `PlatformPasswordEncoder` for one-off encoding tasks (e.g. checking password history):
+
+```java
+public class BasicPasswordEncodablePlatformUser implements PlatformUser {
+    private Long id;
+    private String username;
+    private String password;
+    // setters via @Setter @Accessors(chain = true)
+}
+```
+
+The encoder doesn't need authorities, locked status, etc. — only `username` and `password` — so this thin shell exists to avoid materialising a real `AppUser` for password-only operations.
+
+## `PlatformPasswordEncoder` — hash a user's password
+
+```java
+public interface PlatformPasswordEncoder {
+    String encode(PlatformUser appUser);
+}
+```
+
+A single method. The implementation in `fineract-security` typically delegates to BCrypt with a configurable strength. Taking a `PlatformUser` (not just the raw string) lets implementations include the username in the salt or apply per-user policies.
+
+`AppUser.updatePassword(...)` calls this through its `PlatformPasswordEncoder` field — entities don't hold a raw `BCryptPasswordEncoder` so they stay deserialisable in test scenarios.
+
+## `PasswordEncryptor` — symmetric two-way encryption
+
+```java
+public interface PasswordEncryptor {
+    String encrypt(String plainPassword);
+    String decrypt(String encryptedPassword);
+}
+```
+
+Used for the very small set of cases where Fineract has to **recover** a stored secret — typically integration credentials for external systems (SMS provider tokens, hook authorization headers). User passwords are **never** encrypted, only hashed via `PlatformPasswordEncoder`. The default implementation uses `EncryptionUtil` (see below) with a master key from configuration.
+
+## `PlatformSecurityContext` — the principal getter
+
+```java
+public interface PlatformSecurityContext extends PlatformUserRightsContext {
+
+    AppUser authenticatedUser();
+    AppUser getAuthenticatedUserIfPresent();
+
+    void validateAccessRights(String resourceOfficeHierarchy);
+    String officeHierarchy();
+
+    boolean doesPasswordHasToBeRenewed(AppUser currentUser);
+
+    AppUser authenticatedUser(CommandWrapper commandWrapper);
+}
+```
+
+The workhorse interface every service in Fineract depends on. Semantics:
+
+- **`authenticatedUser()`** — returns the current `AppUser` or throws `UnAuthenticatedUserException` if none. Use it in API-layer code.
+- **`getAuthenticatedUserIfPresent()`** — returns `null` instead of throwing. Use it in code paths shared between API and batch jobs (jobs run with no authenticated user).
+- **`validateAccessRights(officeHierarchy)`** — throws `NoAuthorizationException` if the current user's office isn't an ancestor of the given hierarchy. Used by every entity that has an `office_id` column (clients, loans, journal entries) to enforce branch-level visibility.
+- **`officeHierarchy()`** — current user's branch path (e.g. `.1.4.`). Used to scope SQL queries.
+- **`doesPasswordHasToBeRenewed(user)`** — checks the configured password expiry against `user.lastTimePasswordUpdated`.
+- **`authenticatedUser(commandWrapper)`** — like `authenticatedUser()` but also performs the `taskPermissionName` check derived from the `CommandWrapper` (entity + action).
+
+```java
+public interface PlatformUserRightsContext {
+    void isAuthenticated();
+}
+```
+
+The parent interface lets components require *some* authenticated user without depending on the full security context.
+
+## `PlatformUserDetailsService`
+
+```java
+public interface PlatformUserDetailsService extends UserDetailsService {
+    // no added behaviour
+}
+```
+
+A marker over Spring Security's `UserDetailsService`. Defined in core so authentication filters in `fineract-security` can reference the bean type without leaking Spring Security types into business code. Implementations load `AppUser` by username and resolve roles, permissions, and authorities.
+
+## `RandomPasswordGenerator`
+
+```java
+public class RandomPasswordGenerator {
+
+    private final int numberOfCharactersInPassword;
+    private static final SecureRandom secureRandom = new SecureRandom();
+
+    public RandomPasswordGenerator(int numberOfCharactersInPassword) {
+        this.numberOfCharactersInPassword = numberOfCharactersInPassword;
+    }
+
+    public String generate() {
+        StringBuilder passwordBuilder = new StringBuilder(this.numberOfCharactersInPassword);
+        for (int i = 0; i < this.numberOfCharactersInPassword; i++) {
+            passwordBuilder.append((char) ((int) (secureRandom.nextDouble() * 26) + 97));
+        }
+        return passwordBuilder.toString();
+    }
+}
+```
+
+Generates a lowercase-only ASCII password of fixed length. Used by `AppUser` self-service flows when creating a temporary password before sending a reset email. The output is **not** appropriate for production storage on its own — callers feed it through `PlatformPasswordEncoder` immediately.
+
+<Warning>
+Range `'a'..'z'` only. The intent is short-lived single-use tokens; if your policy requires uppercase or digits, replace the generator bean.
+</Warning>
+
+## `SqlInjectionPreventerService`
+
+```java
+public interface SqlInjectionPreventerService {
+
+    String encodeSql(String literal);
+
+    String quoteIdentifier(String identifier, Set<String> allowedValues);
+    String quoteIdentifier(String identifier);
+}
+```
+
+Two distinct concerns:
+
+- **`encodeSql(literal)`** — escapes a string literal for safe interpolation (used in legacy `String.format` SQL building). Prefer parameterised statements over this.
+- **`quoteIdentifier(identifier)`** — wraps a database identifier (table/column) using DB-specific quote characters (Postgres uses `"`, MySQL uses backticks). Used by **datatables** and reports where the table/column names come from data, not source code. The overload with `allowedValues` additionally rejects identifiers not in a whitelist — the safest way to defang dynamic schema names.
+
+```java
+String column = sqlInjectionPreventer.quoteIdentifier("client_id",
+        Set.of("client_id", "loan_id", "savings_id"));
+String sql   = "SELECT * FROM m_client WHERE " + column + " = ?";
+```
+
+`IllegalArgumentException` is thrown if the identifier is null, empty, or not in the whitelist.
+
+## `SqlValidator`
+
+```java
+public interface SqlValidator {
+    void validate(String statement) throws SqlValidationException;
+    void validate(String profile, String statement) throws SqlValidationException;
+}
+```
+
+Static defence for **operator-supplied SQL** — e.g. ad-hoc reports stored in the `stretchy_report` table or datatable definitions written by an admin. Default implementation (`DefaultSqlValidator`) runs a series of regex matchers against a configurable blacklist (DDL statements, `;`-stacked queries, `INTO OUTFILE`, etc.). Profiles let the validator load different rules for different call sites (e.g. report-builder vs. datatable-script).
+
+```java
+@Component
+public class DefaultSqlValidator implements SqlValidator {
+
+    private final FineractProperties properties;
+    // reads properties.getSqlValidation().getProfiles()
+    // throws SqlValidationException with the matching rule's id
+
+    @Override public void validate(String statement) { ... }
+    @Override public void validate(String profile, String statement) { ... }
+}
+```
+
+`SqlValidationException` extends `AbstractPlatformDomainRuleException` so it propagates through the API layer with HTTP 400 status.
+
+## SQL safety helpers
+
+### `SQLBuilder`
+
+```java
+public class SQLBuilder {
+    private static final Pattern ATOZ =
+        Pattern.compile("([a-zA-Z_][a-zA-Z0-9_-]*\\.)?[a-zA-Z_-][a-zA-Z0-9_-]*");
+    // holds the query, with '?' placeholders, and the parameters
+}
+```
+
+A typed builder for assembling WHERE clauses without manual string concatenation:
+
+```java
+SQLBuilder where = new SQLBuilder();
+where.addCriteria("c.office_id =", officeId);
+where.addCriteria("c.status_enum =", ClientStatus.ACTIVE.getValue());
+String sql = "SELECT * FROM m_client c " + where.getSQLTemplate();
+jdbcTemplate.query(sql, where.getArguments(), rowMapper);
+```
+
+The `ATOZ` pattern enforces that column references are pure identifiers (optionally `table.column`), refusing anything containing punctuation or quotes — so even if a developer passes a tainted variable as the **left-hand side** of a criterion, the builder rejects it.
+
+### `ColumnValidator`
+
+A `JdbcTemplate`-backed helper that loads the actual list of columns for a given table from JDBC metadata and validates that a caller-supplied column name exists. Used by datatable read services and report builders to reject queries against renamed/dropped columns at request time instead of erroring at SQL parse.
+
+### `EncryptionUtil`
+
+PBKDF2 + AES helpers used by `PasswordEncryptor`:
+
+```java
+public final class EncryptionUtil {
+    public static String encryptToBase64(String cipherType, String masterPassword, String data);
+    public static String decryptFromBase64(String cipherType, String masterPassword, String encryptedBase64);
+}
+```
+
+`cipherType` is one of `AES/CBC/PKCS5Padding`, `AES/GCM/NoPadding`, etc. The salt and IV are generated per-encryption and prepended to the output, so the same plaintext encrypts to different ciphertexts each time.
+
+### `LogParameterEscapeUtil`
+
+Strips control characters and newlines from user-supplied identifiers before they hit the logger. Prevents log injection attacks where a malicious username like `"admin\n2024-01-01 user=victim"` could forge log lines.
+
+### `SQLCommandCondition` / `SQLInjectionException`
+
+`SQLInjectionException` is the legacy form thrown by the regex defences; `SqlValidationException` is the newer pattern. `SQLCommandCondition` is a `@Conditional` used by some configuration beans that activate only when SQL validation is enabled in `FineractProperties`.
+
+## Exceptions
+
+| Class                                  | Trigger                                                     | HTTP                  |
+| -------------------------------------- | ----------------------------------------------------------- | --------------------- |
+| `NoAuthorizationException`             | Office/permission check failed                              | 403                   |
+| `InvalidTenantIdentifierException`     | Unknown tenant id in the `Fineract-Platform-TenantId` header| 401                   |
+| `InvalidInstanceTypeMethodException`   | Method blocked by [instance mode](/core/instance-mode)      | 405                   |
+| `SqlValidationException`               | Operator-supplied SQL hit a blacklist rule                  | 400                   |
+
+`UnAuthenticatedUserException` lives in `useradministration/exception/` because it concerns the missing `AppUser` rather than the security layer; it is the exception `PlatformSecurityContext.authenticatedUser()` throws.
+
+## Typical service-layer usage
+
+```java
+@Service
+@RequiredArgsConstructor
+public class ClientWritePlatformServiceImpl {
+
+    private final PlatformSecurityContext context;
+
+    @Transactional
+    public CommandProcessingResult create(JsonCommand command) {
+        AppUser currentUser = context.authenticatedUser(); // throws if no principal
+        Client client = Client.fromJson(command, ...);
+        context.validateAccessRights(client.officeHierarchy());
+        // ... persist
+    }
+}
+```
+
+For a job/background path that may run anonymously:
+
+```java
+AppUser maybeUser = context.getAuthenticatedUserIfPresent();
+String actor = maybeUser != null ? maybeUser.getUsername() : "system";
+```
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Security Implementation" icon="lock" href="/security/overview">
+    Spring Security filter chain, authentication providers, JWT, two-factor.
+  </Card>
+  <Card title="Users Domain" icon="user" href="/core/useradministration-domain">
+    `AppUser`, `Role`, `Permission` — the entities behind `PlatformSecurityContext`.
+  </Card>
+  <Card title="Commands Framework" icon="terminal" href="/core/commands-framework">
+    `taskPermissionName` checks performed by `authenticatedUser(commandWrapper)`.
+  </Card>
+  <Card title="Tenancy" icon="building" href="/tenancy/overview">
+    `InvalidTenantIdentifierException` and tenant resolution.
+  </Card>
+</CardGroup>

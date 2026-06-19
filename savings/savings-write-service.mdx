@@ -1,0 +1,524 @@
+---
+title: "Savings Write Service Reference - Apache Fineract Wiki"
+sidebarTitle: "Write Service"
+description: "Every method on SavingsAccountWritePlatformServiceJpaRepositoryImpl: deposit, withdrawal, postInterest, charges, hold, block, activate, close."
+---
+
+`SavingsAccountWritePlatformServiceJpaRepositoryImpl` is Apache Fineract's central mutator for savings accounts. Every state change that touches an active passbook savings or deposit account — deposit, withdrawal, interest posting, charge add / pay / waive, hold / release, block / unblock, activate, close — routes here from a Spring `CommandHandler`. The class lives at `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsAccountWritePlatformServiceJpaRepositoryImpl.java` (1992 lines) and implements the `SavingsAccountWritePlatformService` interface defined in `fineract-savings`. This page documents every public method engineers reach when extending savings: signatures, side effects, validation hooks and the business events emitted.
+
+## Wiring
+
+The bean is registered by `SavingsConfiguration` and depends on a long list of collaborators — repository wrappers, validators, the [commands framework](/core/commands-framework), the accounting processor and the [business event](/core/event-business) notifier.
+
+```java
+@Override @Transactional
+public CommandProcessingResult deposit(final Long savingsId, final JsonCommand command) {
+    this.context.authenticatedUser();
+    this.savingsAccountTransactionDataValidator.validate(command);
+    boolean isGsim = false;
+
+    final boolean backdatedTxnsAllowedTill = this.savingAccountAssembler.getPivotConfigStatus();
+    final SavingsAccount account = this.savingAccountAssembler.assembleFrom(savingsId, backdatedTxnsAllowedTill);
+
+    if (account.getGsim() != null) {
+        isGsim = true;
+    }
+    checkClientOrGroupActive(account);
+    ...
+}
+```
+
+The collaborators by responsibility:
+
+| Collaborator | Role |
+|--------------|------|
+| `PlatformSecurityContext context` | tenant + user |
+| `SavingsAccountAssembler savingAccountAssembler` | builds `SavingsAccount` from id or JSON, injects helpers |
+| `SavingsAccountRepositoryWrapper savingAccountRepositoryWrapper` | not-found-throwing repository |
+| `SavingsAccountTransactionRepository savingsAccountTransactionRepository` | transaction CRUD |
+| `SavingsAccountChargeRepository savingsAccountChargeRepository` | charge CRUD |
+| `SavingsAccountDomainService savingsAccountDomainService` | non-CRUD domain operations (`handleDeposit`, `handleWithdrawal`, `handleHold`) |
+| `SavingsAccountTransactionDataValidator` / `SavingsAccountChargeDataValidator` | JSON shape + business pre-conditions |
+| `PaymentDetailWritePlatformService` | creates `PaymentDetail` rows |
+| `NoteRepository noteRepository` | attaches operator notes |
+| `ConfigurationDomainService configurationDomainService` | tenant flags (e.g. `isSavingsInterestPostingAtCurrentPeriodEnd`) |
+| `BusinessEventNotifierService businessEventNotifierService` | publishes `SavingsXxxBusinessEvent` |
+| `JournalEntryWritePlatformService` (via `postJournalEntries`) | invokes the [accounting processor](/accounting/accounting-processors) |
+| `EntityDatatableChecksWritePlatformService` | datatable approvals on activate/close |
+| `GSIMRepositoy gsimRepository` | GSIM parent-deposit rollup |
+| `DepositAccountOnHoldTransactionRepository` | lien / on-hold check during balance validation |
+| `HolidayRepository`, `WorkingDaysRepository` | charge / payment date validation |
+
+## Boilerplate that repeats
+
+Almost every method shares the same skeleton:
+
+```java
+@Transactional @Override
+public CommandProcessingResult xxx(Long savingsId, JsonCommand command) {
+    this.context.authenticatedUser();
+    validator.validate(command);
+
+    final boolean backdatedTxnsAllowedTill = savingAccountAssembler.getPivotConfigStatus();
+    final SavingsAccount account = savingAccountAssembler.assembleFrom(savingsId, backdatedTxnsAllowedTill);
+    checkClientOrGroupActive(account);
+
+    final Set<Long> existingTransactionIds = new HashSet<>();
+    final Set<Long> existingReversedTransactionIds = new HashSet<>();
+    updateExistingTransactionsDetails(account, existingTransactionIds, existingReversedTransactionIds);
+
+    // ... mutate account / build transactions ...
+
+    savingAccountRepositoryWrapper.saveAndFlush(account);
+    postJournalEntries(account, existingTransactionIds, existingReversedTransactionIds, isAccountTransfer);
+    businessEventNotifierService.notifyPostBusinessEvent(new SavingsXxxBusinessEvent(account));
+
+    return new CommandProcessingResultBuilder().withEntityId(...)
+        .withOfficeId(account.officeId()).withClientId(account.clientId())
+        .withGroupId(account.groupId()).withSavingsId(savingsId).with(changes).build();
+}
+```
+
+The `existingTransactionIds` / `existingReversedTransactionIds` sets are the diff inputs for `postJournalEntries` — only the newly inserted / newly reversed transactions are passed to the accounting layer.
+
+## Application lifecycle
+
+### `activate(Long, JsonCommand)`
+
+Promotes an `APPROVED` application into an `ACTIVE` account. Runs the datatable approval checks, calls `account.activate(user, command)` which validates and stamps the activation date / user, then `processPostActiveActions` — which (a) deposits the `minRequiredOpeningBalance` if positive, (b) calls `account.processAccountUponActivation` (which seeds the first interest-posting day) and (c) validates that the activation hasn't pushed the balance below zero given any deposit-account-on-hold rows. Emits `SavingsActivateBusinessEvent`.
+
+```java
+final Map<String, Object> changes = account.activate(user, command);
+entityDatatableChecksWritePlatformService.runTheCheckForProduct(
+    savingsId, EntityTables.SAVINGS.getName(), StatusEnum.ACTIVATE.getValue(),
+    EntityTables.SAVINGS.getForeignKeyColumnNameOnDatatable(), account.productId());
+
+if (!changes.isEmpty()) {
+    final Locale locale = command.extractLocale();
+    final DateTimeFormatter fmt = DateTimeFormatter.ofPattern(command.dateFormat()).withLocale(locale);
+    processPostActiveActions(account, fmt, existingTransactionIds, existingReversedTransactionIds);
+    this.savingAccountRepositoryWrapper.saveAndFlush(account);
+}
+
+postJournalEntries(account, existingTransactionIds, existingReversedTransactionIds, false);
+businessEventNotifierService.notifyPostBusinessEvent(new SavingsActivateBusinessEvent(account));
+```
+
+`processPostActiveActions` itself:
+
+```java
+Money amountForDeposit = account.activateWithBalance();
+boolean isRegularTransaction = false;
+if (amountForDeposit.isGreaterThanZero()) {
+    boolean isAccountTransfer = false;
+    this.savingsAccountDomainService.handleDeposit(account, fmt,
+        account.getActivationDate(), amountForDeposit.getAmount(), null,
+        isAccountTransfer, isRegularTransaction, false);
+    updateExistingTransactionsDetails(account, existingTransactionIds, existingReversedTransactionIds);
+}
+account.processAccountUponActivation(isSavingsInterestPostingAtCurrentPeriodEnd, financialYearBeginningMonth);
+
+if (account.getOnHoldFunds().compareTo(BigDecimal.ZERO) > 0) {
+    depositAccountOnHoldTransactions = this.depositAccountOnHoldTransactionRepository
+        .findBySavingsAccountAndReversedFalseOrderByCreatedDateAsc(account);
+}
+account.validateAccountBalanceDoesNotBecomeNegative(
+    SavingsAccountTransactionType.PAY_CHARGE.name(), depositAccountOnHoldTransactions, false);
+```
+
+### `close(Long, JsonCommand)`
+
+`ACTIVE` → `CLOSED`. Refuses if the account is linked to any active loan, then either posts interest (if `postInterestValidationOnClosure = true`) or insists the operator has done so already, optionally withdraws the remaining balance (`withdrawBalance = true`), runs the entity's own `close(user, command)` to stamp the closed-on date/user, disables standing instructions that targeted this account and emits `SavingsCloseBusinessEvent`.
+
+```java
+final boolean isLinkedWithAnyActiveLoan =
+    this.accountAssociationsReadPlatformService.isLinkedWithAnyActiveAccount(savingsId);
+if (isLinkedWithAnyActiveLoan) {
+    throw new SavingsAccountClosingNotAllowedException("linked", defaultUserMessage, savingsId);
+}
+...
+if (isWithdrawBalance && account.getSummary().getAccountBalance(account.getCurrency()).isGreaterThanZero()) {
+    this.savingsAccountDomainService.handleWithdrawal(account, fmt, closedDate, transactionAmount,
+        paymentDetail, transactionBooleanValues, false);
+}
+final Map<String, Object> accountChanges = account.close(user, command);
+businessEventNotifierService.notifyPostBusinessEvent(new SavingsCloseBusinessEvent(account));
+disableStandingInstructionsLinkedToClosedSavings(account);
+```
+
+### Other application transitions
+
+These five are slim wrappers around `SavingsApplicationProcessWritePlatformServiceJpaRepositoryImpl` (different class), but they are exercised through the same set of API commands. Documented here for completeness:
+
+| Method | Command on accounts API | Entry on entity |
+|--------|-------------------------|-----------------|
+| `approveApplication` | `?command=approve` | `account.approveApplication(user, command)` |
+| `undoApplicationApproval` | `?command=undoapproval` | `account.undoApplicationApproval(...)` |
+| `rejectApplication` | `?command=reject` | `account.rejectApplication(user, command)` |
+| `applicantWithdrawsFromApplication` | `?command=withdrawnByApplicant` | `account.applicantWithdrawsFromApplication(...)` |
+| `deleteApplication` | `DELETE /v1/savingsaccounts/{id}` | physical delete; only when status = SUBMITTED |
+
+## Monetary transactions
+
+### `deposit(Long, JsonCommand)`
+
+```java
+final SavingsAccount account = savingAccountAssembler.assembleFrom(savingsId, backdatedTxnsAllowedTill);
+...
+final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+final BigDecimal transactionAmount = command.bigDecimalValueOfParameterNamed("transactionAmount");
+this.savingsAccountTransactionDataValidator.validateTransactionWithPivotDate(transactionDate, account);
+
+final PaymentDetail paymentDetail =
+    this.paymentDetailWritePlatformService.createAndPersistPaymentDetail(command, changes);
+boolean isAccountTransfer = false;
+boolean isRegularTransaction = true;
+final SavingsAccountTransaction deposit = this.savingsAccountDomainService.handleDeposit(
+    account, fmt, transactionDate, transactionAmount, paymentDetail,
+    isAccountTransfer, isRegularTransaction, backdatedTxnsAllowedTill);
+
+if (isGsim && (deposit.getId() != null)) {
+    GroupSavingsIndividualMonitoring gsim = gsimRepository.findById(account.getGsim().getId()).orElseThrow();
+    gsim.setParentDeposit(gsim.getParentDeposit().add(transactionAmount));
+    gsimRepository.save(gsim);
+}
+```
+
+`handleDeposit` in `SavingsAccountDomainServiceJpa` is the place that:
+
+1. validates the deposit against the sub-status (`BLOCK_CREDIT` → throw `SavingsAccountCreditsBlockedException`),
+2. calls `SavingsAccountTransaction.deposit(...)`,
+3. appends the transaction onto the account,
+4. invokes `account.recalculateDailyBalances` to refresh `running_balance_derived` on every transaction newer than the deposit,
+5. updates `summary.totalDeposits` and `summary.accountBalance`,
+6. fires `SavingsDepositBusinessEvent`.
+
+`gsimDeposit(gsimId, command)` loops the child accounts and delegates one `deposit` per child.
+
+### `withdrawal(Long, JsonCommand)`
+
+Same skeleton but calls `handleWithdrawal`. The boolean knobs encode the business intent:
+
+```java
+final boolean isAccountTransfer = false;
+final boolean isRegularTransaction = true;
+final boolean isApplyWithdrawFee = true;
+final boolean isInterestTransfer = false;
+final boolean isWithdrawBalance = false;
+final SavingsTransactionBooleanValues transactionBooleanValues = new SavingsTransactionBooleanValues(
+    isAccountTransfer, isRegularTransaction, isApplyWithdrawFee, isInterestTransfer, isWithdrawBalance);
+final SavingsAccountTransaction withdrawal = this.savingsAccountDomainService.handleWithdrawal(
+    account, fmt, transactionDate, transactionAmount, paymentDetail,
+    transactionBooleanValues, backdatedTxnsAllowedTill);
+```
+
+`handleWithdrawal` raises an `InsufficientAccountBalanceException` if the post-withdrawal balance is below `minRequiredBalance` (when enforced) or below 0 (when overdraft is not allowed). When the product has a `WITHDRAWAL_FEE` charge, a paired `WITHDRAWAL_FEE` transaction is inserted with the same `transactionDate` — but `isApplyWithdrawFee` must be `true`.
+
+### `forceWithdrawal(Long, JsonCommand)`
+
+Same as `withdrawal` but flips the `isForceWithdrawal` bit on `SavingsTransactionBooleanValues`. That instructs `handleWithdrawal` to skip the minimum-balance and overdraft checks. Operators must hold a dedicated `SAVINGSACCOUNT_FORCEWITHDRAWAL` permission.
+
+### `applyAnnualFee(Long savingsAccountChargeId, Long accountId)`
+
+Walks every overdue cycle of an annual-fee charge and calls `payCharge` until the next due date is in the future:
+
+```java
+final SavingsAccountCharge savingsAccountCharge = savingsAccountChargeRepository
+    .findOneWithNotFoundDetection(savingsAccountChargeId, accountId);
+final LocalDate currentDate = DateUtils.getBusinessLocalDate();
+final DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd MM yyyy")
+    .withZone(DateUtils.getDateTimeZoneOfTenant());
+while (DateUtils.isBefore(savingsAccountCharge.getDueDate(), currentDate)) {
+    this.payCharge(savingsAccountCharge, savingsAccountCharge.getDueDate(),
+        savingsAccountCharge.amount(), fmt, false);
+}
+```
+
+Called from the `applyannualfeeforsavings` job and the `applyAnnualFees` command.
+
+### `calculateInterest(Long savingsId)`
+
+Recomputes pending interest without writing an `INTEREST_POSTING` transaction. Used to refresh the read-side projection (`summary.totalInterestEarned`). No journal entries are produced.
+
+### `postInterest(JsonCommand command)`
+
+The actual posting entry point. Validates that an explicit `transactionDate` is supplied when `isPostInterestAsOn = true`, that the date is not in the future, and that no transaction with a later date exists. Then delegates to the overload `postInterest(account, postInterestAs, transactionDate, backdatedTxnsAllowedTill)`:
+
+```java
+public CommandProcessingResult postInterest(final JsonCommand command) {
+    Long savingsId = command.getSavingsId();
+    final boolean postInterestAs = command.booleanPrimitiveValueOfParameterNamed("isPostInterestAsOn");
+    final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+
+    final boolean backdatedTxnsAllowedTill = savingAccountAssembler.getPivotConfigStatus();
+    final SavingsAccount account = savingAccountAssembler.assembleFrom(savingsId, backdatedTxnsAllowedTill);
+
+    if (postInterestAs) {
+        if (transactionDate == null)
+            throw new PostInterestAsOnDateException(VALID_DATE);
+        if (DateUtils.isBefore(transactionDate, account.accountSubmittedOrActivationDate()))
+            throw new PostInterestAsOnDateException(ACTIVATION_DATE);
+        ...
+        if (DateUtils.isDateInTheFuture(transactionDate))
+            throw new PostInterestAsOnDateException(FUTURE_DATE);
+    }
+    postInterest(account, postInterestAs, transactionDate, backdatedTxnsAllowedTill);
+    businessEventNotifierService.notifyPostBusinessEvent(new SavingsPostInterestBusinessEvent(account));
+    ...
+}
+```
+
+The eager-flush overload posts interest by calling `account.postInterest(mc, today, ...)` inside the entity, which delegates to `domain/interest/PostingPeriod` and produces:
+
+- one or more `INTEREST_POSTING` transactions (one per posting period boundary crossed),
+- zero or more `OVERDRAFT_INTEREST` debits for the negative slices,
+- a paired `WITHHOLD_TAX` debit per posting transaction if `withHoldTax = true`.
+
+A third overload — `postInterest(SavingsAccountData savingsAccountData, ...)` — runs in the batched interest-posting Spring Batch path so multiple accounts can be posted under one transaction. It has a `fallbackPostInterest` companion registered with the resilience-4j circuit breaker.
+
+### `reverseTransaction(savingsId, transactionId, JsonCommand)`
+
+Inserts the **mirror** transaction described on the [transactions page](/savings/savings-transactions#reversal-handling). Marks the original as reversed, persists both, recomputes balances and posts the offsetting journal entries.
+
+### `undoTransaction(savingsId, transactionId, JsonCommand)`
+
+Flips `reversed = true` on the source transaction (no mirror). Only allowed for transactions that don't have downstream effects (e.g. an `INITIATE_TRANSFER` cannot be undone independently of the transfer flow).
+
+### `adjustSavingsTransaction(savingsId, transactionId, JsonCommand)`
+
+Combines `reverse` plus a brand-new transaction with the corrected amount / date / payment detail. Backed by the `?command=modify` token.
+
+## Charge management
+
+### `addSavingsAccountCharge(JsonCommand command)`
+
+Builds a new `SavingsAccountCharge` from the JSON, attaches it to the account, validates the due date against holidays / non-working days and that withdrawal-fee charges never carry a due date:
+
+```java
+Integer chargeTimeType = chargeDefinition.getChargeTimeType();
+LocalDate dueAsOfDateParam = command.localDateValueOfParameterNamed(dueAsOfDateParamName);
+if ((chargeTimeType.equals(ChargeTimeType.WITHDRAWAL_FEE.getValue())
+        || chargeTimeType.equals(ChargeTimeType.SAVINGS_NOACTIVITY_FEE.getValue()))
+        && dueAsOfDateParam != null) {
+    baseDataValidator.reset().parameter(dueAsOfDateParamName).value(dueAsOfDateParam.format(fmt))
+        .failWithCodeNoParameterAddedToErrorCode(
+            "charge.due.date.is.invalid.for." + ChargeTimeType.fromInt(chargeTimeType).getCode());
+}
+final SavingsAccountCharge savingsAccountCharge =
+    SavingsAccountCharge.createNewFromJson(savingsAccount, chargeDefinition, command);
+
+savingsAccount.addCharge(fmt, savingsAccountCharge, chargeDefinition);
+savingsAccountChargeRepository.save(savingsAccountCharge);
+savingAccountRepositoryWrapper.saveAndFlush(savingsAccount);
+```
+
+### `updateSavingsAccountCharge(JsonCommand)`
+
+Updates due date / amount on an unpaid charge. Holiday/non-working day validation repeats.
+
+### `payCharge(Long savingsAccountId, Long savingsAccountChargeId, JsonCommand)`
+
+Pays the supplied amount against the charge, producing a `PAY_CHARGE` (or `WITHDRAWAL_FEE` / `ANNUAL_FEE` depending on charge time type) transaction. Refuses holiday and non-working day dates unless the tenant has enabled the corresponding config:
+
+```java
+if (!this.configurationDomainService.allowTransactionsOnHolidayEnabled()
+        && this.holidayRepository.isHoliday(account.officeId(), transactionDate)) {
+    baseDataValidator.reset().parameter(dueAsOfDateParamName).value(transactionDate.format(fmt))
+        .failWithCodeNoParameterAddedToErrorCode("transaction.not.allowed.transaction.date.is.on.holiday");
+}
+```
+
+The private `payCharge(savingsAccountCharge, transactionDate, amountPaid, fmt, backdatedTxnsAllowedTill)` overload is the workhorse — it loads the account, marks the `SavingsAccountCharge` paid (full or partial), produces the transaction, recomputes balances and runs `validateAccountBalanceDoesNotBecomeNegative`.
+
+### `waiveCharge(Long savingsAccountId, Long savingsAccountChargeId)`
+
+Cancels the unpaid portion of a charge. The waiver itself is not a balance-moving transaction — it produces a `WAIVE_CHARGES` (type 6) audit row tagged `entryType = null` and updates `summary.totalFeeCharge` / `summary.totalPenaltyCharge`. After waiver the engine may need to **post interest** if waiving spans the last posting period, hence:
+
+```java
+account.waiveCharge(savingsAccountChargeId, backdatedTxnsAllowedTill);
+if (account.isBeforeLastPostingPeriod(savingsAccountCharge.getDueDate(), backdatedTxnsAllowedTill)) {
+    account.postInterest(mc, today, isInterestTransfer, isSavingsInterestPostingAtCurrentPeriodEnd,
+        financialYearBeginningMonth, postInterestOnDate, backdatedTxnsAllowedTill, postReversals);
+} else {
+    account.calculateInterestUsing(mc, today, isInterestTransfer, ...);
+}
+```
+
+### `deleteSavingsAccountCharge(Long savingsAccountId, Long savingsAccountChargeId, JsonCommand)`
+
+Hard-deletes the charge — only legal before approval (or for unpaid charges depending on type). Calls `savingsAccount.removeCharge(...)`.
+
+### `inactivateCharge(Long savingsAccountId, Long savingsAccountChargeId)`
+
+Marks a recurring fee inactive without deleting history. Used to stop monthly / annual fee accruals after an account-level event (e.g. fee waiver promotion).
+
+### `applyChargeDue(Long savingsAccountChargeId, Long accountId)`
+
+Walks every overdue cycle of the supplied charge and pays the outstanding amount. Driven by `payduesavingscharges` job:
+
+```java
+final LocalDate transactionDate = DateUtils.getBusinessLocalDate();
+final SavingsAccountCharge savingsAccountCharge =
+    savingsAccountChargeRepository.findOneWithNotFoundDetection(savingsAccountChargeId, accountId);
+final DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd MM yyyy")
+    .withZone(DateUtils.getDateTimeZoneOfTenant());
+while (savingsAccountCharge.isNotFullyPaid()
+        && DateUtils.isBefore(savingsAccountCharge.getDueDate(), transactionDate)) {
+    payCharge(savingsAccountCharge, transactionDate, savingsAccountCharge.amoutOutstanding(), fmt, false);
+}
+```
+
+## Holds, blocks and lien
+
+### `holdAmount(Long savingsId, JsonCommand command)`
+
+Inserts an `AMOUNT_HOLD` (type 20) transaction and bumps `m_savings_account.total_savings_amount_on_hold`. The transaction is itself a DEBIT for accounting purposes but does **not** change `running_balance_derived` — this is the special case codified in `SavingsAccountTransactionType.isDebit()`.
+
+```java
+final BigDecimal amount = command.bigDecimalValueOfParameterNamed(transactionAmountParamName);
+Money runningBalance = Money.of(account.getCurrency(), account.getAccountBalance());
+if (account.getSavingsHoldAmount() != null) {
+    runningBalance = runningBalance.minus(account.getSavingsHoldAmount()).minus(amount);
+} else {
+    runningBalance = runningBalance.minus(amount);
+}
+savingsAccountTransactionDataValidator.validateHoldAndAssembleForm(
+    command.json(), account, submittedBy, backdatedTxnsAllowedTill);
+SavingsAccountTransaction transaction =
+    savingsAccountDomainService.handleHold(account, amount, transactionDate, lienAllowed);
+account.holdAmount(amount);
+transaction.setRunningBalance(runningBalance);
+
+final String reasonForBlock = command.stringValueOfParameterNamed(SavingsApiConstants.reasonForBlockParamName);
+transaction.updateReason(reasonForBlock);
+```
+
+`lienAllowed = true` lets the hold push the *available* balance below the minimum-required-balance floor (subject to `maxAllowedLienLimit`).
+
+### `releaseAmount(Long savingsId, Long savingsTransactionId)`
+
+Releases a prior hold. Loads the source `AMOUNT_HOLD`, builds an `AMOUNT_RELEASE` (type 21) transaction copying its amount, patches the source's `release_id_of_hold_amount` and decreases the on-hold total:
+
+```java
+SavingsAccountTransaction holdTransaction =
+    savingsAccountTransactionRepository.findOneByIdAndSavingsAccountId(savingsTransactionId, savingsId);
+holdTransaction.updateReason(null);
+
+final SavingsAccountTransaction transaction = savingsAccountTransactionDataValidator
+    .validateReleaseAmountAndAssembleForm(holdTransaction);
+...
+account.releaseOnHoldAmount(transaction.getAmount());
+savingsAccountTransactionRepository.saveAndFlush(transaction);
+holdTransaction.updateReleaseId(transaction.getId());
+```
+
+### `blockAccount(Long savingsId, JsonCommand)` / `unblockAccount(Long savingsId)`
+
+Flips `sub_status_enum` to `BLOCK` (400) — the account refuses both deposits and withdrawals. The reason is stored on the account itself in `reason_for_block`. Unblocking sets sub-status back to `NONE` and nulls the reason.
+
+```java
+final Map<String, Object> changes = account.block();
+final String reasonForBlock = command.stringValueOfParameterNamed(SavingsApiConstants.reasonForBlockParamName);
+validateReasonForHold(reasonForBlock);
+account.updateReason(reasonForBlock);
+```
+
+### `blockCredits` / `unblockCredits` / `blockDebits` / `unblockDebits`
+
+Per-direction blocks; the entity methods know how to **stack** them — e.g. a `blockCredits` over a `blockDebits` ends up at the full `BLOCK` sub-status:
+
+```java
+final Map<String, Object> changes = account.blockCredits(account.getSubStatus());
+```
+
+The matching `Deposit*BlockedException` is raised by the domain service when an operator tries to perform the wrong direction; see `SavingsAccountCreditsBlockedException` / `SavingsAccountDebitsBlockedException`.
+
+## Field officer and tax-withholding flag
+
+### `assignFieldOfficer(Long, JsonCommand)` / `unassignFieldOfficer(Long, JsonCommand)`
+
+Sets / clears `field_officer_id` and writes a `SavingsOfficerAssignmentHistory` row tagging the period:
+
+```java
+account.reassignSavingsOfficer(newSavingsOfficer, assignmentDate);
+```
+
+### `modifyWithHoldTax(Long savingsAccountId, JsonCommand)`
+
+Flips `withhold_tax` and updates the associated `tax_group_id`. Sanity-checks that the tax group hasn't been deactivated.
+
+## Transfers (between savings accounts)
+
+These are invoked by the higher-level `accounttransfers` service, not directly by the savings API:
+
+| Method | Source transaction type produced |
+|--------|----------------------------------|
+| `initiateSavingsTransfer(savingsAccount, transferDate)` | `INITIATE_TRANSFER` (12), sets status to `TRANSFER_IN_PROGRESS` |
+| `withdrawSavingsTransfer(savingsAccount, transferDate)` | `WITHDRAW_TRANSFER` (14), back to `ACTIVE` |
+| Rejection / approval handled by the destination account |  |
+
+## GSIM helpers
+
+| Method | Purpose |
+|--------|---------|
+| `gsimActivate(Long gsimId, JsonCommand)` | activates every child savings account under a GSIM parent |
+| `gsimDeposit(Long gsimId, JsonCommand)` | deposit cascaded to children using a `savingsArray` payload |
+| `bulkGSIMClose(Long gsimId, JsonCommand)` | closes every child and the parent in one go |
+
+## Method summary
+
+| Method | Command | Produces | Business event |
+|--------|---------|----------|----------------|
+| `activate` | `activate` | optional opening DEPOSIT | `SavingsActivateBusinessEvent` |
+| `deposit` | `deposit` | DEPOSIT | `SavingsDepositBusinessEvent` |
+| `withdrawal` | `withdrawal` | WITHDRAWAL [+ WITHDRAWAL_FEE] | `SavingsWithdrawalBusinessEvent` |
+| `forceWithdrawal` | `force-withdrawal` | WITHDRAWAL [no balance check] | `SavingsWithdrawalBusinessEvent` |
+| `applyAnnualFee` | (job + `applyAnnualFees`) | ANNUAL_FEE × n | — |
+| `calculateInterest` | `calculateInterest` | (none — projection only) | — |
+| `postInterest` | `postInterest` / `postInterestAsOn` | INTEREST_POSTING + [OVERDRAFT_INTEREST] + [WITHHOLD_TAX] | `SavingsPostInterestBusinessEvent` |
+| `reverseTransaction` | `reverse` | mirror transaction | event per source type |
+| `undoTransaction` | `undo` | (none) | — |
+| `adjustSavingsTransaction` | `modify` | mirror + new | event per source type |
+| `close` | `close` | optional WITHDRAWAL | `SavingsCloseBusinessEvent` |
+| `addSavingsAccountCharge` | (POST `/charges`) | (none) | — |
+| `updateSavingsAccountCharge` | (PUT `/charges/{id}`) | (none) | — |
+| `payCharge` | `paycharge` | PAY_CHARGE / WITHDRAWAL_FEE / ANNUAL_FEE | — |
+| `waiveCharge` | `waive` | WAIVE_CHARGES | — |
+| `deleteSavingsAccountCharge` | DELETE | (none) | — |
+| `inactivateCharge` | `inactivate` | (none) | — |
+| `holdAmount` | `holdAmount` | AMOUNT_HOLD | — |
+| `releaseAmount` | `releaseAmount` | AMOUNT_RELEASE | — |
+| `blockAccount` / `unblockAccount` | `block` / `unblock` | (none) | — |
+| `blockCredits` / `unblockCredits` | `blockCredit` / `unblockCredit` | (none) | — |
+| `blockDebits` / `unblockDebits` | `blockDebit` / `unblockDebit` | (none) | — |
+| `assignFieldOfficer` / `unassignFieldOfficer` | `assignSavingsOfficer` / `unassignSavingsOfficer` | (none) | — |
+| `modifyWithHoldTax` | `updateWithHoldTax` (PUT) | (none) | — |
+
+## Accounting integration
+
+`postJournalEntries` is the boundary with the [accounting processor](/accounting/accounting-processors). It computes the diff (`newTransactionIds = current - existingTransactionIds`, `newReversedIds = currentReversed - existingReversedTransactionIds`) and hands them to the journal-entry writer with the product's accounting rule (`NONE`, `CASH_BASED`, `ACCRUAL_PERIODIC`, `ACCRUAL_UPFRONT`). Each transaction's `SavingsAccountTransactionType.entryType` decides the GL direction.
+
+## Exceptions
+
+| Exception | Raised by |
+|-----------|-----------|
+| `SavingsAccountNotFoundException` | `assembleFrom` if id unknown |
+| `SavingsAccountBlockedException` | trying to transact on a `BLOCK` account |
+| `SavingsAccountCreditsBlockedException` | deposit on `BLOCK_CREDIT` |
+| `SavingsAccountDebitsBlockedException` | withdrawal on `BLOCK_DEBIT` |
+| `InsufficientAccountBalanceException` | withdrawal would breach min-balance/overdraft |
+| `SavingsAccountTransactionNotFoundException` | reverse/undo of unknown txn |
+| `SavingsAccountClosingNotAllowedException` | close while linked to active loan |
+| `PostInterestAsOnDateException` | bad `?command=postInterestAsOn` date |
+| `PostInterestClosingDateException` | `close` requires interest posted on closure date |
+| `SavingsTransferTransactionsCannotBeUndoneException` | undo of `INITIATE_TRANSFER` etc. |
+
+## Cross-links
+
+- [Accounts API](/savings/savings-accounts-api) — the REST surface that invokes these methods.
+- [Transactions API](/savings/savings-transactions-api) — deposit/withdrawal/hold endpoints in detail.
+- [Transactions entity](/savings/savings-transactions) — what each method produces.
+- [Account domain](/savings/savings-account-domain) — the aggregate the write service mutates.
+- [Commands framework](/core/commands-framework) — how a `?command=` token finds the right handler.
+- [Accounting processors](/accounting/accounting-processors) — what `postJournalEntries` ends up doing.
+- [COB savings business steps](/cob/savings-cob-business-steps) — schedulers that call `applyChargeDue`, `applyAnnualFee` and the bulk interest-poster.

@@ -1,0 +1,462 @@
+---
+title: "ServerApplication Bootstrap and Spring Configuration Wiring"
+sidebarTitle: "Server Application"
+description: "Anatomy of org.apache.fineract.ServerApplication, the Spring Boot entry point that boots Fineract in embedded Tomcat with Jersey, EclipseLink, Liquibase."
+---
+
+`org.apache.fineract.ServerApplication` is the **single Spring Boot entry
+point** for the Fineract platform. It is launched by `./gradlew devRun`
+during development, by `java -jar fineract-provider.jar` in production, and
+by the Spring Boot WAR initializer in `fineract-war` when deployed to an
+external servlet container. It does almost nothing itself — its only job is
+to compose two `@Configuration` classes ([`FineractWebApplicationConfiguration`](#fineractwebapplicationconfiguration)
+and [`FineractLiquibaseOnlyApplicationConfiguration`](#fineractliquibaseonlyapplicationconfiguration))
+into a single Spring Boot `SpringApplicationBuilder` and call `.run(args)`.
+
+The choice between **web mode** and **Liquibase‑only mode** is taken at
+runtime by Spring `@Conditional`s on each of the two configurations. See
+[`/overview/runtime-modes`](/overview/runtime-modes) for the broader runtime
+mode story, [`/security/overview`](/security/overview) for the security
+filter chain it pulls in, [`/tenancy/overview`](/tenancy/overview) for the
+multi‑tenant routing it activates, and
+[`/database/overview`](/database/overview) for the schema/Liquibase flow.
+
+## File location and class declaration
+
+```java ServerApplication.java
+package org.apache.fineract;
+
+public class ServerApplication extends SpringBootServletInitializer {
+
+    @Import({ FineractWebApplicationConfiguration.class,
+              FineractLiquibaseOnlyApplicationConfiguration.class })
+    private static final class Configuration {}
+
+    @Override
+    protected SpringApplicationBuilder configure(SpringApplicationBuilder builder) {
+        return configureApplication(builder);
+    }
+
+    private static SpringApplicationBuilder configureApplication(SpringApplicationBuilder builder) {
+        return builder.sources(Configuration.class);
+    }
+
+    public static void main(String[] args) throws IOException {
+        configureApplication(new SpringApplicationBuilder(ServerApplication.class)).run(args);
+    }
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/ServerApplication.java`.
+
+The whole file is ~30 lines of executable code. Everything substantive lives
+inside the two imported `@Configuration` classes and the third‑party
+`SpringBootServletInitializer` parent.
+
+## Line‑by‑line walkthrough
+
+### `extends SpringBootServletInitializer`
+
+`SpringBootServletInitializer` is Spring Boot's bridge between the embedded
+launcher and the Servlet 3.0+ `WebApplicationInitializer` SPI. By extending
+it, `ServerApplication` works in **both** of these scenarios with a single
+binary:
+
+| Scenario | Entry point | Builder source |
+| --- | --- | --- |
+| Embedded Tomcat via `./gradlew devRun` or `java -jar` | `main(String[] args)` | `new SpringApplicationBuilder(ServerApplication.class)` |
+| External Tomcat WAR deployment (the `fineract-war` module) | `WebApplicationInitializer.onStartup()` (inherited) | `configure(SpringApplicationBuilder)` override |
+
+The `configure()` and `main()` paths converge on the same static helper —
+`configureApplication(SpringApplicationBuilder)` — so the two modes can
+never drift apart.
+
+### The inner `Configuration` class
+
+```java ServerApplication.java
+@Import({ FineractWebApplicationConfiguration.class,
+          FineractLiquibaseOnlyApplicationConfiguration.class })
+private static final class Configuration {}
+```
+
+The inner class itself has no methods, no annotations beyond `@Import`, and
+no fields. It exists purely to be a single `@Import` target that the
+`SpringApplicationBuilder` can be pointed at via `builder.sources(...)`.
+Spring's `ConfigurationClassParser` then walks `@Import` and pulls both
+[`FineractWebApplicationConfiguration`](#fineractwebapplicationconfiguration)
+and [`FineractLiquibaseOnlyApplicationConfiguration`](#fineractliquibaseonlyapplicationconfiguration)
+into the context for **conditional** evaluation.
+
+<Note>
+Only one of the two imported configurations will actually activate at
+runtime — they are mutually exclusive `@Conditional`s. See the
+[Profile‑driven branching](#profile-driven-branching) section.
+</Note>
+
+### `configure(SpringApplicationBuilder)`
+
+```java
+@Override
+protected SpringApplicationBuilder configure(SpringApplicationBuilder builder) {
+    return configureApplication(builder);
+}
+```
+
+This override is what the **external WAR** path calls when Tomcat (or any
+Servlet 3.1+ container) discovers `ServerApplication` via the SPI
+mechanism. It immediately delegates to the static helper so the same exact
+builder configuration applies to embedded and external boot.
+
+### `configureApplication(SpringApplicationBuilder)`
+
+```java
+private static SpringApplicationBuilder configureApplication(SpringApplicationBuilder builder) {
+    return builder.sources(Configuration.class);
+}
+```
+
+Calls `SpringApplicationBuilder#sources(Class<?>...)` to register the inner
+`Configuration` as the **primary source**. Anything `@Import`ed transitively
+from `Configuration` (i.e. the two top‑level configurations) becomes
+candidate beans.
+
+No banner, no profiles, no environment, no listeners are programmatically
+configured here. All such customisation goes through `application.properties`
+(`fineract-provider/src/main/resources/application.properties`) and Spring's
+standard externalised configuration mechanism.
+
+### `main(String[] args)`
+
+```java
+public static void main(String[] args) throws IOException {
+    configureApplication(new SpringApplicationBuilder(ServerApplication.class)).run(args);
+}
+```
+
+1. Creates a new `SpringApplicationBuilder` rooted at `ServerApplication`.
+2. Adds the inner `Configuration` as a second source via
+   `configureApplication(...)`.
+3. Calls `.run(args)`. Spring Boot then:
+   - Parses CLI `args` (e.g. `--spring.profiles.active=liquibase-only`).
+   - Loads `application.properties` plus any `--spring.config.location=`.
+   - Walks `@EnableAutoConfiguration` (see
+     [`FineractWebApplicationConfiguration`](#fineractwebapplicationconfiguration))
+     and excludes the autoconfigurations Fineract takes over itself.
+   - Starts the embedded Tomcat server on the port declared by
+     `server.port=${FINERACT_SERVER_PORT:8443}` from `application.properties`
+     line 381.
+   - Triggers Liquibase migrations (when `spring.liquibase.enabled=true`)
+     via `TenantDatabaseUpgradeService`.
+
+The `throws IOException` declaration is required because Spring Boot's
+launcher can surface I/O errors from its banner/properties resolution at
+startup.
+
+## What `@Import` pulls in
+
+```mermaid
+graph TD
+    SA[ServerApplication] --> CFG[ServerApplication.Configuration]
+    CFG -->|@Import| Web[FineractWebApplicationConfiguration]
+    CFG -->|@Import| LB[FineractLiquibaseOnlyApplicationConfiguration]
+
+    Web -->|@Conditional<br/>FineractWebApplicationCondition| WebActive["Active when 'liquibase-only'<br/>profile is NOT present"]
+    LB  -->|@Conditional<br/>FineractLiquibaseOnlyApplicationCondition| LBActive["Active ONLY when 'liquibase-only'<br/>profile IS present"]
+
+    WebActive --> Scan[ComponentScan org.apache.fineract.**]
+    WebActive --> Auto[EnableAutoConfiguration<br/>with 6 excludes]
+    WebActive --> Tx[EnableTransactionManagement]
+    WebActive --> Sec[EnableWebSecurity]
+    WebActive --> IC[IntegrationComponentScan]
+    LBActive --> LBImport[Import HikariCpConfig + JdbcConfig]
+    LBActive --> LBScan[ComponentScan database + tenant + migration packages]
+```
+
+### `FineractWebApplicationConfiguration`
+
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/boot/FineractWebApplicationConfiguration.java`
+
+```java FineractWebApplicationConfiguration.java
+@Configuration
+@EnableAutoConfiguration(exclude = {
+        DataSourceAutoConfiguration.class,
+        HibernateJpaAutoConfiguration.class,
+        DataSourceTransactionManagerAutoConfiguration.class,
+        GsonAutoConfiguration.class,
+        JdbcTemplateAutoConfiguration.class,
+        LiquibaseAutoConfiguration.class })
+@EnableTransactionManagement
+@EnableWebSecurity
+@EnableConfigurationProperties({ FineractProperties.class, LiquibaseProperties.class })
+@ComponentScan(basePackages = "org.apache.fineract.**")
+@IntegrationComponentScan(basePackages = "org.apache.fineract.**")
+@Conditional(FineractWebApplicationCondition.class)
+@Slf4j
+public abstract class FineractWebApplicationConfiguration implements InitializingBean { ... }
+```
+
+The class is declared **abstract** with an explicit `// The class needs to
+be abstract for some reason, otherwise the tests start to fail...` comment.
+This prevents Spring from registering it as a regular bean while still
+allowing its annotation metadata to drive configuration.
+
+| Annotation | Purpose |
+| --- | --- |
+| `@EnableAutoConfiguration(exclude = {...})` | Activates all of Spring Boot's autoconfig *except* the six classes listed. Each exclusion exists because Fineract supplies its own replacement (see [Why these autoconfigurations are excluded](#why-these-autoconfigurations-are-excluded)). |
+| `@EnableTransactionManagement` | Enables Spring's AOP‑based `@Transactional` proxying. The `PlatformTransactionManager` itself comes from `ExtendedJpaTransactionManager` registered in [`ScheduledJobRunnerConfig`](/runtime/transaction-management). |
+| `@EnableWebSecurity` | Enables Spring Security filter chain assembly. The chain is defined in `org.apache.fineract.infrastructure.core.config.SecurityConfig` — see [`/security/overview`](/security/overview). |
+| `@EnableConfigurationProperties({FineractProperties.class, LiquibaseProperties.class})` | Binds `fineract.*` and `spring.liquibase.*` keys. `FineractProperties` lives in `fineract-core/.../infrastructure/core/config/FineractProperties.java` and is the single typed binding for every `fineract.*` property. |
+| `@ComponentScan(basePackages = "org.apache.fineract.**")` | Scans **every** Fineract module on the classpath for `@Component`, `@Service`, `@Repository`, `@Configuration`, `@Controller`, and Jersey `@Path`/`@Provider` beans. |
+| `@IntegrationComponentScan(basePackages = "org.apache.fineract.**")` | Activates Spring Integration's `@MessagingGateway` / `@IntegrationComponentScan` annotations (used by the external‑events JMS/Kafka producers in `fineract-investor` and the `fineract-provider` event infrastructure). |
+| `@Conditional(FineractWebApplicationCondition.class)` | Activates the configuration only when the `liquibase-only` profile is NOT in `spring.profiles.active`. |
+
+The `InitializingBean#afterPropertiesSet` callback only logs
+`Fineract is running in web application mode` at WARN level so operators
+see which boot mode actually took effect.
+
+### Why these autoconfigurations are excluded
+
+| Excluded class | Replaced by | Where |
+| --- | --- | --- |
+| `DataSourceAutoConfiguration` | `HikariCpConfig` (tenant‑configuration master pool) + `RoutingDataSource` (per‑tenant routing) | `infrastructure.core.config.HikariCpConfig`, `infrastructure.core.service.database.RoutingDataSource` |
+| `HibernateJpaAutoConfiguration` | `JPAConfig extends JpaBaseConfiguration` with `EclipseLinkJpaVendorAdapter` | `infrastructure.core.config.jpa.JPAConfig` |
+| `DataSourceTransactionManagerAutoConfiguration` | `ExtendedJpaTransactionManager` (extends `JpaTransactionManager`) | `infrastructure.core.persistence.ExtendedJpaTransactionManager`, registered in `infrastructure.jobs.ScheduledJobRunnerConfig#transactionManager` |
+| `GsonAutoConfiguration` | `GoogleGsonSerializerHelper` and the JAX‑RS message‑body writers Fineract registers under `infrastructure.core.serialization` | `infrastructure.core.serialization.GoogleGsonSerializerHelper` |
+| `JdbcTemplateAutoConfiguration` | `JdbcConfig#jdbcTemplate(RoutingDataSource)` and `JdbcConfig#namedParameterJdbcTemplate(RoutingDataSource)` | `infrastructure.core.config.JdbcConfig` |
+| `LiquibaseAutoConfiguration` | `TenantDatabaseUpgradeService` (per‑tenant Liquibase change‑log application) | `infrastructure.core.service.migration.TenantDatabaseUpgradeService` |
+
+This means Fineract owns the **DataSource → JDBC → JPA → Tx → Liquibase**
+stack end‑to‑end, but otherwise inherits Spring Boot's autoconfiguration
+(Web MVC, Validation, Actuator, Micrometer, Jackson, Spring Batch, Spring
+Security, Spring Integration, etc.).
+
+### `FineractLiquibaseOnlyApplicationConfiguration`
+
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/boot/FineractLiquibaseOnlyApplicationConfiguration.java`
+
+```java FineractLiquibaseOnlyApplicationConfiguration.java
+@Conditional(FineractLiquibaseOnlyApplicationCondition.class)
+@Slf4j
+@EnableConfigurationProperties({ FineractProperties.class, LiquibaseProperties.class })
+@Import({ HikariCpConfig.class, JdbcConfig.class })
+@ComponentScan(basePackages = {
+        "org.apache.fineract.infrastructure.core.service.migration",
+        "org.apache.fineract.infrastructure.core.service.database",
+        "org.apache.fineract.infrastructure.core.service.tenant" })
+public class FineractLiquibaseOnlyApplicationConfiguration implements InitializingBean { ... }
+```
+
+A **minimal, headless** boot mode used to run Liquibase migrations against
+the tenant database without starting Tomcat, Jersey, Security, JPA, or any
+of the domain modules. It only imports:
+
+| Imported class | Role |
+| --- | --- |
+| `HikariCpConfig` | Master Hikari pool to `fineract_tenants` from `spring.datasource.hikari.*`. |
+| `JdbcConfig` | `JdbcTemplate` + `NamedParameterJdbcTemplate` over `RoutingDataSource`. |
+
+And it scans only three packages — `migration`, `database`, `tenant` — so
+that `TenantDatabaseUpgradeService` plus its dependencies (the routing data
+source machinery, the tenant details service) get wired up, run, and the
+JVM exits.
+
+This mode is selected by activating the `liquibase-only` Spring profile
+(see `FineractProfiles.LIQUIBASE_ONLY` constant referenced by both
+`FineractWebApplicationCondition` and
+`FineractLiquibaseOnlyApplicationCondition`).
+
+### Profile‑driven branching
+
+Both conditions extend `ProfileCondition` and inspect
+`Environment.getActiveProfiles()`:
+
+```java FineractWebApplicationCondition.java
+public class FineractWebApplicationCondition extends ProfileCondition {
+    @Override
+    protected boolean matches(List<String> activeProfiles) {
+        return !activeProfiles.contains(FineractProfiles.LIQUIBASE_ONLY);
+    }
+}
+```
+
+```java FineractLiquibaseOnlyApplicationCondition.java
+public class FineractLiquibaseOnlyApplicationCondition extends ProfileCondition {
+    @Override
+    protected boolean matches(List<String> activeProfiles) {
+        return activeProfiles.contains(FineractProfiles.LIQUIBASE_ONLY);
+    }
+}
+```
+
+Sources: `fineract-core/.../infrastructure/core/condition/FineractWebApplicationCondition.java`
+and `.../FineractLiquibaseOnlyApplicationCondition.java`. Negating each
+other guarantees exactly one configuration activates per JVM.
+
+## Every `@Configuration` activated in web mode
+
+When `FineractWebApplicationCondition` matches (the default), `@ComponentScan`
+walks `org.apache.fineract.**`. The configurations under
+`infrastructure.core.config/` (and a couple of high‑value siblings) are:
+
+| Class | Package | Role | Conditional |
+| --- | --- | --- | --- |
+| `HikariCpConfig` | `infrastructure.core.config` | Master HikariCP DS for `fineract_tenants`, bound to `spring.datasource.hikari.*`. | `@ConditionalOnExpression("#{ systemEnvironment['fineract_tenants_driver'] == null }")` |
+| `CompatibilityConfig` | `infrastructure.core.config` | Deprecated env‑var shim that builds Hikari from `fineract_tenants_driver/url/uid/pwd`. | `@ConditionalOnExpression("#{ systemEnvironment['fineract_tenants_driver'] != null }")` |
+| `JdbcConfig` | `infrastructure.core.config` | `JdbcTemplate` + `NamedParameterJdbcTemplate` over `RoutingDataSource`. | always |
+| `JPAConfig` | `infrastructure.core.config.jpa` | `EclipseLinkJpaVendorAdapter`, persistence unit `jpa-pu`, `@EnableJpaAuditing`, `@EnableJpaRepositories`. | always |
+| `CacheConfig` | `infrastructure.core.config.cache` | EhCache JCache `JCacheCacheManager`, `TransactionBoundCacheManager`. | always |
+| `SecurityConfig` | `infrastructure.core.config` | `SecurityFilterChain` for `/api/**` plus the ordered filter chain (tenant auth, correlation, COB, idempotency). | `@ConditionalOnProperty("fineract.security.basicauth.enabled")` |
+| `SecurityValidationConfig` | `infrastructure.core.config` | Startup validation of the security mode combination. | always |
+| `SpringConfig` | `infrastructure.core.config` | `fineractEventExecutor` (`ThreadPoolTaskExecutor`), `SimpleApplicationEventMulticaster`, `SecurityContextHolder.MODE_INHERITABLETHREADLOCAL` override. | always |
+| `TaskExecutorConfig` | `infrastructure.core.config` | `fineractDefaultThreadPoolTaskExecutor` and `fineractConfigurableThreadPoolTaskExecutor` (see [`/runtime/task-executors`](/runtime/task-executors)). | always |
+| `MetricsConfig` | `infrastructure.core.config` | `TimedAspect` for `@Timed` Micrometer annotations + `@EnableAspectJAutoProxy`. | always |
+| `OkHttp3Config` | `infrastructure.core.config` | `OkHttpClient` with `fineract.client-*-timeout` and optional insecure TLS. | always |
+| `ContentS3Config` | `infrastructure.core.config` | AWS S3 client beans for the content repository. | `@ConditionalOnProperty("fineract.content.s3.enabled")` (see source) |
+| `FineractStartupValidationConfig` | `infrastructure.core.config` | `@Component` ordered `HIGHEST_PRECEDENCE` that **closes the context** when any `FineractValidationCondition` nested condition reports a misconfiguration. | `@Conditional(FineractValidationCondition.class)` |
+| `JerseyConfig` | `infrastructure.core.jersey` | `extends ResourceConfig` with `@ApplicationPath("/api")`; auto‑registers every Spring bean annotated with `@Path` or `@Provider`. | always |
+| `SpringAsyncConfig` | `infrastructure.configuration.async` | `@EnableAsync`, plus the `loanCOBCatchUpThreadPoolTaskExecutor` / `workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor` beans. | always |
+| `ScheduledJobRunnerConfig` | `infrastructure.jobs` | `@EnableBatchProcessing`, registers `ExtendedJpaTransactionManager`, the Spring Batch `JobRepository`, and the catalogue of `JobLauncher`s. | always |
+
+All of these are documented individually in
+[`/runtime/spring-boot-configuration`](/runtime/spring-boot-configuration).
+The order of bean instantiation is governed by `@DependsOn` annotations
+inside `JPAConfig` (`@DependsOn("tenantDatabaseUpgradeService")`) and
+`SpringConfig` (`@DependsOn("overrideSecurityContextHolderStrategy")`).
+
+## How to run
+
+### Local development (Gradle)
+
+From `README.md` line 53‑60:
+
+```bash
+./gradlew createDB -PdbName=fineract_tenants
+./gradlew createDB -PdbName=fineract_default
+./gradlew devRun
+```
+
+`devRun` is the standard `bootRun` task wired by the Spring Boot Gradle
+plugin in `fineract-provider/build.gradle`. It launches `ServerApplication`
+inside the build JVM with the runtime classpath, including statically
+woven JPA classes (see [`static-weaving.gradle`](#static-weaving-and-build-time-jpa)
+below). The HTTPS port is `8443` by default
+(`server.port=${FINERACT_SERVER_PORT:8443}` in `application.properties`
+line 381) and the context path is `/fineract-provider`
+(`server.servlet.context-path=...:/fineract-provider`, line 382).
+
+Smoke‑test it with:
+
+```bash
+curl --insecure https://localhost:8443/fineract-provider/actuator/health
+```
+
+### Liquibase‑only mode
+
+Set the Spring profile to switch off the web stack and only run schema
+migrations against `fineract_tenants` and the active tenants' databases:
+
+```bash
+java -jar fineract-provider.jar --spring.profiles.active=liquibase-only
+```
+
+The profile name is `FineractProfiles.LIQUIBASE_ONLY` (constant referenced
+by both `*Condition` classes). When matched,
+`FineractLiquibaseOnlyApplicationConfiguration` activates, its component
+scan only sees `service.migration` + `service.database` + `service.tenant`,
+Tomcat is never started, and the JVM exits after migrations complete.
+
+### WAR deployment
+
+`fineract-war/build.gradle` produces a `fineract-provider.war` that wraps
+the same `ServerApplication`. External Tomcat (10+) discovers it via the
+Servlet 3.1+ `WebApplicationInitializer` SPI, calls
+`SpringBootServletInitializer#onStartup(ServletContext)`, which in turn
+calls `ServerApplication#configure(SpringApplicationBuilder)` — the same
+static helper as `main()`.
+
+## Lombok and static‑weaving build glue
+
+### `lombok.config`
+
+`lombok.config` at the repository root applies platform‑wide:
+
+```ini lombok.config
+config.stopBubbling = true
+lombok.addLombokGeneratedAnnotation = true
+lombok.copyableAnnotations += org.springframework.beans.factory.annotation.Qualifier
+```
+
+Three rules are in effect:
+
+| Rule | Effect |
+| --- | --- |
+| `config.stopBubbling = true` | Tells Lombok not to look for further `lombok.config` files in parent directories. |
+| `lombok.addLombokGeneratedAnnotation = true` | Adds `@lombok.Generated` to every generated method, so JaCoCo and SpotBugs can exclude them from coverage / static analysis. |
+| `lombok.copyableAnnotations += org.springframework.beans.factory.annotation.Qualifier` | When `@RequiredArgsConstructor` synthesises a constructor, `@Qualifier` annotations on the field are copied to the constructor parameter. Critical for `DataSourcePerTenantServiceFactory` and similar beans where a specific `@Qualifier("hikariTenantDataSource")` DataSource must be injected. |
+
+### Static weaving and build‑time JPA
+
+`static-weaving.gradle` applies to every Gradle subproject after evaluation
+and weaves EclipseLink bytecode into compiled `*.class` files whenever the
+module ships a `src/main/resources/jpa/static-weaving/module/<name>/persistence.xml`.
+The condition is exact:
+
+```groovy static-weaving.gradle
+def persistenceXmlFile = file("src/main/resources/jpa/static-weaving/module/${project.name}/persistence.xml")
+def hasJpaEntities = persistenceXmlFile.exists()
+```
+
+When present, `compileJava.doLast { ... }` invokes
+`org.eclipse.persistence.tools.weaving.jpa.StaticWeave` on the classes
+directory. The weaver re‑emits the classes back in place
+(`source = sourceSets.main.java.classesDirectory.get()` and `args = [..., source, source]`).
+
+This is paired with `PersistenceUnitProperties.WEAVING = "static"` in
+`JPAConfig#getVendorProperties`:
+
+```java JPAConfig.java
+vendorProperties.put(PersistenceUnitProperties.WEAVING, "static");
+vendorProperties.put(PersistenceUnitProperties.PERSISTENCE_CONTEXT_CLOSE_ON_COMMIT, "true");
+vendorProperties.put(PersistenceUnitProperties.CACHE_SHARED_DEFAULT, "false");
+```
+
+If you run Fineract with classes that have not been statically woven (e.g.
+classes loaded from a non‑Gradle build), EclipseLink will fail at first
+entity access. `STATIC_WEAVING.md` at the repo root documents the per‑module
+contract.
+
+## Where `application.properties` plugs in
+
+`application.properties` is discovered by Spring Boot from
+`fineract-provider/src/main/resources/application.properties` (725 lines).
+The keys consumed by the boot sequence are:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `server.port` | `8443` | HTTP/HTTPS listen port. |
+| `server.servlet.context-path` | `/fineract-provider` | Servlet context. |
+| `server.ssl.enabled` | `true` | Enables TLS termination in embedded Tomcat. |
+| `server.ssl.key-store` | `classpath:keystore.jks` | TLS keystore (Self‑signed by default). |
+| `server.shutdown` | `graceful` | Graceful shutdown — in‑flight requests drain. |
+| `spring.lifecycle.timeout-per-shutdown-phase` | `30s` | Drain timeout. |
+| `spring.main.allow-bean-definition-overriding` | `true` | Required because `RoutingDataSource` and the Hikari master both bind as `DataSource`. |
+| `spring.datasource.hikari.*` | (mariadb defaults) | Bound by `HikariCpConfig#hikariTenantDataSource()`. |
+| `spring.jpa.open-in-view` | `false` | Disables OSIV — JPA is strictly per‑transaction. |
+| `spring.liquibase.enabled` | `true` | Activates schema migration. |
+| `spring.batch.job.enabled` | `false` | Prevents Spring Batch from auto‑running every job at startup. |
+
+See [`/runtime/spring-boot-configuration`](/runtime/spring-boot-configuration)
+for the full property tour.
+
+## Cross‑references
+
+- **Runtime modes (web / Liquibase‑only / read‑only / write):** [`/overview/runtime-modes`](/overview/runtime-modes).
+- **Security filter chain assembled by `SecurityConfig`:** [`/security/overview`](/security/overview).
+- **Per‑tenant routing data source initialised by `RoutingDataSource`:** [`/tenancy/overview`](/tenancy/overview), [`/runtime/datasource-and-connection-pooling`](/runtime/datasource-and-connection-pooling).
+- **Liquibase migrations and tenant schema upgrade flow:** [`/database/overview`](/database/overview).
+- **Transactional infrastructure (`ExtendedJpaTransactionManager`, static weaving runtime):** [`/runtime/transaction-management`](/runtime/transaction-management).
+- **JAX‑RS resource registration (Jersey auto‑discovery of `@Path` beans):** [`/runtime/jersey-jaxrs`](/runtime/jersey-jaxrs).
+- **`fineractDefaultThreadPoolTaskExecutor`, `@Async` infrastructure:** [`/runtime/task-executors`](/runtime/task-executors).
+- **Logging configuration and correlation ID propagation:** [`/runtime/logging-and-correlation`](/runtime/logging-and-correlation).
+- **Spring Boot Actuator endpoints (`health`, `info`, `prometheus`):** [`/runtime/metrics-and-actuator`](/runtime/metrics-and-actuator).
+- **Module overview (what `fineract-core` contributes to this bootstrap):** [`/core/overview`](/core/overview).

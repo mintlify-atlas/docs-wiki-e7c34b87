@@ -1,0 +1,372 @@
+---
+title: "JPA, EclipseLink, and Static Weaving in fineract-provider"
+sidebarTitle: "JPA + EclipseLink"
+description: "JPAConfig: the EntityManagerFactory bean, EclipseLink vendor adapter, jpa-pu persistence unit, static weaving and the EntityManagerFactoryCustomizer SPI."
+---
+
+Apache Fineract uses **EclipseLink** as its JPA provider — not Hibernate. This
+is a deliberate choice rooted in EclipseLink's mature multi-tenancy hooks, its
+strong static-weaving support, and historical reasons going back to the
+project's Mifos origins. The wiring lives in one class:
+`infrastructure/core/config/jpa/JPAConfig.java`.
+
+This page walks the configuration, the static-weaving build step that goes
+hand-in-hand with it, and the `EntityManagerFactoryCustomizer` SPI that lets
+sibling Gradle modules contribute scan packages and vendor properties. For the
+runtime transaction story (transaction boundary, `@Transactional` semantics,
+`TransactionTemplate` usage) see
+[/runtime/transaction-management](/runtime/transaction-management).
+
+## JPAConfig at a glance
+
+```java
+@Configuration
+@EnableJpaAuditing
+@EnableJpaRepositories(basePackages = {
+        "org.apache.fineract.**.domain",
+        "org.apache.fineract.**.repository" })
+@EnableConfigurationProperties(JpaProperties.class)
+@Import(JpaAuditingHandlerRegistrar.class)
+public class JPAConfig extends JpaBaseConfiguration {
+
+    private final DatabaseTypeResolver databaseTypeResolver;
+    private final Collection<EntityManagerFactoryCustomizer> emFactoryCustomizers;
+
+    public JPAConfig(RoutingDataSource dataSource, JpaProperties properties,
+            ObjectProvider<JtaTransactionManager> jtaTransactionManager,
+            DatabaseTypeResolver databaseTypeResolver,
+            Collection<EntityManagerFactoryCustomizer> customizers) {
+        super(dataSource, properties, jtaTransactionManager);
+        this.databaseTypeResolver = databaseTypeResolver;
+        this.emFactoryCustomizers = customizers;
+    }
+    ...
+}
+```
+
+### Class-level annotations
+
+- **`extends JpaBaseConfiguration`** — Spring Boot's base abstract class that
+  provides the `transactionManager` bean and binds the JPA properties. By
+  subclassing it (rather than relying on `HibernateJpaAutoConfiguration` —
+  which is explicitly excluded in `FineractWebApplicationConfiguration`),
+  Fineract gets the transaction manager for free while keeping full control of
+  the vendor adapter and `EntityManagerFactory`.
+- **`@EnableJpaAuditing`** — turns on `@CreatedBy`, `@CreatedDate`,
+  `@LastModifiedBy`, `@LastModifiedDate` support. Combined with the
+  `AuditorAware<Long>` bean below.
+- **`@EnableJpaRepositories(basePackages = { "org.apache.fineract.**.domain",
+  "org.apache.fineract.**.repository" })`** — Spring Data JPA scans every
+  module for `*Repository` interfaces under either `*.domain.*` or
+  `*.repository.*`. This pattern is intentional — historically domain entities
+  and their repositories live in the same `domain` package; newer code splits
+  them into `domain` + `repository`.
+- **`@EnableConfigurationProperties(JpaProperties.class)`** — binds
+  `spring.jpa.*` keys.
+- **`@Import(JpaAuditingHandlerRegistrar.class)`** — registers a custom audit
+  handler from `fineract-core` (writes the current `AppUser.id` into the
+  `created_by_userid` / `last_modified_by_userid` columns).
+
+### Constructor wiring
+
+The injected dependencies are:
+
+| Parameter | Source |
+| --- | --- |
+| `RoutingDataSource dataSource` | The multi-tenant routing data source from `fineract-core`. EclipseLink will see it as a single `DataSource` — the routing happens behind the JDBC `getConnection()` call. |
+| `JpaProperties properties` | `spring.jpa.*` binding. |
+| `ObjectProvider<JtaTransactionManager>` | Spring Boot lets you opt into JTA; Fineract does not. The provider is `Optional`. |
+| `DatabaseTypeResolver` | From `fineract-core`. Detects MariaDB vs Postgres so the right `orm.xml` overrides can be applied. |
+| `Collection<EntityManagerFactoryCustomizer> customizers` | The SPI extension point — every sibling module's bean of this type gets injected. |
+
+## entityManagerFactory bean
+
+The override of `JpaBaseConfiguration.entityManagerFactory`:
+
+```java
+@Override
+@Bean
+@Primary
+@DependsOn("tenantDatabaseUpgradeService")
+public LocalContainerEntityManagerFactoryBean entityManagerFactory(
+        EntityManagerFactoryBuilder factoryBuilder,
+        PersistenceManagedTypes persistenceManagedTypes) {
+    Map<String, Object> vendorProperties = getVendorProperties(getDataSource());
+    String[] packagesToScan = getPackagesToScan();
+    return factoryBuilder
+        .dataSource(getDataSource())
+        .properties(vendorProperties)
+        .persistenceUnit("jpa-pu")
+        .packages(packagesToScan)
+        .jta(false)
+        .build();
+}
+```
+
+Three details to dissect:
+
+### 1. `@DependsOn("tenantDatabaseUpgradeService")`
+
+`tenantDatabaseUpgradeService` is the Liquibase orchestrator (in
+`fineract-core/infrastructure.core.service.migration`). Spring will not create
+the `EntityManagerFactory` until the migration service has been fully
+initialized — which means the database schemas are upgraded *before* EclipseLink
+introspects entity metadata.
+
+Without this dependency declaration, EclipseLink would happily start against a
+half-migrated schema and emit unhelpful "column not found" errors at the first
+query.
+
+### 2. Persistence unit name `"jpa-pu"`
+
+The persistence unit is named `"jpa-pu"` — short for "JPA persistence unit".
+That name flows through:
+
+- `fineract-provider/src/main/resources/META-INF/orm.xml` — XML-based ORM
+  metadata overrides for things JPA annotations can't express cleanly
+  (e.g. database-specific column types).
+- The build-time static-weaving Gradle task, which weaves the entity classes
+  for `jpa-pu` only.
+- Any direct EntityManager lookup using `@PersistenceContext(unitName = "jpa-pu")`.
+
+### 3. `.jta(false)`
+
+Hard-codes "local resource-local transactions". Even though the constructor
+accepts an optional `JtaTransactionManager`, the EMF is forced into JDBC
+transaction mode. This is what enables `@Transactional` on Spring beans to work
+without configuring a JTA transaction manager.
+
+## Vendor properties
+
+```java
+@Override
+protected Map<String, Object> getVendorProperties(DataSource dataSource) {
+    Map<String, Object> vendorProperties = new HashMap<>();
+    vendorProperties.put(PersistenceUnitProperties.WEAVING, "static");
+    vendorProperties.put(PersistenceUnitProperties.PERSISTENCE_CONTEXT_CLOSE_ON_COMMIT, "true");
+    vendorProperties.put(PersistenceUnitProperties.CACHE_SHARED_DEFAULT, "false");
+    emFactoryCustomizers.forEach(c -> vendorProperties.putAll(c.additionalVendorProperties()));
+    return vendorProperties;
+}
+```
+
+The three baseline EclipseLink-only properties:
+
+| Property | Value | Why |
+| --- | --- | --- |
+| `eclipselink.weaving` | `static` | Forces the use of compile-time bytecode weaving (see next section). Without it, EclipseLink would try dynamic weaving via a Java agent which is fragile under Spring Boot's class loaders. |
+| `eclipselink.persistence-context.close-on-commit` | `true` | Drops the persistence context (1st-level cache) when a transaction commits. Prevents stale entities from leaking across requests when a single thread serves multiple HTTP calls. |
+| `eclipselink.cache.shared.default` | `false` | Disables the L2 cache by default. Multi-tenant correctness trumps performance — caching across tenants would corrupt isolation. Individual entities can opt back in with `@Cache`. |
+
+Then every `EntityManagerFactoryCustomizer.additionalVendorProperties()` is
+folded in.
+
+## Packages to scan
+
+```java
+protected String[] getPackagesToScan() {
+    Set<String> packagesToScan = new HashSet<>();
+    packagesToScan.add("org.apache.fineract");
+    emFactoryCustomizers.forEach(c -> packagesToScan.addAll(c.additionalPackagesToScan()));
+    return packagesToScan.toArray(String[]::new);
+}
+```
+
+By default everything under `org.apache.fineract` is scanned. The customizer
+SPI can add more — useful for custom out-of-tree extensions in
+`custom/<company>/<module>` projects.
+
+## EntityManagerFactoryBuilder + PersistenceUnitPostProcessors
+
+```java
+@Override
+public EntityManagerFactoryBuilder entityManagerFactoryBuilder(JpaVendorAdapter jpaVendorAdapter,
+        ObjectProvider<PersistenceUnitManager> persistenceUnitManager,
+        ObjectProvider<EntityManagerFactoryBuilderCustomizer> customizers) {
+    EntityManagerFactoryBuilder builder = super.entityManagerFactoryBuilder(jpaVendorAdapter, persistenceUnitManager, customizers);
+    builder.setPersistenceUnitPostProcessors(getPersistenceUnitPostProcessors());
+    return builder;
+}
+
+private PersistenceUnitPostProcessor[] getPersistenceUnitPostProcessors() {
+    Set<PersistenceUnitPostProcessor> processors = new HashSet<>();
+    processors.add(new DatabaseSelectingPersistenceUnitPostProcessor(databaseTypeResolver));
+    emFactoryCustomizers.forEach(c -> processors.addAll(c.additionalPersistenceUnitPostProcessors()));
+    return processors.toArray(PersistenceUnitPostProcessor[]::new);
+}
+```
+
+The built-in `DatabaseSelectingPersistenceUnitPostProcessor` (from
+`fineract-core`) selects which `orm.xml` overrides to apply based on whether
+the running database is MariaDB or PostgreSQL. This is how dialect-specific
+column type overrides are kept out of the entity classes themselves.
+
+## EclipseLink vendor adapter
+
+```java
+@Override
+protected AbstractJpaVendorAdapter createJpaVendorAdapter() {
+    return new EclipseLinkJpaVendorAdapter();
+}
+```
+
+The vendor adapter exposes the JPA `Dialect` to Spring's JPA infrastructure
+(used by the transaction manager and by Spring Data JPA's `JpaDialect` for
+exception translation). Returning `EclipseLinkJpaVendorAdapter` flips
+everything downstream — `JpaTransactionManager`, `JpaTemplate`,
+`SharedEntityManagerCreator` — into EclipseLink mode.
+
+## Auditing
+
+```java
+@Bean
+public AuditorAware<Long> auditorAware() {
+    return new AuditorAwareImpl();
+}
+```
+
+`AuditorAwareImpl` (in `fineract-core`) reads the current `AppUser` from the
+Spring Security context and returns its primary key. The `@EnableJpaAuditing`
+infrastructure passes this value to `@CreatedBy` and `@LastModifiedBy` fields
+when entities are persisted.
+
+## TransactionTemplate
+
+```java
+@Bean
+public TransactionTemplate txTemplate(PlatformTransactionManager transactionManager) {
+    TransactionTemplate tt = new TransactionTemplate();
+    tt.setTransactionManager(transactionManager);
+    return tt;
+}
+```
+
+`PlatformTransactionManager` is the `JpaTransactionManager` built by the
+superclass. The `txTemplate` bean is convenient for code paths that need
+programmatic transactions (e.g. batch tasklets that must open many short
+transactions sequentially).
+
+## EntityManagerFactoryCustomizer SPI
+
+This is the extension point through which sibling modules can contribute:
+
+```java
+public interface EntityManagerFactoryCustomizer {
+
+    default Set<String> additionalPackagesToScan() {
+        return Collections.emptySet();
+    }
+
+    default Map<String, Object> additionalVendorProperties() {
+        return Collections.emptyMap();
+    }
+
+    default Set<PersistenceUnitPostProcessor> additionalPersistenceUnitPostProcessors() {
+        return Collections.emptySet();
+    }
+}
+```
+
+Any Spring bean implementing this interface — anywhere in the classpath — gets
+folded into the EMF construction. The Javadoc explicitly notes:
+
+> The order in which the customizations are applied is not guaranteed.
+
+This is what allows custom extensions to ship their own JPA entities and ORM
+overrides without modifying core code.
+
+## Static weaving
+
+EclipseLink's `static` weaving mode requires that entity classes be
+post-processed at *build* time, not at runtime. This is enforced by the
+Gradle build configuration: `fineract-provider/build.gradle` registers an
+EclipseLink static-weave task that runs after `compileJava` and walks every
+`@Entity` class to:
+
+- Add `_persistence_*` fields and methods for change-tracking.
+- Insert lazy-loading proxies for `@ManyToOne(fetch = LAZY)` relationships.
+- Generate optimized property accessors.
+
+A repository-level reference exists at the project root:
+`STATIC_WEAVING.md` — read it before you debug "entity class not woven"
+errors. Common symptoms:
+
+- `IllegalStateException: Entity class is not weaved` at startup.
+- Lazy associations behaving like eager ones.
+- `ConcurrentModificationException` in change tracking.
+
+The fix is almost always: re-run `./gradlew :fineract-provider:compileJava`
+(and any module-specific weave tasks) so the bytecode is current. IDE
+incremental compilation sometimes bypasses the weave task.
+
+## orm.xml
+
+A single `META-INF/orm.xml` ships with the provider module at
+`fineract-provider/src/main/resources/META-INF/orm.xml`. It is referenced by
+the `jpa-pu` persistence unit and is used for two purposes:
+
+1. **Dialect-specific column type overrides** — selected at runtime by the
+   `DatabaseSelectingPersistenceUnitPostProcessor`.
+2. **Centralized named queries** — older domain entities still keep their
+   `@NamedQuery` definitions in `orm.xml` rather than on the entity class.
+
+## Where the entities live
+
+Spring Data JPA scans `org.apache.fineract.**.domain` and
+`org.apache.fineract.**.repository` for repositories, and the EMF scans
+`org.apache.fineract.**` for `@Entity` classes. In practice, every Gradle
+module follows the same convention:
+
+```
+<module>/.../domain/<EntityName>.java                @Entity
+<module>/.../domain/<EntityName>Repository.java      extends JpaRepository
+```
+
+or, for newer code:
+
+```
+<module>/.../domain/<EntityName>.java
+<module>/.../repository/<EntityName>Repository.java
+```
+
+## Common operations
+
+### Adding a new entity in a new module
+
+1. Make the new module depend (transitively) on `fineract-core` so the auditing
+   superclasses are available.
+2. Annotate your class with `@Entity` under `org.apache.fineract.<module>.domain`.
+3. Add a Spring Data repository interface in the same package or under
+   `.repository`.
+4. Add a Liquibase changelog under
+   `<module>/src/main/resources/db/changelog/` and reference it from the
+   module's `module-changelog.xml`.
+5. Ensure the EclipseLink static weave task in the module's `build.gradle`
+   picks up the new class.
+
+### Adding a vendor property
+
+Don't edit `JPAConfig`. Instead, implement `EntityManagerFactoryCustomizer`:
+
+```java
+@Component
+public class MyModuleEmfCustomizer implements EntityManagerFactoryCustomizer {
+    @Override
+    public Map<String, Object> additionalVendorProperties() {
+        return Map.of(PersistenceUnitProperties.LOGGING_LEVEL, "INFO");
+    }
+}
+```
+
+Spring's component scan will pick it up and the customizer collection on
+`JPAConfig` will fold it in at boot.
+
+## Related pages
+
+- [/runtime/transaction-management](/runtime/transaction-management) — how
+  `@Transactional` works on top of this EMF.
+- [JDBC and Hikari](/provider/jdbc-and-hikari-config) — the `DataSource` this
+  EMF is built over.
+- [Server Application Entrypoint](/provider/server-application-entrypoint) —
+  why `HibernateJpaAutoConfiguration` is excluded.
+- [Provider Overview](/provider/overview) — where `JPAConfig` fits in.

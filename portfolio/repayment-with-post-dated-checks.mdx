@@ -1,0 +1,295 @@
+---
+title: "Repayment With Post-Dated Checks Entity and APIs"
+sidebarTitle: "Post-Dated Checks"
+description: "Reference for the PostDatedChecks entity, the RepaymentWithPostDatedChecksApiResource, update/bounce/delete handlers and how checks realise loan repayments."
+---
+
+Apache Fineract supports the lending pattern common in South Asia and Latin America where a borrower issues a set of **post-dated checks** at disbursement, one per repayment installment. Each check sits in a vault and is released to the bank on its due date; if the check bounces the platform records the event and reopens the installment. The subsystem lives in `org.apache.fineract.portfolio.repaymentwithpostdatedchecks` — entities in `fineract-loan` (because they hold `@ManyToOne` to `Loan` and `LoanRepaymentScheduleInstallment`), everything else in `fineract-provider`.
+
+This page documents the `PostDatedChecks` entity, the JAX-RS resource at `/v1/loans/{loanId}/postdatedchecks`, the three command handlers, and the read/write services that drive update/bounce/delete operations.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `PostDatedChecks` entity | `fineract-loan` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.domain` |
+| `PostDatedChecksStatus` constants | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.data` |
+| `PostDatedChecksData` DTO | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.data` |
+| `PostDatedChecksRepository` | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.domain` |
+| `RepaymentWithPostDatedChecksApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.api` |
+| `RepaymentWithPostDatedChecksReadPlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.service` |
+| `RepaymentWithPostDatedChecksWritePlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.service` |
+| `RepaymentWithPostDatedChecksAssembler` | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.service` |
+| `EditPostDatedChecksHandler`, `DeletePostDatedChecksHandler`, `BouncePostDatedCheckHandler` | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.handler` |
+| Exceptions (`PostDatedCheckNotFoundException`, `PostDatedCheckBouncedCheckInvalid`) | `fineract-provider` | `org.apache.fineract.portfolio.repaymentwithpostdatedchecks.exception` |
+
+The feature is opt-in per loan product through the `useBorrowerCycle = true` / `holdGuaranteeFunds`-style flag set; on a typical install, only products marked "PDC enabled" actually wire the assembler into the loan-application path.
+
+## Entity
+
+```java
+// fineract-loan/.../repaymentwithpostdatedchecks/domain/PostDatedChecks.java
+@Entity
+@Table(name = "m_repayment_with_post_dated_checks")
+@Getter
+public class PostDatedChecks extends AbstractPersistableCustom<Long> {
+
+    @Setter
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "loan_id", referencedColumnName = "id", nullable = false)
+    private Loan loan;
+
+    @Setter
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "repayment_id", referencedColumnName = "id", nullable = false)
+    private LoanRepaymentScheduleInstallment loanRepaymentScheduleInstallment;
+
+    @Column(name = "account_no", nullable = false, length = 10)
+    private Long accountNo;
+
+    @Column(name = "bank_name", nullable = false, length = 100)
+    private String bankName;
+
+    @Column(name = "amount", scale = 6, precision = 19)
+    private BigDecimal amount;
+
+    @Column(name = "repayment_date", nullable = false)
+    private LocalDate repaymentDate;
+
+    @Setter
+    @Column(name = "status", columnDefinition = "0")
+    private Integer status;
+
+    @Column(name = "check_no", nullable = false, unique = true)
+    private Long checkNo;
+```
+
+Field semantics:
+
+- **`loan`** — parent loan.
+- **`loanRepaymentScheduleInstallment`** — the installment this check covers. The relationship is 1-to-1 logically (one check per installment) but enforced through unique check numbers and a uniqueness constraint on `(loan_id, repayment_id)`.
+- **`accountNo`** — bank account number on the check.
+- **`bankName`** — drawee bank.
+- **`amount`** — check face value (matches the installment principal+interest+fees+penalty due).
+- **`repaymentDate`** — set from the installment due date at creation.
+- **`status`** — see `PostDatedChecksStatus` below.
+- **`checkNo`** — globally unique check number. The `unique=true` constraint is enforced by the DB; collisions raise a `DataIntegrityViolationException`.
+
+### Status
+
+```java
+// fineract-provider/.../portfolio/repaymentwithpostdatedchecks/data/PostDatedChecksStatus.java
+public interface PostDatedChecksStatus {
+
+    Integer POST_DATED_CHECKS_BOUNCED = 1;
+    Integer POST_DATED_CHECKS_PAID    = 2;
+    Integer POST_DATED_CHECKS_PENDING = 0;
+}
+```
+
+A check starts at `PENDING (0)`. When it is presented and cleared, the loan repayment posting path flips it to `PAID (2)`. When it bounces, the bounce handler flips it to `BOUNCED (1)` and reopens the installment.
+
+### Factories
+
+```java
+public static PostDatedChecks instanceOf(final Long accountNo, final String bankName, final BigDecimal amount,
+        final LoanRepaymentScheduleInstallment loanRepaymentScheduleInstallment, final Loan loan, final Long checkNo) {
+    return new PostDatedChecks(accountNo, bankName, amount, loanRepaymentScheduleInstallment,
+            loanRepaymentScheduleInstallment.getDueDate(), loan, checkNo);
+}
+```
+
+The factory takes its `repaymentDate` from the installment, so the check date stays in lock-step with any rescheduling.
+
+### Update
+
+`updatePostDatedChecks(JsonCommand command)` accepts `amount`, `accountNo`, `bankName`, `checkNo` deltas and returns a `Map<String, Object> changes` for the audit log.
+
+## REST surface
+
+```java
+// fineract-provider/.../portfolio/repaymentwithpostdatedchecks/api/RepaymentWithPostDatedChecksApiResource.java
+@Path("/v1/loans/{loanId}/postdatedchecks")
+@Component
+@Tag(name = "repayment with post dated checks", description = "Repay with post dated checks")
+@RequiredArgsConstructor
+public class RepaymentWithPostDatedChecksApiResource {
+
+    private final PlatformSecurityContext context;
+    private final FromJsonHelper fromJsonHelper;
+    private final DefaultToApiJsonSerializer<PostDatedChecksData> apiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final RepaymentWithPostDatedChecksReadPlatformService repaymentWithPostDatedChecksReadPlatformService;
+```
+
+### GET — list all checks for a loan
+
+```java
+@GET
+@Operation(summary = "Get All Post Dated Checks", description = "Get All Post dated Checks")
+public String getPostDatedChecks(@PathParam("loanId") final Long loanId) {
+    this.context.authenticatedUser();
+    final List<PostDatedChecksData> postDatedChecksDataList = this.repaymentWithPostDatedChecksReadPlatformService
+            .getPostDatedChecks(loanId);
+    return this.apiJsonSerializer.serialize(postDatedChecksDataList);
+}
+```
+
+The list is ordered by `repayment_date` ASC so the UI naturally shows next-due first.
+
+### GET — by installment id
+
+```java
+@GET
+@Path("{installmentId}")
+public String getPostDatedCheck(@PathParam("installmentId") final Integer installmentId,
+                                @PathParam("loanId") final Long loanId) {
+    this.context.authenticatedUser();
+    final PostDatedChecksData postDatedChecksData = this.repaymentWithPostDatedChecksReadPlatformService
+            .getPostDatedCheckByInstallmentId(installmentId, loanId);
+    return this.apiJsonSerializer.serialize(postDatedChecksData);
+}
+```
+
+The path parameter is the **installment id**, not the check id — because the UI has the installment list in hand and uses it as the natural key into a check. The read service maps installment number → check row.
+
+### PUT — update OR bounce
+
+```java
+@PUT
+@Path("{postDatedCheckId}")
+@Operation(summary = "Update Post Dated Check, Bounced Check",
+           description = "Update Post Dated Check, Bounced Check")
+public String updatePostDatedChecks(@PathParam("postDatedCheckId") final Long id,
+                                    @PathParam("loanId") final Long loanId,
+                                    final String apiRequestBodyAsJson,
+                                    @QueryParam("editType") final String type) {
+    CommandWrapper commandRequest = null;
+    if ("update".equals(type)) {
+        commandRequest = new CommandWrapperBuilder().updatePostDatedCheck(id, loanId).withJson(apiRequestBodyAsJson).build();
+    } else if ("bounced".equals(type)) {
+        commandRequest = new CommandWrapperBuilder().bouncedCheck(id, loanId).withJson(apiRequestBodyAsJson).build();
+    }
+    final CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return this.apiJsonSerializer.serialize(result);
+}
+```
+
+The verb dispatches on the `?editType` query parameter:
+
+- `?editType=update` → `EditPostDatedChecksHandler`. Updates the check fields (amount, account number, bank, check number).
+- `?editType=bounced` → `BouncePostDatedCheckHandler`. Records a bounce event.
+
+There is no separate "mark paid" verb — paid status is set as a side effect of the loan's repayment posting path. That keeps "the check cleared" in lock-step with "the installment was paid" without two-write inconsistency.
+
+### DELETE
+
+```java
+@DELETE
+@Path("{postDatedCheckId}")
+public String deletePostDatedCheck(@PathParam("postDatedCheckId") final Long id,
+                                   @PathParam("loanId") final Long loanId) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().deletePostDatedCheck(id, loanId).build();
+    return this.apiJsonSerializer.serialize(this.commandsSourceWritePlatformService.logCommandSource(commandRequest));
+}
+```
+
+`DeletePostDatedChecksHandler` removes the check row. Only allowed when the underlying installment has not yet been paid (otherwise the check is the audit trail for the cleared payment and must not be removed).
+
+## Write service contract
+
+```java
+public interface RepaymentWithPostDatedChecksWritePlatformService {
+
+    CommandProcessingResult editPostDatedCheck(Long id, Long loanId, JsonCommand command);
+
+    CommandProcessingResult deletePostDatedCheck(Long id, Long loanId);
+
+    CommandProcessingResult bouncedCheck(Long id, Long loanId, JsonCommand command);
+}
+```
+
+### Bounce semantics
+
+The bounce handler does three things atomically:
+
+1. Sets the check's `status` to `POST_DATED_CHECKS_BOUNCED` (1).
+2. Reopens the matching `LoanRepaymentScheduleInstallment` if it was already marked obligation-met (it shouldn't be, but the handler defends against re-bouncing).
+3. Optionally posts a "check bounce fee" loan charge if the loan product is configured with one (typically a `CHARGE_PAYMENT` of `LoanCharge` type).
+
+`PostDatedCheckBouncedCheckInvalid` is raised (HTTP 400) when the request tries to bounce a check that is not in `PENDING` status.
+
+### Edit semantics
+
+`EditPostDatedChecksHandler` is the simpler path: it allows the user to fix typos (wrong check number, wrong bank name) on a `PENDING` check. Once a check is `PAID` or `BOUNCED`, edits are refused.
+
+## Read service
+
+```java
+public interface RepaymentWithPostDatedChecksReadPlatformService {
+    List<PostDatedChecksData> getPostDatedChecks(Long loanId);
+    PostDatedChecksData getPostDatedCheckByInstallmentId(Integer installmentId, Long loanId);
+}
+```
+
+The impl runs a single JDBC query joining `m_repayment_with_post_dated_checks` to `m_loan_repayment_schedule` to surface the installment number alongside the check fields.
+
+`PostDatedChecksData` carries `id`, `loanId`, `accountNo`, `bankName`, `amount`, `repaymentDate`, `status`, `checkNo`, `installmentId`, `installmentNumber`.
+
+## Assembler — creation at disbursement
+
+`RepaymentWithPostDatedChecksAssembler.fromParsedJson(JsonElement element, Loan loan)` builds the check set from the disbursement request body:
+
+```json
+{
+  "repaymentDate": "2024-08-01",
+  "dateFormat": "yyyy-MM-dd",
+  "locale": "en",
+  "postDatedChecks": [
+    { "accountNo": 12345678, "bankName": "ABC", "amount": 100, "checkNo": 90001, "installmentNumber": 1 },
+    { "accountNo": 12345678, "bankName": "ABC", "amount": 100, "checkNo": 90002, "installmentNumber": 2 },
+    ...
+  ]
+}
+```
+
+The assembler walks each entry, resolves the matching `LoanRepaymentScheduleInstallment` by `installmentNumber`, calls `PostDatedChecks.instanceOf(...)` and accumulates the list. It is invoked by `LoanWritePlatformServiceJpaRepositoryImpl.disburseLoan(...)` after the loan's installments are crystallised. If `useRepaymentWithPostDatedChecks` is not enabled on the product, the assembler is skipped.
+
+## Permissions
+
+- `READ_POSTDATEDCHECKS`, `UPDATE_POSTDATEDCHECKS`, `DELETE_POSTDATEDCHECKS`, `BOUNCE_POSTDATEDCHECKS`.
+
+All operations are auditable through the standard command pipeline; maker-checker is supported.
+
+## Exceptions
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `PostDatedCheckNotFoundException` | 404 | `{postDatedCheckId}` does not exist or does not belong to `{loanId}`. |
+| `PostDatedCheckBouncedCheckInvalid` | 400 | Trying to bounce a check that is not `PENDING` (already PAID or already BOUNCED). |
+
+Loan-level exceptions such as `LoanCannotBeDisbursedException` may surface during the assembler phase if the request to attach checks comes in for a loan in the wrong status.
+
+## Edge cases
+
+- **Rescheduling and check dates** — when a loan is rescheduled, the new installment due dates do **not** automatically reflow into existing PDC rows. The expected operational pattern is: bounce or delete the affected checks, reschedule, then issue replacement checks. The platform deliberately keeps these manual to mirror the physical check workflow.
+- **Check number collisions** — `check_no` is globally unique across `m_repayment_with_post_dated_checks`. If two loans use the same check book (unlikely), the second insertion fails with a DB constraint. The API surfaces this as HTTP 409 via the generic data-integrity exception mapper.
+- **Partial bounce / partial pay** — not supported. Each check is either fully paid or bounced.
+
+## Operational walkthrough
+
+1. **Disbursement** — borrower hands over a check book; officer enters check numbers into the loan-application body's `postDatedChecks` array. Disbursement creates all checks in `PENDING`.
+2. **Day-of-installment** — branch staff presents the matching check; once cleared by the bank, the loan repayment is posted via `/v1/loans/{id}/transactions?command=repayment` (or via the [collection sheet](/portfolio/collection-sheet)). The repayment path flips the check status to `PAID`.
+3. **Bounce** — if the bank returns "non-sufficient funds", staff calls `PUT /v1/loans/{loanId}/postdatedchecks/{id}?editType=bounced`. The installment is reopened and a bounce fee may be posted.
+4. **Replacement** — staff calls `DELETE` on the bounced check, then `POST` is not exposed on this resource — replacement checks are added through the loan-application "edit" path that re-runs the assembler with new entries.
+
+## Cross-references
+
+- [/loan/loan-domain-model](/loan/loan-domain-model) — the parent `Loan` and `LoanRepaymentScheduleInstallment` references.
+- [/loan/loan-disbursement-api](/loan/loan-disbursement-api) — disbursement path that triggers the assembler.
+- [/loan/loan-charges](/loan/loan-charges) — bounce-fee charges that may be configured.
+- [/portfolio/payment-details](/portfolio/payment-details) — when checks clear, the resulting loan repayment carries a `PaymentDetail` with the check number.
+- [/portfolio/payment-types](/portfolio/payment-types) — the "Cheque" payment type usually used.
+- [/portfolio/collection-sheet](/portfolio/collection-sheet) — bulk-pay flow that often realises PDC checks for a center.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder` for update/bounce/delete.

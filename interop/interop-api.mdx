@@ -1,0 +1,426 @@
+---
+title: "Interop API: Accounts, Parties, Quotes, Transfers Reference"
+sidebarTitle: "Interop API"
+description: "Endpoint-by-endpoint reference for Fineract's InteropApiResource at /v1/interoperation, covering account discovery, party lookup, quotes, two-phase transfers, and KYC."
+---
+
+`InteropApiResource` is Fineract's externally visible interoperability
+surface — the FSP-side endpoint that a Mojaloop hub (or any similar
+switch) calls to look up parties, calculate quotes, and execute transfers
+against savings accounts on the platform. The resource is at
+`/v1/interoperation` and lives in `fineract-provider`. It delegates to
+`InteropService` for reads and to the [commands framework](/command/overview)
+via `InteropWrapperBuilder` for writes. Each handler eventually lands in
+`InteropServiceImpl`.
+
+## Resource declaration
+
+Source: `interoperation/api/InteropApiResource.java`.
+
+```java
+@Path("/v1/interoperation") // api/v1/
+@Component
+@Tag(name = "Inter Operation", description = "")
+@RequiredArgsConstructor
+public class InteropApiResource {
+
+    private final PlatformSecurityContext context;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final DefaultToApiJsonSerializer<CommandProcessingResult> jsonSerializer;
+    private final InteropService interopService;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceService;
+```
+
+## Endpoint catalogue
+
+| Method | Path | Operation | Backing call |
+| --- | --- | --- | --- |
+| `GET` | `/health` | `health()` returns `"OK"` | — |
+| `GET` | `/accounts/{accountId}` | `getAccountDetails` | `interopService.getAccountDetails(accountId)` |
+| `GET` | `/accounts/{accountId}/transactions` | `getAccountTransactions(?debit&credit&fromBookingDateTime&toBookingDateTime)` | `interopService.getAccountTransactions(...)` |
+| `GET` | `/accounts/{accountId}/identifiers` | `getAccountIdentifiers` | `interopService.getAccountIdentifiers(accountId)` |
+| `GET` | `/accounts/{accountId}/kyc` | `getClientKyc` | `interopService.getKyc(accountId)` |
+| `GET` | `/parties/{idType}/{idValue}` | `getAccountByIdentifier` | `interopService.getAccountByIdentifier(idType, idValue, null)` |
+| `GET` | `/parties/{idType}/{idValue}/{subIdOrType}` | `getAccountByIdentifier` | `interopService.getAccountByIdentifier(idType, idValue, subIdOrType)` |
+| `POST` | `/parties/{idType}/{idValue}` | `registerAccountIdentifier` | command `CREATE INTERID` → `registerAccountIdentifier(...)` |
+| `POST` | `/parties/{idType}/{idValue}/{subIdOrType}` | `registerAccountIdentifier` (with sub) | command `CREATE INTERID` |
+| `DELETE` | `/parties/{idType}/{idValue}` | `deleteAccountIdentifier` | command `DELETE INTERID` |
+| `DELETE` | `/parties/{idType}/{idValue}/{subIdOrType}` | `deleteAccountIdentifier` (with sub) | command `DELETE INTERID` |
+| `GET` | `/transactions/{transactionCode}/requests/{requestCode}` | `getTransactionRequest` | always returns `REJECTED` until stored — see service |
+| `POST` | `/requests` | `createTransactionRequest` | command `CREATE INTERREQUEST` |
+| `GET` | `/transactions/{transactionCode}/quotes/{quoteCode}` | `getQuote` | `interopService.getQuote(...)` (currently returns `null`) |
+| `POST` | `/quotes` | `createQuote` | command `CREATE INTERQUOTE` |
+| `GET` | `/transactions/{transactionCode}/transfers/{transferCode}` | `getTransfer` | `interopService.getTransfer(...)` (currently returns `null`) |
+| `POST` | `/transfers?action=PREPARE\|CREATE\|RELEASE` | `performTransfer` | command `PREPARE\|CREATE\|RELEASE INTERTRANSFER` |
+| `POST` | `/transactions/{accountId}/disburse` | `disburseLoan` | `interopService.disburseLoan(accountId, body)` |
+| `POST` | `/transactions/{accountId}/loanrepayment` | `loanRepayment` | `interopService.loanRepayment(accountId, body)` |
+
+## Identifier registration
+
+```java
+@POST
+@Path("parties/{idType}/{idValue}")
+public String registerAccountIdentifier(
+        @PathParam("idType") InteropIdentifierType idType,
+        @PathParam("idValue") String idValue,
+        String identifierJson,
+        @Context UriInfo uriInfo) {
+    CommandWrapper commandRequest = new InteropWrapperBuilder()
+            .registerAccountIdentifier(idType, idValue, null)
+            .withJson(identifierJson).build();
+
+    InteropIdentifierAccountResponseData result =
+        (InteropIdentifierAccountResponseData) commandsSourceService.logCommandSource(commandRequest);
+    ...
+}
+```
+
+The downstream service performs:
+
+```java
+InteropIdentifier identifier = new InteropIdentifier(
+        savingsAccount, request.getIdType(), request.getIdValue(),
+        request.getSubIdOrType(), createdBy.getUsername());
+identifierRepository.saveAndFlush(identifier);
+```
+
+If the unique constraint
+`uk_hathor_identifier_account` (`account_id`, `type`) or
+`uk_hathor_identifier_value` (`type`, `a_value`, `sub_value_or_type`)
+is violated, `handleInteropDataIntegrityIssues` translates the cause into
+a `PlatformDataIntegrityException`.
+
+### Request body
+
+The `InteropIdentifierRequestData` validator allows one parameter:
+
+```java
+static final String[] PARAMS = { PARAM_ACCOUNT_ID };
+```
+
+Sample body:
+
+```json
+{ "accountId": "ABC-7654-321" }
+```
+
+Where `accountId` is the savings account's `external_id` (not its
+internal `m_savings_account.id`). Both reads and writes resolve accounts by
+external id.
+
+## Identifier deregistration
+
+```java
+@DELETE
+@Path("parties/{idType}/{idValue}")
+public String deleteAccountIdentifier(
+        @PathParam("idType") InteropIdentifierType idType,
+        @PathParam("idValue") String idValue,
+        @Context UriInfo uriInfo) {
+    CommandWrapper commandRequest = new InteropWrapperBuilder()
+            .deleteAccountIdentifier(idType, idValue, null).build();
+    ...
+}
+```
+
+The handler resolves the identifier through
+`InteropIdentifierRepository`, throws `InteropAccountNotFoundException` if
+missing, otherwise deletes the row.
+
+## Party lookup
+
+```java
+@GET
+@Path("parties/{idType}/{idValue}")
+public String getAccountByIdentifier(
+        @PathParam("idType") InteropIdentifierType idType,
+        @PathParam("idValue") String idValue,
+        @Context UriInfo uriInfo) {
+    InteropIdentifierAccountResponseData result =
+        interopService.getAccountByIdentifier(idType, idValue, null);
+    ...
+}
+```
+
+The service:
+
+```java
+InteropIdentifier identifier = findIdentifier(idType, idValue, subIdOrType);
+if (identifier == null) {
+    throw new InteropAccountNotFoundException(idType, idValue, subIdOrType);
+}
+return InteropIdentifierAccountResponseData.build(
+        identifier.getId(),
+        identifier.getAccount().getExternalId().getValue());
+```
+
+The response shape carries the identifier row id (so it can be DELETE'd later)
+and the savings account external id.
+
+## Quotes
+
+```java
+@POST
+@Path("quotes")
+public String createQuote(String quotesJson, @Context UriInfo uriInfo) {
+    CommandWrapper commandRequest = new InteropWrapperBuilder()
+            .createQuotes().withJson(quotesJson).build();
+
+    InteropQuoteResponseData result =
+        (InteropQuoteResponseData) commandsSourceService.logCommandSource(commandRequest);
+    ...
+}
+```
+
+`InteropServiceImpl.createQuote` computes a fee depending on the
+transaction role and ensures sufficient withdrawable balance:
+
+```java
+InteropQuoteRequestData request = dataValidator.validateAndParseCreateQuote(command);
+SavingsAccount savingsAccount = validateAndGetSavingAccount(request);
+SavingsAccountTransactionType transactionType = request.getTransactionRole().getTransactionType();
+
+final BigDecimal fee;
+if (transactionType.isDebit()) {
+    fee = savingsAccount.calculateWithdrawalFee(request.getAmount().getAmount());
+    if (MathUtil.isLessThan(savingsAccount.getWithdrawableBalance(),
+                            request.getAmount().getAmount().add(fee))) {
+        throw new InsufficientAccountBalanceException(...);
+    }
+} else {
+    fee = BigDecimal.ZERO;
+}
+
+return InteropQuoteResponseData.build(command.commandId(), request.getTransactionCode(),
+        InteropActionState.ACCEPTED, request.getExpiration(),
+        request.getExtensionList(), request.getQuoteCode(),
+        MoneyData.build(fee, savingsAccount.getCurrency().getCode()), null);
+```
+
+Notably the read endpoint `GET /transactions/{transactionCode}/quotes/{quoteCode}`
+currently returns `null` — Mojaloop hubs typically cache quotes
+themselves, but this is a known stub.
+
+## Transaction requests
+
+```java
+@POST
+@Path("requests")
+public String createTransactionRequest(String quotesJson, @Context UriInfo uriInfo) {
+    CommandWrapper commandRequest = new InteropWrapperBuilder()
+            .createTransactionRequest().withJson(quotesJson).build();
+    ...
+}
+```
+
+The service implementation returns `InteropActionState.ACCEPTED` after
+validating the request and the savings account:
+
+```java
+return InteropTransactionRequestResponseData.build(
+        command.commandId(), request.getTransactionCode(),
+        InteropActionState.ACCEPTED, request.getExpiration(),
+        request.getExtensionList(), request.getRequestCode());
+```
+
+`GET .../requests/{requestCode}` currently always returns `REJECTED`
+because requests are not persisted; this is documented in the source:
+
+```java
+@Override
+public InteropTransactionRequestResponseData getTransactionRequest(
+        @NonNull String transactionCode, @NonNull String requestCode) {
+    // always REJECTED until request info is stored
+    return InteropTransactionRequestResponseData.build(
+        transactionCode, InteropActionState.REJECTED, requestCode);
+}
+```
+
+## Two-phase transfer
+
+```java
+@POST
+@Path("transfers")
+public String performTransfer(@QueryParam("action") String action,
+        String quotesJson, @Context UriInfo uriInfo) {
+
+    baseDataValidator.reset().parameter("action").value(action).notNull()
+        .isOneOfEnumValues(InteropTransferActionType.class);
+
+    if (!dataValidationErrors.isEmpty()) {
+        throw new PlatformApiDataValidationException(
+            "validation.msg.validation.errors.exist", "Validation errors exist.",
+            dataValidationErrors);
+    }
+
+    CommandWrapper commandRequest = new InteropWrapperBuilder()
+            .performTransfer(InteropTransferActionType.valueOf(action))
+            .withJson(quotesJson).build();
+
+    InteropTransferResponseData result =
+        (InteropTransferResponseData) commandsSourceService.logCommandSource(commandRequest);
+    ...
+}
+```
+
+The `action` query parameter must be one of `PREPARE`, `CREATE`,
+`RELEASE`. The wrapper records the action verbatim:
+
+```java
+public InteropWrapperBuilder performTransfer(InteropTransferActionType action) {
+    this.actionName = action.name();
+    this.entityName = ENTITY_NAME_TRANSFER;   // "INTERTRANSFER"
+    this.href = "/" + ROOT_PATH + "/transfers";
+    return this;
+}
+```
+
+### PREPARE
+
+`InteropServiceImpl.prepareTransfer`:
+
+```java
+SavingsAccountTransactionType transactionType =
+    request.getTransactionRole().getTransactionType();
+if (transactionType.isDebit()) {
+    SavingsAccount savingsAccount = validateAndGetSavingAccount(request);
+    BigDecimal total = calculateTotalTransferAmount(request, savingsAccount);
+
+    if (MathUtil.isLessThan(savingsAccount.getWithdrawableBalance(), total)) {
+        throw new InsufficientAccountBalanceException(...);
+    }
+    if (findTransaction(savingsAccount, transferCode, AMOUNT_HOLD.getValue()) != null) {
+        throw new InteropTransferAlreadyOnHoldException(...);
+    }
+
+    PaymentDetail paymentDetail = instance(findPaymentType(),
+        savingsAccount.getExternalId().getValue(), null,
+        getRoutingCode(), transferCode, null);
+    SavingsAccountTransaction holdTransaction =
+        SavingsAccountTransaction.holdAmount(savingsAccount, savingsAccount.office(),
+            paymentDetail, transactionDate,
+            Money.of(savingsAccount.getCurrency(), total), false);
+    ...
+    savingsAccount.holdAmount(total);
+    savingsAccount.addTransaction(holdTransaction);
+    savingsAccountRepository.save(savingsAccount);
+}
+```
+
+A debit-side `PREPARE` results in an `AMOUNT_HOLD` row on the savings
+account, indexed by `transferCode` in `PaymentDetail`. Credit-side
+`PREPARE` is a no-op — the payee account does not reserve funds.
+
+### CREATE (commit)
+
+`commitTransfer` releases the hold and posts the actual debit or credit,
+keyed by the same `transferCode`. If the transfer already has an
+ACCEPTED `WITHDRAWAL`/`DEPOSIT`, it throws
+`InteropTransferAlreadyCommittedException`.
+
+### RELEASE
+
+`releaseTransfer` releases the hold without posting — typically called by
+the switch when a transfer is aborted at the hub. If no hold exists, it
+throws `InteropTransferMissingException`.
+
+## KYC
+
+```java
+@GET
+@Path("accounts/{accountId}/kyc")
+public String getClientKyc(@PathParam("accountId") String accountId, @Context UriInfo uriInfo) {
+    InteropKycResponseData result = interopService.getKyc(accountId);
+    ...
+}
+```
+
+`InteropServiceImpl.getKyc` uses a `RowMapper` (`InteropKycMapper`) to
+fetch a flattened KYC record by joining `m_savings_account`, `m_client`,
+`m_client_identifier`, `m_code_value`, and any address tables, and throws
+`InteropKycDataNotFoundException` when nothing matches.
+
+## Loan integration
+
+```java
+@POST
+@Path("transactions/{accountId}/disburse")
+public String disburseLoan(@PathParam("accountId") String accountId,
+        final String apiRequestBodyAsJson, @Context UriInfo uriInfo) {
+    return interopService.disburseLoan(accountId, apiRequestBodyAsJson);
+}
+```
+
+The service:
+
+```java
+@Override
+public @NonNull String disburseLoan(@NonNull String accountId, String apiRequestBodyAsJson) {
+    ...
+    final CommandWrapper commandRequest = builder.disburseLoanApplication(loanId).build();
+    ...
+}
+```
+
+This dispatches to the standard loan-disbursement command — fully reusing
+the loan workflow. Same pattern for `loanRepayment`. Note that `accountId`
+in these two endpoints is interpreted as the **savings account external
+id** of the borrower, and the loan id is resolved internally.
+
+## Filtering account transactions
+
+```java
+@GET
+@Path("accounts/{accountId}/transactions")
+public String getAccountTransactions(@PathParam("accountId") String accountId,
+        @DefaultValue("true")  @QueryParam("debit")  boolean debit,
+        @DefaultValue("false") @QueryParam("credit") boolean credit,
+        @QueryParam("fromBookingDateTime") String fromBookingDateTime,
+        @QueryParam("toBookingDateTime")   String toBookingDateTime,
+        @Context UriInfo uriInfo) {
+    LocalDateTime transactionsFrom = fromBookingDateTime == null ? null
+        : LocalDateTime.parse(fromBookingDateTime, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+    LocalDateTime transactionsTo = toBookingDateTime == null ? null
+        : LocalDateTime.parse(toBookingDateTime, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+    ...
+}
+```
+
+The service applies a `Predicate<SavingsAccountTransaction>` that filters
+by `debit`/`credit` and the booking window, then enriches the response
+with concatenated `Note` records (truncated at 500 characters).
+
+## Health
+
+```java
+@GET
+@Path("health")
+public String health(@Context UriInfo uriInfo) {
+    return "OK";
+}
+```
+
+Used by load balancers and switches to probe liveness without
+authenticating against a savings account.
+
+## Permission and security model
+
+| Endpoint | Check |
+| --- | --- |
+| GET / DELETE on `/transactions/{...}/requests`, `/quotes` | `validateHasReadPermission(ENTITY_NAME_REQUEST)` or `ENTITY_NAME_QUOTE` |
+| POST identifier / quote / request / transfer | Resolved by `CommandWrapper` against the entity name (`INTERID`, `INTERREQUEST`, `INTERQUOTE`, `INTERTRANSFER`) and action (`CREATE`, `DELETE`, `PREPARE`, `RELEASE`) |
+| Other GETs | `validateHasReadPermission` is not directly called — but `InteropService` methods invoke `validateAndGetSavingAccount` which throws `InteropAccountNotFoundException` if the account is missing or off-tenant |
+
+The switch caller must use a Fineract AppUser with permissions on the
+`INTER*` entities. The `Fineract-Platform-TenantId` header is mandatory.
+
+## See also
+
+- [Interop overview](/interop/overview)
+- [Interop domain](/interop/interop-domain) — identifier and transaction
+  enums
+- [Interop serialization](/interop/interop-serialization) — `InteropDataValidator`
+- [Commands framework](/command/overview)
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `SavingsAccount`
+- [User administration domain](/core/useradministration-domain)
+- [`/api/portfolio-apis`](/api/portfolio-apis)

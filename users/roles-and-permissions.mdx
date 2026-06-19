@@ -1,0 +1,401 @@
+---
+title: "Roles and Permissions — Authorisation Model and Maker–Checker"
+sidebarTitle: "Roles & Permissions"
+description: "Fineract Role and Permission entities, m_role_permission join, RolesApiResource lifecycle, PermissionsApiResource matrix and maker–checker toggling."
+---
+
+In Apache Fineract every authorisation decision boils down to two questions: *does the calling user hold at least one role*, and *does any of those roles include the permission whose code matches `ACTION_ENTITY` for this command*. The model is intentionally flat — there is no role hierarchy, no permission grouping at runtime, no per-resource ACL. The flexibility comes from the **maker–checker** layer that lets an administrator declare any permission as "needs a second user to approve" by flipping a single column on `m_permission`. This page documents the `Role` and `Permission` entities, the join tables, and the two JAX-RS resources `/v1/roles` and `/v1/permissions` that manage them.
+
+<Note>
+For the `AppUser` ↔ `Role` join and the user-level helpers (`validateHasReadPermission`, `validateHasCheckerPermissionTo`, `ALL_FUNCTIONS` short-circuit) see [users domain](/users/users-domain). This page focuses on the role and permission tables themselves and on the matrix endpoint.
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `Role` | `fineract-core` |
+| Entity | `Permission` | `fineract-core` |
+| Entity | `AppUserPreviousPassword` (used by change-password) | `fineract-provider` |
+| Data | `RoleData`, `PermissionData`, `RolePermissionsData` | `fineract-core` |
+| Repositories | `RoleRepository`, `PermissionRepository` | `fineract-provider` |
+| Read services | `RoleReadPlatformService` / `…Impl`, `PermissionReadPlatformService` / `…Impl` | `fineract-provider` |
+| Write services | `RoleWritePlatformService` / `…JpaRepositoryImpl`, `PermissionWritePlatformService` / `…JpaRepositoryImpl` | `fineract-provider` |
+| Validator | `RoleDataValidator`, `PermissionsCommandFromApiJsonDeserializer` | `fineract-provider` |
+| Command | `PermissionsCommand` | `fineract-provider` |
+| Handlers | `CreateRoleCommandHandler`, `UpdateRoleCommandHandler`, `DeleteRoleCommandHandler`, `EnableRoleCommandHandler`, `DisableRoleCommandHandler`, `UpdateRolePermissionsCommandHandler`, `UpdateMakerCheckerPermissionsCommandHandler` | `fineract-provider` |
+| JAX-RS | `RolesApiResource` (`/v1/roles`), `PermissionsApiResource` (`/v1/permissions`) | `fineract-provider` |
+| Exceptions | `RoleNotFoundException`, `RoleAssociatedException`, `PermissionNotFoundException`, `PermissionCantBeMakerCheckerableException` | `fineract-provider` |
+
+## `Role` entity
+
+```java
+// fineract-core/.../useradministration/domain/Role.java
+@Entity
+@Table(name = "m_role",
+       uniqueConstraints = { @UniqueConstraint(columnNames = {"name"}, name = "unq_name") })
+public class Role extends AbstractPersistableCustom<Long> implements Serializable {
+
+    @Column(name = "name",        unique = true, nullable = false, length = 100) private String  name;
+    @Column(name = "description", nullable = false, length = 500)                 private String  description;
+    @Column(name = "is_disabled", nullable = false)                                private Boolean disabled;
+
+    @ManyToMany(fetch = FetchType.EAGER)
+    @JoinTable(name = "m_role_permission",
+        joinColumns        = @JoinColumn(name = "role_id"),
+        inverseJoinColumns = @JoinColumn(name = "permission_id"))
+    private Set<Permission> permissions = new HashSet<>();
+}
+```
+
+### Column inventory
+
+| Column | Field | Constraint | Meaning |
+| --- | --- | --- | --- |
+| `name` | `name` | unique, `NOT NULL`, 100 chars | Human-readable role name — `Super user`, `Self Service User`, … |
+| `description` | `description` | `NOT NULL`, 500 chars | Free text shown in the UI |
+| `is_disabled` | `disabled` | `NOT NULL` | Soft-disable flag — users keep the assignment but its permissions are ignored |
+| join `m_role_permission` | `permissions` | EAGER | Direct M:M to `Permission` |
+
+### Lifecycle methods
+
+```java
+public boolean updatePermission(final Permission permission, final boolean isSelected) {
+    return isSelected ? addPermission(permission) : removePermission(permission);
+}
+
+public void disableRole() { this.disabled = true; }
+public void enableRole()  { this.disabled = false; }
+
+public boolean hasPermissionTo(final String permissionCode) {
+    boolean match = false;
+    for (final Permission permission : this.permissions) {
+        if (permission.hasCode(permissionCode)) { match = true; break; }
+    }
+    return match;
+}
+```
+
+Note `isEnabled()` returns the `disabled` flag, not its inverse — this looks like a bug but is actually preserved for backwards compat. Use `Boolean.FALSE.equals(role.isDisabled())` for clarity in new code.
+
+### Bootstrap roles
+
+The default Liquibase changeset inserts:
+
+| id | name | description | is_disabled |
+| --- | --- | --- | --- |
+| 1 | `Super user` | Special role designated for the System Administrator | false |
+| 2 | `Self Service User` | Limited self-service portal access | false |
+
+The Super user is mapped to the `ALL_FUNCTIONS` permission, which short-circuits every check in `AppUser.validateHasPermission(...)`.
+
+## `Permission` entity
+
+```java
+// fineract-core/.../useradministration/domain/Permission.java
+@Entity
+@Table(name = "m_permission")
+public class Permission extends AbstractPersistableCustom<Long> implements Serializable {
+
+    @Column(name = "grouping",     nullable = false, length = 45)  private String  grouping;
+    @Column(name = "code",         nullable = false, length = 100) private String  code;
+    @Column(name = "entity_name",  length = 100)                    private String  entityName;
+    @Column(name = "action_name",  length = 100)                    private String  actionName;
+    @Column(name = "can_maker_checker", nullable = false)           private boolean canMakerChecker;
+
+    public Permission(final String grouping, final String entityName, final String actionName) {
+        this.grouping   = grouping;
+        this.entityName = entityName;
+        this.actionName = actionName;
+        this.code       = actionName + "_" + entityName;
+        this.canMakerChecker = false;
+    }
+
+    public boolean hasCode(final String checkCode) { return this.code.equalsIgnoreCase(checkCode); }
+    public boolean enableMakerChecker(final boolean canMakerChecker) {
+        final boolean same = this.canMakerChecker == canMakerChecker;
+        this.canMakerChecker = canMakerChecker;
+        return !same;
+    }
+}
+```
+
+### Column inventory
+
+| Column | Field | Meaning |
+| --- | --- | --- |
+| `grouping` | `grouping` | High-level bucket: `special`, `authorisation`, `portfolio`, `transaction_loan`, `accounting`, `report`, `organisation`, … |
+| `code` | `code` | The canonical `ACTION_ENTITY` string checked at runtime |
+| `entity_name` | `entityName` | The resource: `CLIENT`, `LOAN`, `OFFICE`, … |
+| `action_name` | `actionName` | The action: `READ`, `CREATE`, `UPDATE`, `DELETE`, `APPROVE`, `DISBURSE`, … |
+| `can_maker_checker` | `canMakerChecker` | Whether this permission is currently enabled for maker–checker |
+
+### `code` generation rule
+
+The constructor always assembles `code = actionName + "_" + entityName`. So inserting a permission with `actionName = "CREATE"` and `entityName = "CLIENT"` produces `code = "CREATE_CLIENT"`. The maker–checker variants follow the convention `<CODE>_CHECKER` (e.g. `CREATE_CLIENT_CHECKER`) and are inserted as **separate rows** at bootstrap, not derived at runtime.
+
+### Special permissions
+
+A handful of codes have grouping `special` and no `entity_name` / `action_name`. They are checked via `hasAnyPermission(...)` rather than `validateHasReadPermission(...)`:
+
+| Code | Effect |
+| --- | --- |
+| `ALL_FUNCTIONS` | Bypass every permission check |
+| `ALL_FUNCTIONS_READ` | Bypass every read-only check |
+| `CHECKER_SUPER_USER` | Approve any maker–checker entry without holding the per-permission `_CHECKER` flag |
+| `REPORTING_SUPER_USER` | Read any report |
+| `BYPASS_LOAN_WRITE_PROTECTION` | Skip closed-loan/non-active-loan write guards |
+| `APPROVEINPAST_LOAN`, `REJECTINPAST_LOAN`, `WITHDRAWINPAST_LOAN`, `DISBURSEINPAST_LOAN`, `REPAYMENTINPAST_LOAN` | Allow back-dated loan state transitions |
+
+## `RolesApiResource` — `/v1/roles`
+
+```java
+@Path("/v1/roles")
+@Component
+@Tag(name = "Roles", description = "An API capability to support management of application roles for user administration.")
+@RequiredArgsConstructor
+public class RolesApiResource {
+    public static final String ID                    = "id";
+    public static final String NAME                  = "name";
+    public static final String DESCRIPTION           = "description";
+    public static final String AVAILABLE_PERMISSIONS = "availablePermissions";
+    public static final String SELECTED_PERMISSIONS  = "selectedPermissions";
+    public static final String PERMISSION_USAGE_DATA = "permissionUsageData";
+    public static final String DISABLE               = "disable";
+    public static final String ENABLE                = "enable";
+
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "ROLE";
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/roles` | `retrieveAllRoles` | — | List |
+| POST | `/v1/roles` | `createRole` | `CREATE_ROLE` | Create role |
+| GET | `/v1/roles/{roleId}` | `retrieveRole` | — | One role |
+| POST | `/v1/roles/{roleId}?command=enable\|disable` | `actionsOnRoles` | `ENABLE_ROLE` / `DISABLE_ROLE` | Toggle |
+| PUT | `/v1/roles/{roleId}` | `updateRole` | `UPDATE_ROLE` | Edit name/description |
+| GET | `/v1/roles/{roleId}/permissions` | `retrieveRolePermissions` | — | Role + permission usage matrix |
+| PUT | `/v1/roles/{roleId}/permissions` | `updateRolePermissions` | `UPDATE_ROLE_PERMISSIONS` | Set which permissions belong to the role |
+| DELETE | `/v1/roles/{roleId}` | `deleteRole` | `DELETE_ROLE` | Delete (only if unassigned) |
+
+### `POST /v1/roles` — create
+
+```json
+{ "name": "Branch Teller", "description": "Cash-handling staff at a branch" }
+```
+
+Mandatory: `name`, `description`. The unique constraint on `name` is enforced both by `RoleDataValidator` and by the DB.
+
+### `POST /v1/roles/{roleId}?command=enable|disable`
+
+```java
+public String actionsOnRoles(@PathParam("roleId") final Long roleId,
+        @QueryParam("command") final String commandParam,
+        @Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandProcessingResult result = null;
+    if      (is(commandParam, DISABLE)) result = commandsSourceWritePlatformService.logCommandSource(builder.disableRole(roleId).build());
+    else if (is(commandParam, ENABLE))  result = commandsSourceWritePlatformService.logCommandSource(builder.enableRole(roleId).build());
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Two valid command values: `enable`, `disable`. Anything else returns a null result and a `200` body of `null` — there is no explicit `UnrecognizedQueryParamException` here (unlike holidays); clients should validate locally before calling.
+
+### `GET /v1/roles/{roleId}/permissions` — the matrix
+
+```java
+public String retrieveRolePermissions(@PathParam("roleId") final Long roleId, @Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    final RoleData role = roleReadPlatformService.retrieveOne(roleId);
+    final Collection<PermissionData> permissionUsageData = permissionReadPlatformService.retrieveAllRolePermissions(roleId);
+    final RolePermissionsData permissionsData = role.toRolePermissionData(permissionUsageData);
+    return permissionsToApiJsonSerializer.serialize(settings, permissionsData, PERMISSIONS_RESPONSE_PARAMETERS);
+}
+```
+
+Response shape (`RolePermissionsData`):
+
+```json
+{
+  "id": 3,
+  "name": "Loan Officer",
+  "description": "Frontline staff managing client portfolios",
+  "permissionUsageData": [
+    { "grouping": "portfolio",          "code": "READ_CLIENT",   "entityName": "CLIENT",   "actionName": "READ",   "selected": true  },
+    { "grouping": "portfolio",          "code": "CREATE_CLIENT", "entityName": "CLIENT",   "actionName": "CREATE", "selected": true  },
+    { "grouping": "portfolio",          "code": "UPDATE_CLIENT", "entityName": "CLIENT",   "actionName": "UPDATE", "selected": false },
+    { "grouping": "transaction_loan",   "code": "APPROVE_LOAN",  "entityName": "LOAN",     "actionName": "APPROVE","selected": false }
+  ]
+}
+```
+
+The `selected` flag is computed by `PermissionUsageDataMapper.rolePermissionSchema()`:
+
+```sql
+SELECT  p.grouping     AS "grouping",
+        p.code         AS "code",
+        p.entity_name  AS "entityName",
+        p.action_name  AS "actionName",
+        (CASE WHEN rp.permission_id IS NULL THEN 0 ELSE 1 END) AS "selected"
+FROM    m_permission p
+LEFT JOIN m_role_permission rp ON rp.permission_id = p.id AND rp.role_id = ?
+ORDER BY p.grouping, p.entity_name, p.action_name
+```
+
+So **every** permission row is returned, with `selected` indicating membership — this is what powers the role-edit UI checklist.
+
+### `PUT /v1/roles/{roleId}/permissions`
+
+Body:
+
+```json
+{
+  "permissions": {
+    "READ_CLIENT":   true,
+    "CREATE_CLIENT": true,
+    "UPDATE_CLIENT": false,
+    "APPROVE_LOAN":  false
+  }
+}
+```
+
+The map is a **complete** specification — anything omitted is left unchanged. The handler `UpdateRolePermissionsCommandHandler` iterates the map, loads each `Permission` by code (raising `PermissionNotFoundException` on miss) and calls `role.updatePermission(permission, isSelected)`.
+
+### `DELETE /v1/roles/{roleId}`
+
+The handler counts users carrying the role via `AppUserRepository.countUsersByRoleId(roleId)`. If non-zero → `RoleAssociatedException` (HTTP 409). Otherwise the role row, along with its `m_role_permission` entries, is removed.
+
+## `PermissionsApiResource` — `/v1/permissions`
+
+```java
+@Path("/v1/permissions")
+@Component
+public class PermissionsApiResource {
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "PERMISSION";
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = Set.of(
+        "grouping", "code", "entityName", "actionName", "selected", "isMakerChecker");
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/permissions` | `retrieveAllPermissions` | — | List; `?makerCheckerable=true` returns the maker–checker matrix |
+| PUT | `/v1/permissions` | `updatePermissionsDetails` | `UPDATE_PERMISSIONS` | Flip the maker–checker flag on a set of permissions |
+
+### `GET /v1/permissions`
+
+```java
+public String retrieveAllPermissions(@Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    Collection<PermissionData> permissions = settings.isMakerCheckerable()
+            ? permissionReadPlatformService.retrieveAllMakerCheckerablePermissions()
+            : permissionReadPlatformService.retrieveAllPermissions();
+    return toApiJsonSerializer.serialize(settings, permissions, RESPONSE_DATA_PARAMETERS);
+}
+```
+
+#### Without `makerCheckerable`
+
+The plain `permissionSchema()` returns every permission row with `selected = true`. This is just the catalogue of codes the platform recognises, useful for diagnostic tooling.
+
+#### With `?makerCheckerable=true`
+
+The `makerCheckerablePermissionSchema()` returns the same rows but with `selected = can_maker_checker`. This is the matrix the UI uses to toggle which permissions require a second user.
+
+Response sample:
+
+```json
+[
+  { "grouping": "special",          "code": "ALL_FUNCTIONS", "entityName": null,     "actionName": null,   "selected": false },
+  { "grouping": "portfolio",        "code": "CREATE_CLIENT", "entityName": "CLIENT", "actionName": "CREATE","selected": true  },
+  { "grouping": "transaction_loan", "code": "APPROVE_LOAN",  "entityName": "LOAN",   "actionName": "APPROVE","selected": true }
+]
+```
+
+### `PUT /v1/permissions` — toggle maker–checker
+
+```java
+public String updatePermissionsDetails(@Parameter(hidden = true) final String apiRequestBodyAsJson) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .updatePermissions().withJson(apiRequestBodyAsJson).build();
+    final CommandProcessingResult result = commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+Body:
+
+```json
+{
+  "permissions": {
+    "CREATE_CLIENT": true,
+    "APPROVE_LOAN":  true,
+    "DISBURSE_LOAN": false
+  }
+}
+```
+
+The handler `UpdateMakerCheckerPermissionsCommandHandler`:
+
+1. Loads each `Permission` by code.
+2. For each one whose action is `CREATE`, `UPDATE`, `DELETE`, `APPROVE`, `WAIVE`, `WRITE`, `WRITEOFF`, `REJECT`, `WITHDRAW`, `DISBURSE`, `REPAYMENT`, `RECOVERYPAYMENT`, … (the predefined maker–checker-eligible set), calls `permission.enableMakerChecker(true|false)`.
+3. For any permission **not** in that set (i.e. `READ_*` or special codes), raises `PermissionCantBeMakerCheckerableException` (HTTP 400).
+
+The actual maker–checker enforcement is in `PortfolioCommandSourceWritePlatformService.logCommandSource(...)` — when the wrapped command's resource is a maker–checker-enabled permission, the source row is logged in state `submitted` rather than executed. A separate checker user later calls `/v1/makercheckers/{id}?command=approve` (out of scope for this page) to finish the execution.
+
+## `AppUserPreviousPassword`
+
+```java
+@Entity
+@Table(name = "m_appuser_previous_password")
+public class AppUserPreviousPassword extends AbstractPersistableCustom<Long> {
+    @Column(name = "user_id",      nullable = false) private Long       userId;
+    @Column(name = "removal_date")                   private LocalDate  removalDate;
+    @Column(name = "password",     nullable = false) private String     password;
+
+    public AppUserPreviousPassword(final AppUser user) {
+        this.userId       = user.getId();
+        this.password     = user.getPassword().trim();
+        this.removalDate  = DateUtils.getLocalDateOfTenant();
+    }
+}
+```
+
+Although owned by the password-policy flow, this entity is **discovered by the role module** because `RolesApiResource` does not touch it — it is referenced here for completeness. For its role in change-password, see [password policy](/users/password-policy).
+
+## Exceptions
+
+| Exception | HTTP | Message key |
+| --- | --- | --- |
+| `RoleNotFoundException` | 404 | `error.msg.role.id.invalid` |
+| `RoleAssociatedException` | 409 | `error.msg.role.associated.with.users` |
+| `PermissionNotFoundException` | 404 | `error.msg.permission.code.invalid` |
+| `PermissionCantBeMakerCheckerableException` | 400 | `error.msg.permission.cannot.be.maker.checkerable` |
+
+## Permission codes installed by this module
+
+| Code | Purpose |
+| --- | --- |
+| `READ_ROLE`, `READ_PERMISSION` | List/retrieve |
+| `CREATE_ROLE`, `CREATE_ROLE_CHECKER` | Create + maker–checker |
+| `UPDATE_ROLE`, `UPDATE_ROLE_CHECKER` | Update |
+| `DELETE_ROLE`, `DELETE_ROLE_CHECKER` | Delete |
+| `ENABLE_ROLE`, `DISABLE_ROLE` (+`_CHECKER`) | Toggle |
+| `UPDATE_ROLE_PERMISSIONS`, `UPDATE_ROLE_PERMISSIONS_CHECKER` | Edit a role's permission set |
+| `UPDATE_PERMISSIONS`, `UPDATE_PERMISSIONS_CHECKER` | Toggle maker–checker on permissions |
+
+## See also
+
+- [Users overview](/users/overview) — module map.
+- [Users domain](/users/users-domain) — `AppUser` permission helpers (`validateHasReadPermission`, `validateHasCheckerPermissionTo`, `ALL_FUNCTIONS` short-circuit).
+- [Password policy](/users/password-policy) — `AppUserPreviousPassword` lookback and the change-password command.
+- [Commands framework](/core/commands-framework) — maker–checker semantics, `*_CHECKER` permissions and `PortfolioCommandSourceWritePlatformService`.
+- [User administration domain](/core/useradministration-domain) — package map.
+- [Security overview](/security/overview) — how `getAuthorities()` and the permission codes are consumed.
+- [Security APIs](/api/security-apis) — Swagger schemas.

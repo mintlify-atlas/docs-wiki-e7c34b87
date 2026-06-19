@@ -1,0 +1,218 @@
+---
+title: "Custom Modules: Dynamic Gradle Inclusion and ACME Samples"
+sidebarTitle: "Overview"
+description: "How custom/<company>/<category>/<module> subprojects are auto-included via settings.gradle, with the five ACME reference modules as a tour of the extension surface."
+---
+
+Apache Fineract ships a `custom/` directory whose subprojects are dynamically wired into the Gradle build at startup. The pattern is fixed at three levels — `custom/<company>/<category>/<module>` — and the reference implementations under `custom/acme/` cover the five main extension shapes the platform exposes: external events, COB business steps, Spring Batch jobs, loan transaction processors, and replacement portfolio services. This page is the map; the per-module pages drill into each one.
+
+## Why a `custom/` tree at all
+
+Apache Fineract is a multi-tenant microfinance core; downstream installers routinely need to layer in jurisdiction-specific events, COB steps, batch jobs, transaction-processing strategies, and portfolio-service overrides without forking. The `custom/` tree gives them a stable extension surface: drop a Gradle subproject in, follow the `<company>/<category>/<module>` layout, and the root build picks it up automatically.
+
+## Dynamic inclusion in `settings.gradle`
+
+The root `settings.gradle` ends with a `file().eachDir { … }` loop that scans the `custom/` directory and includes every leaf module that matches the pattern:
+
+```groovy
+// NOTE: custom Docker image with all custom modules included
+include ':custom:docker'
+
+// NOTE: dynamically load custom modules with pattern "custom -> company -> category -> module"
+file("${rootDir}/custom").eachDir { companyDir ->
+    if ('build' != companyDir.name && 'docker' != companyDir.name) {
+        file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+            if ('build' != categoryDir.name) {
+                file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                    if ('build' != moduleDir.name) {
+                        include ":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Three rules to remember:
+
+- **Exactly three levels.** A path like `custom/foo/bar.gradle` is invisible to Gradle. The leaf directory has to live three levels under `custom/`.
+- **`build/` and `docker/` are skipped at every level.** This keeps Gradle's own output directories and the bundling `:custom:docker` module out of the dynamic scan.
+- **The Gradle project path mirrors the filesystem path.** `custom/acme/loan/cob/` becomes `:custom:acme:loan:cob` in Gradle terms.
+
+See [Custom Modules build](/build/custom-modules) for the broader narrative around how the Docker image and the WAR pick these subprojects up.
+
+## The ACME reference set
+
+`custom/acme/` is the official reference set. It contains five categories:
+
+```text
+custom/acme/
+├── event/
+│   ├── externalevent/        # custom external-event provider
+│   └── starter/              # auto-configuration glue
+├── loan/
+│   ├── cob/                  # custom COB business step
+│   ├── job/                  # custom Spring Batch job
+│   ├── processor/            # custom loan transaction processor
+│   └── starter/              # auto-configuration glue for cob+job+processor
+└── note/
+    ├── service/              # replacement NoteReadPlatformService / NoteWritePlatformService
+    └── starter/              # auto-configuration glue
+```
+
+After dynamic inclusion these become the Gradle subprojects:
+
+| Project path | Subdirectory |
+| --- | --- |
+| `:custom:acme:event:externalevent` | `custom/acme/event/externalevent` |
+| `:custom:acme:event:starter` | `custom/acme/event/starter` |
+| `:custom:acme:loan:cob` | `custom/acme/loan/cob` |
+| `:custom:acme:loan:job` | `custom/acme/loan/job` |
+| `:custom:acme:loan:processor` | `custom/acme/loan/processor` |
+| `:custom:acme:loan:starter` | `custom/acme/loan/starter` |
+| `:custom:acme:note:service` | `custom/acme/note/service` |
+| `:custom:acme:note:starter` | `custom/acme/note/starter` |
+
+| Module | Extension point | Pages |
+| --- | --- | --- |
+| `event/externalevent` | `LoanBusinessEvent` subtype + `SimpleExternalEventSourceProvider` bean | [acme-event-external](/custom/acme-event-external) |
+| `loan/cob` | `LoanCOBBusinessStep` Spring `@Component` + `m_batch_business_steps` row | [acme-loan-cob](/custom/acme-loan-cob) |
+| `loan/job` | Spring Batch `Job` + `Tasklet` + `JobNameProvider` + `job` table row | [acme-loan-job](/custom/acme-loan-job) |
+| `loan/processor` | `FineractStyleLoanRepaymentScheduleTransactionProcessor` subclass | [acme-loan-processor](/custom/acme-loan-processor) |
+| `note/service` (+ `note/starter`) | replacement of `NoteReadPlatformService` / `NoteWritePlatformService` beans behind `@ConditionalOnProperty("acme.note.enabled")` | [acme-note](/custom/acme-note) |
+
+## The starter pattern
+
+Every customisation module ships in a pair: one or more **functional modules** containing the actual code (`event/externalevent`, `loan/cob`, `loan/job`, `loan/processor`, `note/service`), plus a **starter module** that owns:
+
+- The Spring `@AutoConfiguration` class that `@ComponentScan`s the functional sibling packages.
+- The `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` file that registers that auto-configuration class with Spring Boot.
+- Any feature-flag conditions (`@ConditionalOnProperty("acme.loan.enabled")`, `@ConditionalOnProperty("acme.note.enabled")`).
+- The micro-Cucumber harness verifying the wiring (`src/test/java`, `src/test/resources/features`).
+
+For example, `custom/acme/loan/starter/src/main/java/.../AcmeLoanAutoConfiguration.java`:
+
+```java
+@AutoConfiguration
+@ComponentScan(basePackages = {
+    "com.acme.fineract.loan.cob",
+    "com.acme.fineract.loan.processor",
+    "com.acme.fineract.loan.job" })
+@ConditionalOnProperty("acme.loan.enabled")
+public class AcmeLoanAutoConfiguration { … }
+```
+
+…and the matching `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`:
+
+```
+com.acme.fineract.loan.starter.AcmeLoanAutoConfiguration
+```
+
+Without the starter, the functional code would still compile but Fineract would never pick it up at runtime — Spring Boot only auto-configures classes listed in the `AutoConfiguration.imports` file.
+
+## Why the starter modules use feature flags
+
+`@ConditionalOnProperty` is the standard "off by default" switch. If an operator forgets to set `acme.loan.enabled=true`, the auto-configuration class is silently skipped and Fineract behaves exactly as it does without the customisation. This is the canonical safety net: opt-in rather than opt-out.
+
+Two of the ACME starters carry the conditional:
+
+- `AcmeLoanAutoConfiguration` is gated by `acme.loan.enabled`.
+- `AcmeNoteAutoConfiguration` is gated by `acme.note.enabled` (which also gates the individual `AcmeNoteReadPlatformService` / `AcmeNoteWritePlatformService` beans).
+
+`AcmeEventAutoConfiguration` (the external-event starter) is **not** gated — events are inert until the operator enables the corresponding row in `m_external_event_configuration`, and the Liquibase changelog inserts that row with `enabled=false` by default.
+
+## Liquibase changelogs in custom modules
+
+Three of the ACME modules ship a Liquibase changelog under `src/main/resources/db/custom-changelog/`. The relevant rules:
+
+| Module | Changelog | Inserts/Creates |
+| --- | --- | --- |
+| `event/externalevent` | `0001_acme_external_event_configuration.xml` | Row in `m_external_event_configuration` with `type=AcmeLoanExternalEvent`, `enabled=false` |
+| `loan/cob` | `0001_acme_loan_cob.xml` | Row in `m_batch_business_steps` with `job_name=LOAN_CLOSE_OF_BUSINESS`, `step_name=ACME_LOAN_NOOP`, `step_order=5` |
+| `loan/job` | `0001_acme_loan_job.xml` | Row in `job` table for `Acme Noop Job` with cron `0 1 0 1/1 * ? *` and `is_active=false`; second changeset updates `short_name=ACM_NOOP` |
+| `note/starter` | `0001_acme_note_initial.xml` | Creates a `acme_note_dummy` table with `id`, `name` (unique), `description` |
+
+Liquibase scans every JAR on the classpath for `db/custom-changelog/*.xml` at boot, so just dropping the module on the classpath is enough to wire its schema mutations.
+
+## Gradle build files
+
+Each ACME module follows the same template:
+
+```groovy
+// build.gradle
+description = 'ACME Fineract <Category> <Module>'
+group       = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-<category>-<module>'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+```groovy
+// dependencies.gradle
+dependencies {
+    implementation(project(':fineract-core'))
+    implementation(project(':fineract-<sibling>'))   // e.g. ':fineract-loan'
+    implementation(project(':fineract-provider'))
+    implementation('org.springframework.boot:spring-boot-starter')
+    // ad-hoc extras (spring-boot-starter-data-jpa, autoconfigure, etc.)
+}
+```
+
+The split between `build.gradle` (metadata + apply) and `dependencies.gradle` (the dependencies block) is the project-wide convention; consumers replicate it in any new custom module they add.
+
+## Custom-module tests do not boot the WAR
+
+Each ACME starter ships its own micro-Cucumber harness in `src/test/`. They use Spring Boot's `ApplicationContextRunner` — not Cargo, not Selenium, not GreenMail — to assert that the auto-configuration wires the beans the customer expects:
+
+```java
+contextRunner = new ApplicationContextRunner()
+    .withConfiguration(AutoConfigurations.of(AcmeLoanAutoConfiguration.class))
+    .withPropertyValues("acme.loan.enabled", "true")
+    .withUserConfiguration(TestDefaultConfiguration.class);
+```
+
+The `TestDefaultConfiguration` (or `TestOverrideConfiguration` for the note module) supplies Mockito mocks of every Spring bean the auto-configured graph would otherwise pull in (repositories, JdbcTemplate, RoutingDataSource, etc.).
+
+This is intentional: the WAR-deploying Cargo suites in `integration-tests/`, `oauth2-tests/`, and `twofactor-tests/` cover end-to-end behaviour. The custom-module tests just validate the auto-configuration wiring.
+
+## How the modules ship together
+
+`custom/docker/` builds an OCI image with the official `fineract-provider.war` plus the four ACME starters and their functional siblings, exposing `acme.*` feature flags as runtime overrides. Operators flip them on in their compose / Helm chart:
+
+```yaml
+environment:
+  - acme.loan.enabled=true
+  - acme.note.enabled=true
+```
+
+The external-event sample requires no Spring flag — operators enable it by updating the `m_external_event_configuration` row inserted by the Liquibase changelog.
+
+See [Custom Modules build](/build/custom-modules) for the Dockerfile layout.
+
+## Extension surfaces summarised
+
+| Surface | Type | Key Fineract interface | ACME module |
+| --- | --- | --- | --- |
+| External events | publish | `BusinessEvent` subtypes via `BusinessEventNotifierService` | `event/externalevent` |
+| Event source registration | publish | `ExternalEventSourceProvider` (`SimpleExternalEventSourceProvider`) | `event/externalevent` |
+| COB business step | execute | `LoanCOBBusinessStep` | `loan/cob` |
+| Spring Batch job | execute | Spring Batch `Job` + `Tasklet` | `loan/job` |
+| Loan transaction processor | execute | `LoanRepaymentScheduleTransactionProcessor` (extend `FineractStyleLoanRepaymentScheduleTransactionProcessor`) | `loan/processor` |
+| Portfolio service replacement | replace | `NoteReadPlatformService`, `NoteWritePlatformService` | `note/service` |
+
+Each row corresponds to one ACME module. Use them as the starting point when you need to ship the same shape of customisation for a different company or domain — the directory layout and the starter / functional split copy directly.
+
+## Related pages
+
+- [acme-event-external](/custom/acme-event-external)
+- [acme-loan-cob](/custom/acme-loan-cob)
+- [acme-loan-job](/custom/acme-loan-job)
+- [acme-loan-processor](/custom/acme-loan-processor)
+- [acme-note](/custom/acme-note)
+- [Gradle Multi-Module Build](/build/gradle-multi-module)
+- [Custom Modules build](/build/custom-modules)
+- [External Events Overview](/events/overview)

@@ -1,0 +1,344 @@
+---
+title: "Calendar: Recurrence Rules and CalendarInstance Bindings"
+sidebarTitle: "Calendar"
+description: "Reference for the Fineract Calendar entity, RRULE construction, CalendarInstance, CalendarType, CalendarEntityType and the CalendarsApiResource."
+---
+
+# Calendar
+
+`Calendar` is the recurrence-rule (RRULE) container in Apache Fineract.
+A calendar describes "when does something repeat?", `CalendarInstance`
+attaches a calendar to a concrete entity (a group, centre, client, loan
+or savings account), and `Meeting` is one materialised occurrence. The
+same RRULE drives both the meeting calendar and the loan repayment
+schedule for JLG (Joint Liability Group) products.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `Calendar`, `CalendarInstance`, `CalendarHistory` | `fineract-core` | `org.apache.fineract.portfolio.calendar.domain` |
+| `CalendarType`, `CalendarFrequencyType`, `CalendarWeekDaysType`, `CalendarEntityType`, `CalendarRemindBy` | `fineract-core` | `org.apache.fineract.portfolio.calendar.domain` |
+| `CalendarUtils` (RRULE parsing) | `fineract-core` | `org.apache.fineract.portfolio.calendar.service` |
+| `CalendarConstants.CalendarSupportedParameters` | `fineract-core` | `org.apache.fineract.portfolio.calendar` |
+| `CalendarsApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.calendar.api` |
+| `CalendarReadPlatformService(Impl)`, `CalendarWritePlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.calendar.service` |
+| `CalendarRepositoryWrapper`, `CalendarInstanceRepositoryWrapper`, `CalendarHistoryRepository` | `fineract-provider` | `org.apache.fineract.portfolio.calendar.domain` |
+| Exceptions: `CalendarDateException`, `CalendarParameterUpdateNotSupportedException` | `fineract-core` | `org.apache.fineract.portfolio.calendar.exception` |
+
+See [Meetings](/portfolio/meetings) for the per-occurrence side and
+[Groups and Centers](/portfolio/groups-and-centers) for the owners of a
+collection calendar.
+
+## Calendar entity
+
+```java
+@Entity
+@Table(name = "m_calendar")
+public class Calendar extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+    @Column(name = "title", length = 50, nullable = false)        private String title;
+    @Column(name = "description", length = 100)                   private String description;
+    @Column(name = "location", length = 100)                      private String location;
+    @Column(name = "start_date", nullable = false)                private LocalDate startDate;
+    @Column(name = "end_date")                                    private LocalDate endDate;
+    @Column(name = "duration")                                    private Integer duration;
+    @Column(name = "calendar_type_enum", nullable = false)        private Integer typeId;
+    @Column(name = "repeating", nullable = false)                 private boolean repeating;
+    @Column(name = "recurrence", length = 100)                    private String recurrence;
+    @Column(name = "remind_by_enum")                              private Integer remindById;
+    @Column(name = "first_reminder")                              private Integer firstReminder;
+    @Column(name = "second_reminder")                             private Integer secondReminder;
+    @Column(name = "meeting_time")                                private LocalTime meetingtime;
+
+    @OneToMany(mappedBy = "calendar", fetch = FetchType.EAGER,
+               cascade = CascadeType.ALL, orphanRemoval = true)
+    private Set<CalendarHistory> calendarHistory = new HashSet<>();
+}
+```
+
+### Field map
+
+| Column | Purpose |
+| --- | --- |
+| `title` | Human-readable name, required |
+| `description`, `location` | Optional metadata |
+| `start_date` | First occurrence date; required |
+| `end_date` | Last allowed occurrence; nullable for open-ended |
+| `duration` | Minutes per session; informational |
+| `calendar_type_enum` | `CalendarType` (collection / training / audit / general) |
+| `repeating` | `true` for recurring calendars (must be true for `COLLECTION`) |
+| `recurrence` | The RRULE string (see below) |
+| `remind_by_enum` | `CalendarRemindBy` |
+| `first_reminder`, `second_reminder` | Hours/days before — semantics depend on `remindById` |
+| `meeting_time` | Time-of-day of each session |
+| `calendarHistory` | Audit trail of past RRULE changes |
+
+### Validation invariant
+
+```java
+if (calendarType.isCollection() && !repeating) {
+    baseDataValidator.reset().parameter("repeating")
+        .failWithCodeNoParameterAddedToErrorCode("must.repeat.for.collection.calendar");
+}
+```
+
+A `COLLECTION` calendar must always carry `repeating = true`.
+
+## CalendarType
+
+```java
+public enum CalendarType {
+    COLLECTION(1, "calendarType.collection"),
+    TRAINING(2,   "calendarType.training"),
+    AUDIT(3,      "calendarType.audit"),
+    GENERAL(4,    "calendarType.general");
+}
+```
+
+Only `COLLECTION` calendars are used to drive loan repayment schedules.
+The other types are informational events for group/client management.
+
+## CalendarFrequencyType
+
+```java
+public enum CalendarFrequencyType {
+    INVALID(0, ...), DAILY(1, ...), WEEKLY(2, ...), MONTHLY(3, ...), YEARLY(4, ...);
+
+    public static CalendarFrequencyType from(PeriodFrequencyType p);
+    public static PeriodFrequencyType  from(CalendarFrequencyType c);
+}
+```
+
+Round-trips with `PeriodFrequencyType` (used by the loan module) so the
+same value space governs repayment schedules and meeting recurrence.
+
+## CalendarWeekDaysType
+
+```java
+MO(1), TU(2), WE(3), TH(4), FR(5), SA(6), SU(7);
+```
+
+`fromString` is case-insensitive. The two-letter token matches the
+iCalendar BYDAY RRULE component (`MO`, `TU`, …).
+
+## CalendarRemindBy
+
+```java
+SMS(1), EMAIL(2), SYSTEMALERT(3);
+```
+
+Used by the notification subsystem if reminders are enabled.
+
+## RRULE construction
+
+The `Calendar.constructRecurrence` helper emits an iCalendar-shaped
+RRULE substring (only the right-hand side, without the leading `RRULE:`
+line):
+
+```text
+FREQ=DAILY
+FREQ=WEEKLY;INTERVAL=2;BYDAY=MO
+FREQ=MONTHLY;BYMONTHDAY=15
+FREQ=MONTHLY;BYSETPOS=2;BYDAY=TU      # "the 2nd Tuesday of the month"
+```
+
+Source excerpt:
+
+```java
+recurrenceBuilder.append("FREQ=").append(frequencyType.toString().toUpperCase());
+if (interval > 1) recurrenceBuilder.append(";INTERVAL=").append(interval);
+if (frequencyType.isWeekly() && repeatsOnDay != null) {
+    CalendarWeekDaysType weekDays = CalendarWeekDaysType.fromInt(repeatsOnDay);
+    if (!weekDays.isInvalid()) {
+        recurrenceBuilder.append(";BYDAY=").append(weekDays.toString().toUpperCase());
+    }
+}
+if (frequencyType.isMonthly()) {
+    if (repeatsOnNthDayOfMonth != null
+            && (repeatsOnDay == null || repeatsOnDay.equals(INVALID.getValue()))) {
+        // simple day-of-month
+        recurrenceBuilder.append(";BYMONTHDAY=").append(repeatsOnNthDayOfMonth);
+    } else if (repeatsOnNthDayOfMonth != null && repeatsOnDay != null) {
+        // "nth weekday of the month"
+        NthDayType nthDay = NthDayType.fromInt(repeatsOnNthDayOfMonth);
+        recurrenceBuilder.append(";BYSETPOS=").append(nthDay.getValue());
+        recurrenceBuilder.append(";BYDAY=").append(weekday.toString().toUpperCase());
+    }
+}
+```
+
+`CalendarUtils.isValidRecurringDate(recurrence, startDate, candidate)`
+checks whether a candidate `LocalDate` is one of the RRULE's
+occurrences. `Calendar.isValidRecurringDate` additionally consults
+`calendarHistory` so dates that fell on the old RRULE before a change
+remain valid.
+
+### Supported parameters
+
+`CalendarSupportedParameters` exposes the parameter names that the
+`fromJson` deserialiser recognises. The notable ones for a write
+request:
+
+| Param | Type | Purpose |
+| --- | --- | --- |
+| `title` | string | Required |
+| `startDate` | local-date | Required |
+| `endDate` | local-date | Optional |
+| `typeId` | integer | `CalendarType` |
+| `repeating` | boolean | True for recurring |
+| `frequency` | integer | `CalendarFrequencyType` |
+| `interval` | integer | Every N occurrences |
+| `repeatsOnDay` | integer | `CalendarWeekDaysType` (weekly) |
+| `repeatsOnNthDayOfMonth` | integer | `NthDayType` (monthly) |
+| `duration` | integer | Minutes |
+| `remindBy` | integer | `CalendarRemindBy` |
+| `firstReminder`, `secondReminder` | integer | Reminder offsets |
+| `meetingTime` | local-time | Time of day |
+
+## CalendarInstance
+
+```java
+@Entity
+@Table(name = "m_calendar_instance")
+public class CalendarInstance extends AbstractPersistableCustom<Long> {
+    @ManyToOne(cascade = CascadeType.PERSIST)
+    @JoinColumn(name = "calendar_id", nullable = false)
+    private Calendar calendar;
+
+    @Column(name = "entity_id",        nullable = false) private Long entityId;
+    @Column(name = "entity_type_enum", nullable = false) private Integer entityTypeId;
+
+    public static CalendarInstance from(Calendar calendar, Long entityId, Integer entityTypeId) {
+        return new CalendarInstance(calendar, entityId, entityTypeId);
+    }
+}
+```
+
+`entity_type_enum` is `CalendarEntityType`:
+
+| Code | Entity |
+| --- | --- |
+| 1 | `CLIENTS` |
+| 2 | `GROUPS` |
+| 3 | `LOANS` |
+| 4 | `CENTERS` |
+| 5 | `SAVINGS` |
+| 6 | `LOAN_RECALCULATION_REST_DETAIL` |
+| 7 | `LOAN_RECALCULATION_COMPOUNDING_DETAIL` |
+
+A single `Calendar` can have multiple `CalendarInstance` rows attached
+to it — useful when a group meeting calendar is shared with the group's
+JLG loans.
+
+### CalendarHistory
+
+When a calendar's recurrence or start date changes, the old
+configuration is persisted in `m_calendar_history` so that already-paid
+loan schedule rows tied to that history remain valid. The entity is
+managed transparently via the `calendarHistory` cascade on `Calendar`.
+
+## CalendarsApiResource
+
+Mounted at `/v1/{entityType}/{entityId}/calendars`. `entityType` is the
+URL fragment from `CalendarEntityType` (e.g. `groups`, `centers`,
+`clients`, `loans`).
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/{entityType}/{entityId}/calendars/template` | Template — frequency / weekday option lists | `READ_CALENDAR` |
+| `GET` | `/v1/{entityType}/{entityId}/calendars` | List calendars bound to the entity | `READ_CALENDAR` |
+| `GET` | `/v1/{entityType}/{entityId}/calendars/{calendarId}` | Single calendar | `READ_CALENDAR` |
+| `POST` | `/v1/{entityType}/{entityId}/calendars` | Create | `CREATE_CALENDAR` |
+| `PUT` | `/v1/{entityType}/{entityId}/calendars/{calendarId}` | Update (with history) | `UPDATE_CALENDAR` |
+| `DELETE` | `/v1/{entityType}/{entityId}/calendars/{calendarId}` | Delete | `DELETE_CALENDAR` |
+
+### Create
+
+```http
+POST /v1/groups/{groupId}/calendars
+```
+
+```json
+{
+  "title": "Weekly collection",
+  "startDate": "27 January 2025",
+  "typeId": 1,
+  "repeating": true,
+  "frequency": 2,
+  "interval": 1,
+  "repeatsOnDay": 1,
+  "duration": 60,
+  "meetingTime": "10:00",
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+`frequency = 2` (`WEEKLY`) + `repeatsOnDay = 1` (`MO`) constructs
+`FREQ=WEEKLY;BYDAY=MO`.
+
+### Update
+
+`PUT` accepts the same shape. Changing the recurrence or start date
+triggers `Calendar.updateStartDateAndDerivedFeilds` which:
+
+- Rejects dates before today (`CalendarDateException`,
+  `new.start.date.cannot.be.in.past`).
+- Rejects dates before the existing start date if today already passed it
+  (`new.start.date.before.existing.date`).
+- Copies the previous RRULE into a new `CalendarHistory` row.
+
+## Use in repayment schedules
+
+For JLG loans, the loan repayment schedule lines up with a group/centre
+collection calendar. The flow:
+
+1. The loan creation request includes `calendarId`.
+2. The loan write-service stamps a `CalendarInstance` with
+   `entity_type_enum = LOANS` (3) referencing the same `calendar_id`.
+3. The repayment schedule generator
+   (`DefaultScheduledDateGenerator`, see `loanaccount.loanschedule`)
+   calls `CalendarUtils.isValidRecurringDate` to align disbursement and
+   instalment dates to the RRULE.
+
+This is why the [Standing Instructions](/portfolio/standing-instructions)
+job calls the same `ScheduledDateGenerator` — recurring transfers share
+the calendar machinery.
+
+## Use in meetings
+
+[Meetings](/portfolio/meetings) hang off `CalendarInstance` and the
+`(calendarInstanceId, meetingDate)` unique constraint ensures one
+meeting per occurrence date.
+
+## Reading recurrences
+
+`CalendarUtils` (in `fineract-core`) is the single source of truth for
+recurrence math. Common helpers:
+
+- `isValidRecurringDate(recurrence, startDate, candidateDate)` —
+  membership check.
+- `getNextRecurringDate(recurrence, startDate, fromDate)` — next
+  occurrence on or after `fromDate`.
+- `getRecurringDates(recurrence, startDate, periodStart, periodEnd)` —
+  materialise all occurrences in a window.
+
+These wrap the `iCal4j` recurrence engine internally.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `CalendarNotFoundException` | Bad `calendarId` |
+| `CalendarDateException` | Start-date validation (past / before history) |
+| `CalendarParameterUpdateNotSupportedException` | An attempt to mutate a parameter that the platform cannot safely change after creation |
+| `CalendarInstanceNotFoundException` | The `(entityId, entityTypeId)` pair has no calendar |
+
+## Cross-references
+
+- [Meetings](/portfolio/meetings) — per-occurrence rows
+- [Groups and Centers](/portfolio/groups-and-centers) — typical owners
+- [Standing Instructions](/portfolio/standing-instructions) — reuse of
+  `ScheduledDateGenerator`
+- [Loan overview](/loan/overview) — JLG schedule alignment
+- [Portfolio shared domain](/core/portfolio-shared-domain) —
+  `PeriodFrequencyType`, `NthDayType`
+- [Portfolio APIs index](/api/portfolio-apis)

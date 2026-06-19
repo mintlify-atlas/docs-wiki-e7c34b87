@@ -1,0 +1,305 @@
+---
+title: "Generic Products and Product Mix APIs Reference"
+sidebarTitle: "Products Generic"
+description: "Reference for the generic ProductsApiResource, ProductMixApiResource, ProductCommandsService and the cross-product wiring that backs share, mix and product setup."
+---
+
+Apache Fineract has product-specific REST resources (`/v1/loanproducts`, `/v1/savingsproducts`, `/v1/shareproducts/...` variants) but it also exposes two **generic, type-discriminated** endpoints in `org.apache.fineract.portfolio.products` and `org.apache.fineract.portfolio.loanproduct.productmix` for cases where the type of product is itself a path parameter or the resource is cross-product (e.g. defining which loan products may co-exist on a client).
+
+The two endpoints documented here are:
+
+- **`ProductsApiResource`** — `/v1/products/{type}` — a type-discriminated facade currently used for share products via the `ShareProductReadPlatformService` lookup by Spring bean name. The path is designed so that future product types can plug in without a new JAX-RS resource.
+- **`ProductMixApiResource`** — `/v1/loanproducts/{productId}/productmix` — the only "cross-product" admin endpoint, used to declare which loan products may be open simultaneously on a given client.
+
+Both live in `fineract-provider`. The generic facade lets the UI build template-aware screens by feeding it the product type as a string.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ProductsApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.products.api` |
+| `ProductData` (base DTO), `ProductsApiConstants` | `fineract-provider` | `org.apache.fineract.portfolio.products.data` / `.constants` |
+| `ProductCommandsService` (per-type commands strategy) | `fineract-provider` | `org.apache.fineract.portfolio.products.service` |
+| `ShareProductReadPlatformService` (base interface) | `fineract-provider` | `org.apache.fineract.portfolio.products.service` |
+| `ProductNotFoundException` | `fineract-provider` | `org.apache.fineract.portfolio.products.exception` |
+| `ProductMixApiResource`, `ProductMixData`, `ProductMixRequest` | `fineract-provider` | `org.apache.fineract.portfolio.loanproduct.productmix.{api,data}` |
+| `ProductMixReadPlatformService` impl | `fineract-provider` | `org.apache.fineract.portfolio.loanproduct.productmix.service` |
+
+The generic product layer sits *above* the per-product modules; it dispatches into `shareproducts`, and is structured so new product types can register a Spring bean and respond to the same URL family.
+
+## `/v1/products/{type}` — generic facade
+
+`ProductsApiResource` is a JAX-RS component that dispatches each call based on the `{type}` path parameter to the matching Spring bean. The dispatch is plain `ApplicationContext.getBean(name)` where `name = type + "ReadPlatformService"`, and the bean must implement `ShareProductReadPlatformService` (the canonical "read base" used by every product family that joins this facade).
+
+```java
+// fineract-provider/.../portfolio/products/api/ProductsApiResource.java
+@Path("/v1/products/{type}")
+@Component
+@Tag(name = "Products", description = "")
+@RequiredArgsConstructor
+public class ProductsApiResource {
+
+    private final ApplicationContext applicationContext;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final DefaultToApiJsonSerializer<ProductData> toApiJsonSerializer;
+    private final PlatformSecurityContext platformSecurityContext;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+```
+
+### Template
+
+```java
+@GET
+@Path("template")
+public String retrieveTemplate(@PathParam("type") final String productType, @Context final UriInfo uriInfo) {
+    String serviceName = productType + ProductsApiConstants.READPLATFORM_NAME;
+    try {
+        ShareProductReadPlatformService service = (ShareProductReadPlatformService) this.applicationContext.getBean(serviceName);
+        ProductData data = service.retrieveTemplate();
+        final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+        return this.toApiJsonSerializer.serialize(settings, data, service.getResponseDataParams());
+    } catch (BeansException e) {
+        throw new ResourceNotFoundException(e);
+    }
+}
+```
+
+If `{type}` does not correspond to a registered Spring bean (e.g. `/v1/products/foo/template`), Spring throws `BeansException` and Fineract maps it to a 404 via the standard `ResourceNotFoundException` mapper.
+
+### List / detail
+
+```java
+@GET
+@Path("{productId}")
+@Operation(summary = "Retrieve a Share Product",
+           description = "Retrieves a Share Product\n\nExample Requests:\n\nproducts/share/1\n\nproducts/share/1?template=true")
+public String retrieveProduct(@PathParam("productId") final Long productId,
+                              @PathParam("type") final String productType,
+                              @Context final UriInfo uriInfo) {
+    String serviceName = productType + ProductsApiConstants.READPLATFORM_NAME;
+    ShareProductReadPlatformService service = (ShareProductReadPlatformService) this.applicationContext.getBean(serviceName);
+    final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    ProductData data = service.retrieveOne(productId, settings.isTemplate());
+    return this.toApiJsonSerializer.serialize(settings, data, service.getResponseDataParams());
+}
+```
+
+`retrieveAllProducts(productType, offset, limit, uriInfo)` calls `service.retrieveAllProducts(offset, limit)` and returns a `Page<ProductData>`.
+
+### Write
+
+`POST /v1/products/{type}` and `POST /v1/products/{type}/{productId}` both go through the standard `CommandWrapper` pipeline:
+
+```java
+@POST
+public String createProduct(@PathParam("type") final String productType,
+                            final String apiRequestBodyAsJson) {
+    this.platformSecurityContext.authenticatedUser();
+    CommandWrapper commandWrapper = new CommandWrapperBuilder().createProduct(productType)
+            .withJson(apiRequestBodyAsJson).build();
+    return this.toApiJsonSerializer.serialize(
+            this.commandsSourceWritePlatformService.logCommandSource(commandWrapper));
+}
+
+@POST
+@Path("{productId}")
+public String handleCommands(@PathParam("type") final String productType,
+                             @PathParam("productId") final Long productId,
+                             @QueryParam("command") final String commandParam,
+                             final String apiRequestBodyAsJson) {
+    CommandWrapper commandWrapper = new CommandWrapperBuilder()
+            .createProductCommand(productType, commandParam, productId)
+            .withJson(apiRequestBodyAsJson).build();
+    return this.toApiJsonSerializer.serialize(
+            this.commandsSourceWritePlatformService.logCommandSource(commandWrapper));
+}
+```
+
+The third leg is `PUT /v1/products/{type}/{productId}` — same pattern, building `updateProduct(productType, productId)`.
+
+### Command dispatch — `ProductCommandsService`
+
+The non-CRUD `?command=…` actions hit a per-type strategy. The interface is intentionally small:
+
+```java
+// fineract-provider/.../portfolio/products/service/ProductCommandsService.java
+public interface ProductCommandsService {
+    Object handleCommand(Long productId, String command, String jsonBody);
+}
+```
+
+Each product family registers an implementation. The share family ships `ShareProductCommandsServiceImpl` in `shareproducts/service/` — the same Spring-bean-lookup approach used by the read facade. Adding a new product type to the facade means:
+
+1. Implement `ShareProductReadPlatformService` for reads and `ProductCommandsService` for non-CRUD writes.
+2. Name the bean `{type}ReadPlatformService` and `{type}CommandsService` so the facade can resolve it from the URL.
+3. Wire CRUD into the command pipeline through the existing `createProduct`, `updateProduct`, and `createProductCommand` builder methods.
+
+### `ProductsApiConstants`
+
+```java
+// fineract-provider/.../portfolio/products/constants/ProductsApiConstants.java
+public final class ProductsApiConstants {
+    public static final String READPLATFORM_NAME = "ReadPlatformService";
+    // ... per-field parameter names used by validators
+}
+```
+
+The `READPLATFORM_NAME` suffix is what binds URL segments like `share` to the Spring bean `shareReadPlatformService`.
+
+## `/v1/loanproducts/{productId}/productmix` — product mix
+
+The product-mix endpoint declares "if product **A** is open on a client, products **B**, **C** may also be open simultaneously". It is independent of the generic facade and is dedicated to loan products.
+
+```java
+// fineract-provider/.../portfolio/loanproduct/productmix/api/ProductMixApiResource.java
+@Path("/v1/loanproducts/{productId}/productmix")
+@Component
+@Tag(name = "Product Mix")
+@RequiredArgsConstructor
+public class ProductMixApiResource {
+
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "PRODUCTMIX";
+
+    private static final Set<String> PRODUCT_MIX_DATA_PARAMETERS = new HashSet<>(
+            Arrays.asList("productId", "productName", "restrictedProducts", "allowedProducts", "productOptions"));
+
+    private final PlatformSecurityContext context;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final DefaultToApiJsonSerializer<ProductMixData> toApiJsonSerializer;
+    private final ProductMixReadPlatformService productMixReadPlatformService;
+    private final LoanProductReadPlatformService loanProductReadPlatformService;
+```
+
+### GET — current mix + template options
+
+```java
+@GET
+public String retrieveTemplate(@PathParam("productId") final Long productId, @Context final UriInfo uriInfo) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    ProductMixData productMixData = this.productMixReadPlatformService.retrieveLoanProductMixDetails(productId);
+    final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    if (settings.isTemplate()) {
+        final Collection<LoanProductData> productOptions = this.loanProductReadPlatformService.retrieveAvailableLoanProductsForMix();
+        productMixData = ProductMixData.withTemplateOptions(productMixData, productOptions);
+    }
+    return this.toApiJsonSerializer.serialize(settings, productMixData, PRODUCT_MIX_DATA_PARAMETERS);
+}
+```
+
+The five JSON keys this resource emits are exactly the `PRODUCT_MIX_DATA_PARAMETERS` set:
+
+- `productId`, `productName` — the parent loan product.
+- `restrictedProducts` — products that **cannot** be co-opened with the parent.
+- `allowedProducts` — products explicitly allowed (those not on the restricted list).
+- `productOptions` — only present when `?template=true`, listing all loan products eligible to be added to a mix.
+
+### Mutations
+
+```java
+@POST  public CommandProcessingResult createProductMix(...);
+@PUT   public CommandProcessingResult updateProductMix(...);
+@DELETE public CommandProcessingResult deleteProductMix(...);
+```
+
+Each builds a `CommandWrapper` through `createProductMix(productId)` / `updateProductMix(productId)` / `deleteProductMix(productId)` and writes via `PortfolioCommandSourceWritePlatformService.logCommandSource`. The serialized payload is a `ProductMixRequest` (Lombok value), so the request body is `{ "restrictedProducts": [2, 3, 5] }` style.
+
+### Read service
+
+`ProductMixReadPlatformService.retrieveLoanProductMixDetails(productId)` joins `m_product_loan` to `m_product_mix` to produce the `ProductMixData` value. The implementation is a single JDBC `query` invocation; if no rows exist for the product, the result simply has empty `restrictedProducts` / `allowedProducts` sets, which is the "no constraint" semantic.
+
+## Where this fits in the loan disbursement gate
+
+When a loan is approved or disbursed, the loan validators check the client's other active loans against the parent loan product's mix. If any active loan's product is on the **restricted** list of the parent product, the disbursement fails with a `LoanDisbursalException` / `MultiDisbursalException`. See [/loan/loan-disbursement-api](/loan/loan-disbursement-api) for the gate and [/loan/loan-product-api](/loan/loan-product-api) for the parent product surface.
+
+## Permissions and tagging
+
+| Resource | OpenAPI tag | Resource name (permission) |
+| --- | --- | --- |
+| `ProductsApiResource` | `Products` | per-product (derived from `{type}`) |
+| `ProductMixApiResource` | `Product Mix` | `PRODUCTMIX` |
+
+`PRODUCTMIX` permission names (`READ_PRODUCTMIX`, `CREATE_PRODUCTMIX`, `UPDATE_PRODUCTMIX`, `DELETE_PRODUCTMIX`) follow the same maker-checker pattern as every other Fineract resource.
+
+## Cross-product setup notes
+
+If you are building a CLI/admin script that bootstraps an installation, the order is:
+
+1. **Loan products** (`POST /v1/loanproducts`) — see [/loan/loan-product-api](/loan/loan-product-api).
+2. **Savings products** (`POST /v1/savingsproducts`) — see [/savings/overview](/savings/overview).
+3. **Share products** via the generic facade (`POST /v1/products/share`) — see [/portfolio/share-products](/portfolio/share-products).
+4. **Product mixes** between loan products (`POST /v1/loanproducts/{id}/productmix`) — this page.
+5. **Charges** (`POST /v1/charges`) and link them to products through product-update calls.
+
+Only after all four are present can you create accounts of those products on clients.
+
+## Failure modes
+
+- **`ProductNotFoundException`** — thrown by the generic facade when a `{productId}` cannot be resolved by the per-type read service. Mapped to HTTP 404.
+- **`BeansException` → `ResourceNotFoundException` (404)** — thrown when `{type}` is unknown to Spring.
+- **Validation errors** — every command is parsed by the per-type `DataValidator`; `PlatformApiDataValidationException` turns into HTTP 400 with the conventional `errors` array.
+- **Maker-checker rejection** — if the `commands` row needs approval, `logCommandSource` returns a `pending` result and the change is held until approved. See [/command/overview](/command/overview).
+
+## Extensibility checklist
+
+When introducing a brand-new product type that should join the `/v1/products/{type}` facade:
+
+1. Create a domain entity and JPA repository in the product's own package.
+2. Implement `ShareProductReadPlatformService` (a misleading name historically, but it is the contract used by the facade) and register the bean as `{type}ReadPlatformService`.
+3. Implement `ProductCommandsService` and register as `{type}CommandsService`.
+4. Register `CreateXxxProduct`, `UpdateXxxProduct` and `XxxProductCommand` command handlers so that `CommandWrapperBuilder.createProduct(productType)` resolves.
+5. Add Swagger schemas in `ProductsApiResourceSwagger` so the OpenAPI surface lists the new type.
+6. Add `{type}` permissions and update the security tables.
+
+## Templates and response data parameters
+
+The generic facade defers field-list management to each per-type `ShareProductReadPlatformService` implementation: the interface exposes `Set<String> getResponseDataParams()` which is passed to `DefaultToApiJsonSerializer.serialize(settings, data, params)` to honour the `?fields=` query parameter. Concretely:
+
+- The share-product impl returns the set of share-product JSON keys (`name`, `shortName`, `currency`, `totalShares`, `unitPrice`, `marketPrice`, `lockinPeriod`, ...).
+- Any future per-type impl should return its own set so the facade can serialize correctly regardless of the type.
+
+When implementing a new type, do not return an empty set — the serializer would then emit every public getter on the data class, polluting the response with internal fields.
+
+## Walkthrough: bootstrapping a share product
+
+```bash
+# 1. List the existing products (empty)
+curl -u admin:password \
+  'http://host/fineract-provider/api/v1/products/share?limit=50'
+
+# 2. Fetch the template
+curl -u admin:password \
+  'http://host/fineract-provider/api/v1/products/share/template'
+
+# 3. POST the new product
+curl -u admin:password -X POST -H 'Content-Type: application/json' \
+  'http://host/fineract-provider/api/v1/products/share' \
+  -d '{
+    "name": "Member Equity",
+    "shortName": "ME",
+    "description": "Standard membership shares",
+    "currencyCode": "USD",
+    "digitsAfterDecimal": 2,
+    "inMultiplesOf": 1,
+    "locale": "en",
+    "totalShares": 100000,
+    "unitPrice": 10.00,
+    "nominalShares": 1,
+    "allowDividendCalculationForInactiveClients": false,
+    "accountingRule": 1
+  }'
+
+# 4. Verify
+curl -u admin:password \
+  'http://host/fineract-provider/api/v1/products/share/1?template=true'
+```
+
+## Cross-references
+
+- [/loan/loan-product-api](/loan/loan-product-api) — the dedicated loan-product REST surface.
+- [/savings/overview](/savings/overview) — savings products.
+- [/portfolio/share-products](/portfolio/share-products) — share-product domain and CRUD.
+- [/portfolio/share-accounts](/portfolio/share-accounts) — share-account lifecycle that consumes share products.
+- [/api/portfolio-apis](/api/portfolio-apis) — end-user product API tour.
+- [/command/overview](/command/overview) — command pipeline, maker-checker, audit trail.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — shared abstractions all product entities inherit.

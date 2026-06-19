@@ -1,0 +1,303 @@
+---
+title: "Working Days — Weekly Recurrence and Instalment Rescheduling"
+sidebarTitle: "Working Days"
+description: "Apache Fineract WorkingDays entity, RFC 5545 RRULE recurrence, RepaymentRescheduleType options for moving instalments off weekends, WorkingDaysApiResource endpoints and runtime hooks."
+---
+
+In Apache Fineract there is exactly **one row** in `m_working_days` per tenant: it encodes the institution's standard work-week as an iCalendar (RFC 5545) recurrence and decides what to do with a loan repayment that lands on a non-working day. Together with [holidays](/organisation/holidays), it forms the second leg of the date-adjustment pipeline that drives every loan schedule generator and every COB rescheduling job.
+
+<Note>
+Working-day rules fire only when the global configuration toggle `reschedule-future-repayments` is enabled. A second toggle, `allow-transactions-on-non-workingday`, controls whether incoming repayment **transactions** may be posted on a non-working day at all. Both are flipped through [global configurations](/core/configuration-properties).
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `WorkingDays` | `fineract-core` |
+| Enum | `RepaymentRescheduleType` | `fineract-core` |
+| Helpers | `WorkingDaysUtil`, `WorkingDaysEnumerations`, `WorkingDaysApiConstants`, `AdjustedDateDetailsDTO` | `fineract-core` |
+| Repositories | `WorkingDaysRepository`, `WorkingDaysRepositoryWrapper` | `fineract-provider` |
+| Read service | `WorkingDaysReadPlatformService` / `WorkingDaysReadPlatformServiceImpl` | provider |
+| Write service | `WorkingDaysWritePlatformService` / `…JpaRepositoryImpl` | provider |
+| Validator | `WorkingDayValidator`, `WorkingDaysUpdateRequestValidator` | provider |
+| Command | `WorkingDaysUpdateCommand` | provider |
+| Command handler | `UpdateWorkingDaysCommandHandler` | provider |
+| JAX-RS | `WorkingDaysApiResource` (`/v1/workingdays`) | provider |
+| Exception | `WorkingDaysNotFoundException` | provider |
+
+## `WorkingDays` entity
+
+```java
+// fineract-core/.../workingdays/domain/WorkingDays.java
+@Builder @Getter @Setter
+@Entity
+@NoArgsConstructor @AllArgsConstructor
+@FieldNameConstants
+@Table(name = "m_working_days")
+public class WorkingDays extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "recurrence", length = 100)
+    private String recurrence;
+
+    @Column(name = "repayment_rescheduling_enum", nullable = false)
+    private Integer repaymentReschedulingType;
+
+    @Column(name = "extend_term_daily_repayments", nullable = false)
+    private Boolean extendTermForDailyRepayments;
+
+    @Column(name = "extend_term_holiday_repayment", nullable = false)
+    private Boolean extendTermForRepaymentsOnHolidays;
+}
+```
+
+### Column inventory
+
+| Column | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| `recurrence` | `recurrence` | RFC 5545 RRULE string (100 chars) | e.g. `FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR` |
+| `repayment_rescheduling_enum` | `repaymentReschedulingType` | int | One of the values in `RepaymentRescheduleType` below |
+| `extend_term_daily_repayments` | `extendTermForDailyRepayments` | bool | For daily-frequency loans, extend the term to accommodate skipped non-working days |
+| `extend_term_holiday_repayment` | `extendTermForRepaymentsOnHolidays` | bool | For any frequency, extend the term when a repayment is moved due to a holiday |
+
+The default seed inserts a single row id `1` with:
+
+```text
+recurrence                          = FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR,SA,SU
+repayment_rescheduling_enum         = 2  (MOVE_TO_NEXT_WORKING_DAY)
+extend_term_daily_repayments        = false
+extend_term_holiday_repayment       = false
+```
+
+i.e. **all seven days** are working days by default — institutions are expected to edit the row to reflect their actual work-week.
+
+### `RepaymentRescheduleType`
+
+```java
+@Getter
+public enum RepaymentRescheduleType {
+    INVALID(0,                              "RepaymentRescheduleType.invalid"),
+    SAME_DAY(1,                             "RepaymentRescheduleType.same.day"),
+    MOVE_TO_NEXT_WORKING_DAY(2,             "RepaymentRescheduleType.move.to.next.working.day"),
+    MOVE_TO_NEXT_REPAYMENT_MEETING_DAY(3,   "RepaymentRescheduleType.move.to.next.repayment.meeting.day"),
+    MOVE_TO_PREVIOUS_WORKING_DAY(4,         "RepaymentRescheduleType.move.to.previous.working.day"),
+    MOVE_TO_NEXT_MEETING_DAY(5,             "RepaymentRescheduleType.move.to.next.meeting.day");
+}
+```
+
+| Value | Enum | Behaviour |
+| --- | --- | --- |
+| 1 | `SAME_DAY` | Keep the original date even if it is a non-working day (the schedule shows it; whether the posting is rejected depends on `allow-transactions-on-non-workingday`). |
+| 2 | `MOVE_TO_NEXT_WORKING_DAY` | Iterate `+1 day` until a working day is reached. |
+| 3 | `MOVE_TO_NEXT_REPAYMENT_MEETING_DAY` | Snap to the next *meeting* date defined on the loan's `Calendar` (for group / centre loans). |
+| 4 | `MOVE_TO_PREVIOUS_WORKING_DAY` | Iterate `-1 day` until a working day is reached. |
+| 5 | `MOVE_TO_NEXT_MEETING_DAY` | Snap to the next meeting date in the loan's `Calendar`, irrespective of working-day status. |
+
+## How loan repayments respect working days
+
+The runtime hook is `WorkingDaysUtil.getOffSetDateIfNonWorkingDay(...)`:
+
+```java
+// fineract-core/.../workingdays/service/WorkingDaysUtil.java
+public static LocalDate getOffSetDateIfNonWorkingDay(final LocalDate date,
+        final LocalDate nextMeetingDate, final WorkingDays workingDays) {
+
+    // If date is a working day then return date.
+    if (isWorkingDay(workingDays, date)) {
+        return date;
+    }
+
+    final RepaymentRescheduleType rescheduleType =
+        RepaymentRescheduleType.fromInt(workingDays.getRepaymentReschedulingType());
+
+    switch (rescheduleType) {
+        case INVALID:
+        case SAME_DAY:
+            return date;
+        case MOVE_TO_NEXT_WORKING_DAY:
+            return getOffSetDateIfNonWorkingDay(date.plusDays(1),  nextMeetingDate, workingDays);
+        case MOVE_TO_NEXT_REPAYMENT_MEETING_DAY:
+            return nextMeetingDate;
+        case MOVE_TO_PREVIOUS_WORKING_DAY:
+            return getOffSetDateIfNonWorkingDay(date.minusDays(1), nextMeetingDate, workingDays);
+        default:
+            return date;
+    }
+}
+```
+
+Notice the recursive descent: `MOVE_TO_NEXT_WORKING_DAY` simply advances day-by-day until `isWorkingDay(...)` returns `true`. The check itself delegates to `CalendarUtils.isValidRecurringDate(...)` which interprets the RRULE:
+
+```java
+public static boolean isWorkingDay(final WorkingDays workingDays, final LocalDate date) {
+    return CalendarUtils.isValidRecurringDate(workingDays.getRecurrence(), date, date);
+}
+```
+
+### Composing with holidays
+
+The full date-adjustment chain inside `LoanScheduleAssembler` / `LoanScheduleGeneratorFactory` is:
+
+```
+original date
+  │
+  ▼
+HolidayUtil.getRepaymentRescheduleDateToIfHoliday(...)  // see /organisation/holidays
+  │
+  ▼
+WorkingDaysUtil.getOffSetDateIfNonWorkingDay(...)       // this page
+  │
+  ▼
+adjusted date
+```
+
+Holidays come **first** so a holiday rescheduled to a specific date still gets bumped if that date itself is a non-working day. The helper `WorkingDaysUtil.updateWorkingDayIfRepaymentDateIsNonWorkingDay(adjustedDateDetailsDTO, workingDays)` is what new code uses — it mutates an `AdjustedDateDetailsDTO` in place so the caller does not have to re-thread the result through layered DTOs.
+
+### Term extension flags
+
+| Flag | Effect |
+| --- | --- |
+| `extendTermForDailyRepayments` | When a daily-repayment loan has an instalment moved across a weekend, the loan **term grows by the moved days**. Without this flag the next instalments shift forward but the final date and term are unchanged. |
+| `extendTermForRepaymentsOnHolidays` | Same idea but triggered by any holiday-induced shift (regardless of frequency). |
+
+These flags are read by `LoanScheduleAssembler.handleRecalculationForNonDueDateTransactions(...)` to decide whether to insert an extra instalment at the tail of the schedule.
+
+## `WorkingDaysApiResource` — `/v1/workingdays`
+
+```java
+@Path("/v1/workingdays")
+@Component
+@Tag(name = "Working days",
+     description = "The days of the week that are workdays …")
+@RequiredArgsConstructor
+public class WorkingDaysApiResource {
+    private final WorkingDaysReadPlatformService     workingDaysReadPlatformService;
+    private final WorkingDaysUpdateRequestValidator  workingDaysUpdateRequestValidator;
+    private final CommandPipeline                    commandPipeline;
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Notes |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/workingdays` | `retrieveAll` | — | Returns the single working-days row |
+| PUT | `/v1/workingdays` | `update` | `WorkingDaysUpdateCommand` | Edit the singleton |
+| GET | `/v1/workingdays/template` | `template` | — | Returns the `RepaymentRescheduleType` enum options |
+
+There is no `POST` — the row is created by liquibase at tenant bootstrap and is never deleted.
+
+### `GET /v1/workingdays`
+
+```java
+@GET
+public WorkingDaysData retrieveAll() {
+    return this.workingDaysReadPlatformService.retrieve();
+}
+```
+
+Sample response:
+
+```json
+{
+  "id": 1,
+  "recurrence": "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR",
+  "repaymentRescheduleType": {
+    "id": 2,
+    "code": "RepaymentRescheduleType.move.to.next.working.day",
+    "value": "Move to next working day"
+  },
+  "extendTermForDailyRepayments": false,
+  "extendTermForRepaymentsOnHolidays": false
+}
+```
+
+### `PUT /v1/workingdays`
+
+```java
+@PUT
+public WorkingDaysUpdateResponse update(@Valid WorkingDaysUpdateRequest request) {
+    final var command = new WorkingDaysUpdateCommand();
+    command.setCommandId(System.currentTimeMillis());
+    command.setCreatedAt(Instant.now());
+    command.setPayload(request);
+    final Supplier<WorkingDaysUpdateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+Request body (mandatory fields per the `@Operation` annotation):
+
+```json
+{
+  "recurrence": "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR",
+  "repaymentRescheduleType": 2,
+  "extendTermForDailyRepayments": false,
+  "extendTermForRepaymentsOnHolidays": false,
+  "locale": "en"
+}
+```
+
+The validator `WorkingDaysUpdateRequestValidator`:
+
+1. Parses `recurrence` through `CalendarUtils` and raises a validation error if it is not a valid RRULE.
+2. Rejects `repaymentRescheduleType` values outside the enum range using `RepaymentRescheduleType.getMinValue()` / `getMaxValue()`.
+3. Requires at least one `BYDAY` token (you cannot have a zero-day work week).
+
+The command pipeline uses `commandId = System.currentTimeMillis()` as a deduplication key — note this is the timestamp of the **request**, not a stable resource id; submissions are not idempotent in the strict sense.
+
+### `GET /v1/workingdays/template`
+
+```java
+@GET @Path("/template")
+public WorkingDaysData template() {
+    return this.workingDaysReadPlatformService.repaymentRescheduleType();
+}
+```
+
+Returns only the enum options for `repaymentRescheduleType` — useful for populating the update form's dropdown.
+
+## DTOs
+
+| DTO | Purpose |
+| --- | --- |
+| `WorkingDaysData` | Response (GET + PUT) |
+| `WorkingDaysUpdateRequest` | Typed PUT body |
+| `WorkingDaysUpdateResponse` | Typed PUT response |
+| `AdjustedDateDetailsDTO` | Pass-through DTO for `WorkingDaysUtil.updateWorkingDayIfRepaymentDateIsNonWorkingDay(...)` |
+
+## Repository wrapper
+
+`WorkingDaysRepositoryWrapper.findOne()` returns the singleton row, raising `WorkingDaysNotFoundException` if (somehow) absent. The wrapper caches by Spring `@Cacheable` so the row is read once per request — loan-schedule generators may call it many times during a single command execution.
+
+## Exceptions
+
+| Exception | HTTP | Message key | When |
+| --- | --- | --- | --- |
+| `WorkingDaysNotFoundException` | 404 | `error.msg.workingdays.entity.not.found` | Row missing from `m_working_days` (only on a malformed tenant) |
+| `PlatformApiDataValidationException` | 400 | `validation.msg.workingdays.<field>.<rule>` | Validator failures |
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_WORKINGDAYS` | List / retrieve / template |
+| `UPDATE_WORKINGDAYS`, `UPDATE_WORKINGDAYS_CHECKER` | Update + maker–checker |
+
+There is no `CREATE` or `DELETE` permission — the singleton row is provisioned by liquibase and cannot be removed via the API.
+
+## How `WorkingDays` plumbs into other modules
+
+- **Loan scheduling**: every `LoanScheduleAssembler` derivative calls `WorkingDaysUtil.getOffSetDateIfNonWorkingDay(...)` after holiday adjustment. The result populates `LoanRepaymentScheduleInstallment.dueDate`.
+- **Group calendars**: `MOVE_TO_NEXT_REPAYMENT_MEETING_DAY` and `MOVE_TO_NEXT_MEETING_DAY` consult the `Calendar` attached to the loan's group/centre via `CalendarRepositoryWrapper`.
+- **Savings deposit accounts**: term-deposit maturity dates are run through the same util so a maturity that lands on a non-working day is moved forward (or the maturity-date-on-due flag is respected).
+- **Scheduler jobs**: COB jobs reading `repaymentReschedulingType` decide whether to insert / shift an instalment when a holiday is activated mid-loan.
+
+## See also
+
+- [Holidays](/organisation/holidays) — pre-step that runs before the working-day adjustment.
+- [Organisation shared domain](/core/organisation-shared-domain) — package map.
+- [Configuration properties](/core/configuration-properties) — `reschedule-future-repayments`, `allow-transactions-on-non-workingday`.
+- [Commands framework](/core/commands-framework) — typed `CommandPipeline.send(...)`.
+- [Organisation APIs](/api/organisation-apis) — Swagger payloads for `/v1/workingdays`.
+- [Security overview](/security/overview) — `WORKINGDAYS` permission resource.

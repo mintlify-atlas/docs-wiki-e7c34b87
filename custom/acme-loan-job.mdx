@@ -1,0 +1,262 @@
+---
+title: "ACME Loan Job: Custom Spring Batch Job Sample"
+sidebarTitle: "ACME Loan Job"
+description: "Reference walkthrough of custom/acme/loan/job — a noop Spring Batch Job and Tasklet plus the JobNameProvider bean and Liquibase seed row in the job table."
+---
+
+`custom/acme/loan/job/` is the Apache Fineract reference implementation for shipping a **custom Spring Batch job**. It wires a one-step `Job` ("Acme Noop Job") that runs a single `Tasklet`, exposes the job name through a `SimpleJobNameProvider` bean so the platform's scheduler API can discover it, and ships a Liquibase changelog that inserts the matching row in the `job` table. The tasklet body is a noop — its purpose is to demonstrate the wiring contract, not real work.
+
+## Module layout
+
+```text
+custom/acme/loan/job/
+├── build.gradle
+├── dependencies.gradle
+└── src/
+    ├── main/
+    │   ├── java/com/acme/fineract/loan/job/
+    │   │   ├── AcmeJobName.java
+    │   │   ├── AcmeJobNameConfig.java
+    │   │   ├── AcmeNoopJobConfiguration.java
+    │   │   └── AcmeNoopJobTasklet.java
+    │   └── resources/db/custom-changelog/
+    │       └── 0001_acme_loan_job.xml
+    └── test/java/
+        └── AcmeNoopJobTaskletTest.java
+```
+
+Gradle project path: `:custom:acme:loan:job`. The auto-configuration that picks the beans up is shared with `loan/cob` and `loan/processor` in `custom/acme/loan/starter/`.
+
+## `build.gradle`
+
+```groovy
+description = 'ACME Fineract Loan Job'
+group       = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-loan-job'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+The dependencies.gradle pulls in `fineract-core`, `fineract-loan`, `fineract-provider`, and the Spring Boot data-JPA starter (siblings of the cob/processor modules).
+
+## The job name enum
+
+`com.acme.fineract.loan.job.AcmeJobName`:
+
+```java
+public enum AcmeJobName {
+
+    ACME_NOOP_JOB("Acme Noop Job");
+
+    private final String name;
+
+    AcmeJobName(final String name) {
+        this.name = name;
+    }
+
+    @Override
+    public String toString() {
+        return this.name;
+    }
+}
+```
+
+This enum is the single source of truth for the job's identity:
+
+- **`name()`** = `ACME_NOOP_JOB` is the Spring Batch job name (used by `JobBuilder(...)`, `StepBuilder(...)`, and the `JobLauncher`).
+- **`toString()`** = `"Acme Noop Job"` is the human-readable display name (used by `JobNameProvider`, the `job` table seed row, and the UI).
+
+Mismatching the two strings between code and the Liquibase row will silently break the scheduler's ability to launch the job, so keep them in sync.
+
+## Registering the job name
+
+`AcmeJobNameConfig` exposes a `JobNameProvider` bean. This is what allows the Fineract scheduler API (`GET /jobs`) to list the custom job alongside built-ins:
+
+```java
+@Configuration
+public class AcmeJobNameConfig {
+
+    @Bean
+    public JobNameProvider acmeJobNameProvider() {
+        return new SimpleJobNameProvider(
+            List.of(new JobNameData(AcmeJobName.ACME_NOOP_JOB.name(),
+                                    AcmeJobName.ACME_NOOP_JOB.toString())));
+    }
+}
+```
+
+A `JobNameData` is a `(name, displayName)` pair: name `ACME_NOOP_JOB`, display `Acme Noop Job`. A module that ships several jobs passes several entries to the `SimpleJobNameProvider` constructor (or registers several beans).
+
+## The tasklet
+
+`AcmeNoopJobTasklet` is the unit of work:
+
+```java
+@Slf4j
+@Component
+public class AcmeNoopJobTasklet implements Tasklet {
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        log.info("Acme custom job execution");
+        return RepeatStatus.FINISHED;
+    }
+}
+```
+
+It implements `org.springframework.batch.core.step.tasklet.Tasklet`, returns `RepeatStatus.FINISHED` to signal "single-pass completion" to Spring Batch, and is a Spring `@Component` so the starter's `@ComponentScan("com.acme.fineract.loan.job")` picks it up.
+
+A real tasklet would:
+
+- Pull data via repositories injected through the constructor.
+- Loop over loans / clients / journal entries.
+- Write rows or raise external events.
+- Return `RepeatStatus.CONTINUABLE` if it wants Spring Batch to call `execute()` again, or `RepeatStatus.FINISHED` if a single pass is enough.
+
+## The job configuration
+
+`AcmeNoopJobConfiguration` wires a one-step Spring Batch `Job` from the tasklet:
+
+```java
+@Configuration
+@RequiredArgsConstructor
+public class AcmeNoopJobConfiguration {
+
+    private final JobRepository jobRepository;
+    private final PlatformTransactionManager transactionManager;
+    private final AcmeNoopJobTasklet tasklet;
+
+    @Bean
+    protected Step acmeNoopJobStep() {
+        return new StepBuilder(AcmeJobName.ACME_NOOP_JOB.name(), jobRepository)
+            .tasklet(tasklet, transactionManager)
+            .build();
+    }
+
+    @Bean
+    public Job acmeNoopJob() {
+        return new JobBuilder(AcmeJobName.ACME_NOOP_JOB.name(), jobRepository)
+            .start(acmeNoopJobStep())
+            .incrementer(new RunIdIncrementer())
+            .build();
+    }
+}
+```
+
+Things to note:
+
+- The configuration uses the modern `StepBuilder` / `JobBuilder` API introduced in Spring Batch 5.
+- `JobRepository` and `PlatformTransactionManager` come from the Fineract provider context — no need to define them locally.
+- `RunIdIncrementer()` is what lets the operator re-run the job with `JobParameters` from the launcher without conflict.
+
+## Liquibase seed row
+
+`src/main/resources/db/custom-changelog/0001_acme_loan_job.xml` inserts the job row used by the Fineract scheduler dashboard:
+
+```xml
+<changeSet author="acme" id="1">
+    <insert tableName="job">
+        <column name="name"                       value="Acme Noop Job"/>
+        <column name="display_name"               value="Acme Noop Job"/>
+        <column name="cron_expression"            value="0 1 0 1/1 * ? *"/>
+        <column name="create_time"                valueDate="${current_datetime}"/>
+        <column name="task_priority"              valueNumeric="5"/>
+        <column name="group_name"/>
+        <column name="previous_run_start_time"/>
+        <column name="job_key"                    value="Acme Noop Job _ DEFAULT"/>
+        <column name="initializing_errorlog"/>
+        <column name="is_active"                  valueBoolean="false"/>
+        <column name="currently_running"          valueBoolean="false"/>
+        <column name="updates_allowed"            valueBoolean="true"/>
+        <column name="scheduler_group"            valueNumeric="0"/>
+        <column name="is_misfired"                valueBoolean="false"/>
+        <column name="node_id"                    valueNumeric="1"/>
+        <column name="is_mismatched_job"          valueBoolean="true"/>
+    </insert>
+</changeSet>
+<changeSet author="acme" id="2">
+    <update tableName="job">
+        <column name="short_name" value="ACM_NOOP"/>
+        <where>name='Acme Noop Job'</where>
+    </update>
+</changeSet>
+```
+
+| Column | Value | Meaning |
+| --- | --- | --- |
+| `name` | `Acme Noop Job` | matches `AcmeJobName.ACME_NOOP_JOB.toString()`. |
+| `display_name` | `Acme Noop Job` | label shown in the scheduler UI. |
+| `cron_expression` | `0 1 0 1/1 * ? *` | every day at `00:01:00`. |
+| `task_priority` | `5` | tie-breaker when several jobs run at the same time. |
+| `job_key` | `Acme Noop Job _ DEFAULT` | Quartz scheduler key. |
+| `is_active` | `false` | starts disabled — operator turns it on via `PUT /api/v1/jobs/<id>`. |
+| `is_mismatched_job` | `true` | flagged "mismatched" until the platform reconciles it with a registered Spring Batch job by name at boot. |
+| `short_name` (changeset 2) | `ACM_NOOP` | optional short alias used in logs. |
+
+## Auto-configuration
+
+The starter module's `AcmeLoanAutoConfiguration` (gated by `@ConditionalOnProperty("acme.loan.enabled")`) component-scans `com.acme.fineract.loan.job`, so:
+
+- `AcmeNoopJobTasklet` (a `@Component`) becomes a bean.
+- `AcmeJobNameConfig` (a `@Configuration`) is processed; its `JobNameProvider` bean lands in the context.
+- `AcmeNoopJobConfiguration` (a `@Configuration`) is processed; the `Job` and `Step` beans are created.
+
+All three pieces need the same flag, so set `acme.loan.enabled=true` once and the entire loan-customisation bundle (cob + job + processor) comes up together.
+
+## Operator workflow
+
+| Step | Action |
+| --- | --- |
+| 1 | Build the WAR with the custom JAR on the classpath (`custom/docker` already does so). |
+| 2 | Set `acme.loan.enabled=true`. |
+| 3 | Boot Fineract. Liquibase applies the changelogs; Spring autowires the Tasklet, JobConfiguration, and NameProvider. |
+| 4 | `GET /api/v1/jobs` — confirm `Acme Noop Job` appears. |
+| 5 | `PUT /api/v1/jobs/<id>` with `isActive=true` to enable scheduled execution, or `POST /api/v1/jobs/<id>?command=executeJob` to launch ad hoc. |
+
+## Tasklet unit test
+
+`src/test/java/AcmeNoopJobTaskletTest.java`:
+
+```java
+@ExtendWith(MockitoExtension.class)
+public class AcmeNoopJobTaskletTest {
+
+    @Mock private StepContribution stepContribution;
+    @Mock private ChunkContext chunkContext;
+    private RepeatStatus resultStatus;
+    private AcmeNoopJobTasklet underTest;
+
+    @BeforeEach
+    public void setUp() {
+        underTest = new AcmeNoopJobTasklet();
+    }
+
+    @Test
+    public void testJobExecution() throws Exception {
+        resultStatus = underTest.execute(stepContribution, chunkContext);
+        assertEquals(FINISHED, resultStatus);
+    }
+}
+```
+
+The test does what unit tests should do: instantiate the tasklet, stub the Spring Batch context, call `execute(...)`, and verify the return value. It does **not** boot Spring; the wiring tests happen in the starter module's Cucumber feature (see [acme-loan-cob](/custom/acme-loan-cob)).
+
+## Conventions and gotchas
+
+- **Three independent strings.** The enum `name()`, the enum `toString()`, and the Liquibase `name` column must all agree (or the scheduler can't find the job).
+- **`is_active=false` is intentional.** Custom jobs ship disabled so operators opt them in.
+- **`is_mismatched_job=true` is normal at first boot.** Fineract clears it after matching the row to a registered Spring Batch job by name.
+- **`@Component` on the tasklet.** Without it, the auto-configuration can't `@ComponentScan` the tasklet and the `JobConfiguration` will fail to autowire.
+- **Don't recompute the cron at boot.** The cron lives in the database row; changes go through the API (`PUT /api/v1/jobs/<id>`) so they survive reboots.
+- **Job parameters.** The sample uses no parameters; the scheduler API still works because of `RunIdIncrementer`. If you need parameters, replace it with `JobParametersIncrementer` and a custom strategy.
+
+## Related pages
+
+- [Custom Modules Overview](/custom/overview)
+- [acme-loan-cob](/custom/acme-loan-cob) — sibling COB step in the same starter.
+- [acme-loan-processor](/custom/acme-loan-processor) — sibling transaction processor in the same starter.
+- [Gradle Multi-Module Build](/build/gradle-multi-module)
+- [Custom Modules build](/build/custom-modules)

@@ -1,0 +1,296 @@
+---
+title: "Interest Rate Charts and Slabs for Term Deposits"
+sidebarTitle: "Interest Rate Charts"
+description: "Reference for InterestRateChart, InterestRateChartSlab, the two REST resources at /interestratecharts and /interestratecharts/{id}/chartslabs and incentives."
+---
+
+Apache Fineract represents tiered deposit interest schemes as **interest rate charts**. A chart is a date-bounded named container holding one or more **slabs** (a.k.a. interest bands), each of which defines an interest rate that applies to deposits of a given term and (optionally) amount range. Term-deposit products (Fixed Deposit, Recurring Deposit) bind to one chart at a time through `DepositAccountInterestRateChart`; the savings interest-posting engine reads the chart slabs to derive the rate per period.
+
+The subsystem lives in `org.apache.fineract.portfolio.interestratechart`: entities and embeddables in `fineract-savings`, REST resources, deserializers and command handlers in `fineract-provider`. The chart resources are some of the few in Fineract that fully use the modern `CommandPipeline` instead of the legacy `commands_source` write path.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `InterestRateChart` entity | `fineract-savings` | `org.apache.fineract.portfolio.interestratechart.domain` |
+| `InterestRateChartFields` embeddable | `fineract-savings` | `org.apache.fineract.portfolio.interestratechart.domain` |
+| `InterestRateChartSlab` entity | `fineract-savings` | `org.apache.fineract.portfolio.interestratechart.domain` |
+| `InterestRateChartSlabFields` embeddable | `fineract-savings` | `org.apache.fineract.portfolio.interestratechart.domain` |
+| `InterestIncentives` entity (per-slab incentives) | `fineract-savings` | `org.apache.fineract.portfolio.interestratechart.domain` |
+| `InterestRateChartsApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.api` |
+| `InterestRateChartSlabsApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.api` |
+| `InterestRateChartCreate/Update/DeleteCommand`, slab equivalents | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.command` |
+| `*Request` / `*Response` DTOs | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.data` |
+| `InterestRateChart*CommandHandler` family | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.handler` |
+| `InterestRateChartDataValidator`, `InterestRateChartSlabDataValidator`, `InterestIncentiveDataValidator` | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.data` |
+| Read services | `fineract-provider` | `org.apache.fineract.portfolio.interestratechart.service` |
+
+The savings module owns the entities so that fixed/recurring-deposit code can manipulate them directly without crossing module boundaries.
+
+## Chart entity
+
+```java
+// fineract-savings/.../portfolio/interestratechart/domain/InterestRateChart.java
+@Entity
+@Table(name = "m_interest_rate_chart")
+public class InterestRateChart extends AbstractPersistableCustom<Long> {
+
+    @Embedded
+    private InterestRateChartFields chartFields;
+
+    @OneToMany(mappedBy = "interestRateChart", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
+    private Set<InterestRateChartSlab> chartSlabs = new HashSet<>();
+```
+
+The header is an embeddable so its fields share the chart's row:
+
+```java
+@Embeddable
+public class InterestRateChartFields {
+
+    @Column(name = "name", length = 100, nullable = false) private String name;
+    @Column(name = "description") private String description;
+    @Column(name = "from_date",  nullable = false) private LocalDate fromDate;
+    @Column(name = "end_date") private LocalDate endDate;
+    @Column(name = "is_primary_grouping_by_amount", nullable = false) private boolean isPrimaryGroupingByAmount;
+}
+```
+
+Semantics:
+
+- **`name`** — display name. Not unique on its own — a single product may have multiple historical charts.
+- **`fromDate` / `endDate`** — validity period. `endDate` is nullable, meaning open-ended. Charts on the same product cannot overlap.
+- **`isPrimaryGroupingByAmount`** — when `true`, the deposit account first selects the slab band by amount, then by period; when `false`, by period first. Affects how the slab table is rendered and how the engine indexes the slabs.
+
+The chart is associated to a product (Fixed Deposit / Recurring Deposit) through the join table `m_deposit_account_interest_rate_chart` and there is no direct `productId` column on `m_interest_rate_chart` itself, which is what lets a single chart definition be shared across product variants if needed.
+
+## Slab entity
+
+```java
+// fineract-savings/.../portfolio/interestratechart/domain/InterestRateChartSlab.java
+@Entity
+@Table(name = "m_interest_rate_slab")
+public class InterestRateChartSlab extends AbstractPersistableCustom<Long> {
+
+    @Embedded
+    private InterestRateChartSlabFields slabFields;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "interest_rate_chart_id", referencedColumnName = "id", nullable = false)
+    private InterestRateChart interestRateChart;
+
+    @OneToMany(mappedBy = "interestRateChartSlab", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
+    private Set<InterestIncentives> interestIncentives = new HashSet<>();
+```
+
+The embeddable owns the band parameters:
+
+```java
+@Embeddable
+public class InterestRateChartSlabFields {
+
+    @Column(name = "description") private String description;
+
+    @Column(name = "period_type_enum") private Integer periodType;     // SavingsPeriodFrequencyType
+    @Column(name = "from_period")      private Integer fromPeriod;
+    @Column(name = "to_period")        private Integer toPeriod;       // null = open-ended band
+
+    @Column(name = "amount_range_from", scale = 6, precision = 19) private BigDecimal amountRangeFrom;
+    @Column(name = "amount_range_to",   scale = 6, precision = 19) private BigDecimal amountRangeTo;
+
+    @Column(name = "annual_interest_rate", scale = 6, precision = 19, nullable = false) private BigDecimal annualInterestRate;
+    @Column(name = "currency_code", nullable = false) private String currencyCode;
+}
+```
+
+Semantics:
+
+- **`periodType`** — units of `fromPeriod`/`toPeriod`. Backed by `SavingsPeriodFrequencyType` (DAYS, WEEKS, MONTHS, YEARS).
+- **`fromPeriod` / `toPeriod`** — inclusive lower bound, exclusive upper bound. `toPeriod=null` means an open-ended top band ("90+ days at 7%").
+- **`amountRangeFrom` / `amountRangeTo`** — optional amount-band tiering for the same period.
+- **`annualInterestRate`** — the rate the engine applies to deposits falling into the band.
+- **`currencyCode`** — slabs are currency-scoped. A multi-currency product carries multiple slabs per band, one per currency.
+
+`InterestIncentives` rows hang off a slab and let the institution offer bonus rates for specific attributes — gender, joint accounts, client classification — through the standard `Code`/`CodeValue` framework. The savings interest engine sums the slab rate plus any matching incentive when posting interest.
+
+## REST surface — `InterestRateChartsApiResource`
+
+The chart resource lives at `/v1/interestratecharts` and uses the typed `CommandPipeline`:
+
+```java
+// fineract-provider/.../portfolio/interestratechart/api/InterestRateChartsApiResource.java
+@Path("/v1/interestratecharts")
+@Component
+@Consumes(MediaType.APPLICATION_JSON)
+@Produces(MediaType.APPLICATION_JSON)
+@Tag(name = "Interest Rate Chart",
+     description = "This defines an interest rate scheme that can be associated to a term deposit product. "
+                 + "This will have a slab (band or range) of deposit periods and the associated interest rates "
+                 + "applicable along with incentives for each band.")
+@RequiredArgsConstructor
+public class InterestRateChartsApiResource {
+
+    private final InterestRateChartReadService chartReadPlatformService;
+    private final CommandPipeline commandPipeline;
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/interestratecharts/template` | Returns template defaults and allowed value lists for the create UI. |
+| `GET`  | `/v1/interestratecharts?productId={id}` | List all charts associated with a term-deposit product. |
+| `GET`  | `/v1/interestratecharts/{chartId}` | Retrieve a chart; `?associations=chartSlabs` includes the slabs in the response. |
+| `POST` | `/v1/interestratecharts` | Create a chart. Body: `InterestRateChartCreateRequest`. |
+| `PUT`  | `/v1/interestratecharts/{chartId}` | Update a chart. Body: `InterestRateChartUpdateRequest`. |
+| `DELETE` | `/v1/interestratecharts/{chartId}` | Delete a chart. Body: empty. |
+
+### Create
+
+```java
+@POST
+@Operation(summary = "Create a Chart",
+           description = "Creates a new chart which can be attached to a term deposit products (FD or RD).")
+public InterestRateChartCreateResponse create(final InterestRateChartCreateRequest request) {
+    final var command = new InterestRateChartCreateCommand();
+    command.setPayload(request);
+    final Supplier<InterestRateChartCreateResponse> responseSupplier = commandPipeline.send(command);
+    return responseSupplier.get();
+}
+```
+
+The pipeline routes to `InterestRateChartCreateCommandHandler`, which validates via `InterestRateChartDataValidator`, builds an `InterestRateChartFields` via `createNew(...)` and a new `InterestRateChart`, and persists through the repository. The response carries the new id and a snapshot of the persisted record.
+
+### Update / Delete
+
+Both follow the same pattern — `…UpdateCommand`, `…DeleteCommand`, pushed through `commandPipeline.send(...)` with the response supplier resolved at the end.
+
+### Retrieve with associations
+
+```java
+@GET
+@Path("{chartId}")
+public InterestRateChartData retrieveOne(@PathParam("chartId") final Long chartId,
+                                         @QueryParam("associations") final String associations) {
+    InterestRateChartData chartData;
+    if (associations != null && associations.contains(InterestRateChartApiConstants.chartSlabs)) {
+        chartData = chartReadPlatformService.retrieveOneWithSlabs(chartId);
+    } else {
+        chartData = chartReadPlatformService.retrieveOne(chartId);
+    }
+    return chartData;
+}
+```
+
+`retrieveOneWithSlabs(chartId)` performs a single SQL join across `m_interest_rate_chart`, `m_interest_rate_slab` and `m_interest_incentives` to produce the full `InterestRateChartData` tree.
+
+## REST surface — `InterestRateChartSlabsApiResource`
+
+Slabs sit under each chart at `/v1/interestratecharts/{chartId}/chartslabs`:
+
+```java
+@Path("/v1/interestratecharts/{chartId}/chartslabs")
+@Component
+@Tag(name = "Interest Rate Slab (A.K.A interest bands)",
+     description = "The slabs a.k.a interest bands are associated with Interest Rate Chart. "
+                 + "These bands allow to define different interest rates for different deposit term periods.")
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/interestratecharts/{chartId}/chartslabs/template` | Template options (period types, currencies). |
+| `GET`  | `/v1/interestratecharts/{chartId}/chartslabs` | List all slabs on a chart. |
+| `GET`  | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | Get a single slab. |
+| `POST` | `/v1/interestratecharts/{chartId}/chartslabs` | Add a slab. Body: `InterestRateChartSlabsCreateRequest`. |
+| `PUT`  | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | Update. Body: `InterestRateChartSlabsUpdateRequest`. |
+| `DELETE` | `/v1/interestratecharts/{chartId}/chartslabs/{chartSlabId}` | Delete. |
+
+Mandatory create fields: `periodType`, `fromPeriod`, `annualInterestRate`. Optional: `toPeriod`, `amountRangeFrom`, `amountRangeTo`, `description`.
+
+The verbs again ride the typed pipeline:
+
+```java
+@POST
+public InterestRateChartSlabsCreateResponse create(@PathParam("chartId") final Long chartId,
+                                                   final InterestRateChartSlabsCreateRequest request) {
+    request.setChartId(chartId);
+    final var command = new InterestRateChartSlabsCreateCommand();
+    command.setPayload(request);
+    final Supplier<InterestRateChartSlabsCreateResponse> responseSupplier = commandPipeline.send(command);
+    return responseSupplier.get();
+}
+```
+
+## Validation
+
+`InterestRateChartDataValidator` enforces:
+
+- `name`, `fromDate` required.
+- `endDate ≥ fromDate` when present.
+- No overlap with any other chart associated with the same product.
+
+`InterestRateChartSlabDataValidator` enforces:
+
+- `periodType` is one of `SavingsPeriodFrequencyType` values.
+- `fromPeriod ≥ 0` and `toPeriod > fromPeriod` (when both set).
+- `annualInterestRate` between configured product min/max.
+- `amountRangeFrom < amountRangeTo` (when both set).
+- The slab does not overlap any existing slab in the same currency / amount range on the same chart.
+
+`InterestIncentiveDataValidator` enforces incentive parameter consistency (e.g. attribute_name, condition_type, value pairing).
+
+All raise `PlatformApiDataValidationException` (HTTP 400) on failure.
+
+## Chart selection at deposit time
+
+When a Fixed Deposit account is created (see [/savings/overview](/savings/overview)):
+
+1. The product's active chart is selected (`m_interest_rate_chart.from_date <= today < end_date`).
+2. The chart is **cloned** into a per-account `DepositAccountInterestRateChart` row so subsequent product-chart edits do not retroactively change live accounts.
+3. On every interest posting, the savings engine walks the cloned chart's slabs in order, selecting by amount-range first or period first depending on `isPrimaryGroupingByAmount`, picks the matching slab and adds any matching `InterestIncentives`.
+
+This clone-at-creation pattern is the reason the chart resource does not need an "in use" guard — edits affect new accounts but never live ones.
+
+## Lifecycle and command handlers
+
+| Command | Handler |
+| --- | --- |
+| `CREATE_INTERESTRATECHART` | `InterestRateChartCreateCommandHandler` |
+| `UPDATE_INTERESTRATECHART` | `InterestRateChartUpdateCommandHandler` |
+| `DELETE_INTERESTRATECHART` | `InterestRateChartDeleteCommandHandler` |
+| `CREATE_CHARTSLAB` | `InterestRateChartSlabsCreateCommandHandler` |
+| `UPDATE_CHARTSLAB` | `InterestRateChartSlabsUpdateCommandHandler` |
+| `DELETE_CHARTSLAB` | `InterestRateChartSlabsDeleteCommandHandler` |
+
+Each handler is a Spring component picked up by the `CommandPipeline` based on the command class type.
+
+## Permissions
+
+- `READ_INTERESTRATECHART`, `CREATE_INTERESTRATECHART`, `UPDATE_INTERESTRATECHART`, `DELETE_INTERESTRATECHART`.
+- `READ_CHARTSLAB`, `CREATE_CHARTSLAB`, `UPDATE_CHARTSLAB`, `DELETE_CHARTSLAB`.
+
+Maker-checker is supported through the `CommandPipeline`'s `CommandSource` envelope.
+
+## Failure modes
+
+- **HTTP 400** — validation: overlapping slabs, bad dates, out-of-range rates.
+- **HTTP 404** — chart or slab id unknown (`InterestRateChartNotFoundException`, `InterestRateChartSlabNotFoundException`).
+- **HTTP 409** — attempt to delete a chart still bound to an active product (FK constraint).
+
+## Edge cases
+
+- **Open-ended top band** — leave `toPeriod=null` to denote "everything above `fromPeriod`".
+- **Currency-specific slabs** — a chart used by a multi-currency product needs explicit slabs per currency; the validator does not auto-replicate.
+- **Incentive precedence** — when multiple incentives match for a deposit account, the engine sums them by default; product configuration can switch this to "highest only".
+
+## Cross-references
+
+- [/savings/overview](/savings/overview) — term-deposit products that consume charts.
+- [/savings/savings-account-domain](/savings/savings-account-domain) — `DepositAccountInterestRateChart` clone-at-creation flow.
+- [/portfolio/rate](/portfolio/rate) — the generic `Rate` entity (distinct from this chart machinery).
+- [/rates/overview](/rates/overview) — floating-rate-base machinery used by loans.
+- [/command/overview](/command/overview) — the modern typed `CommandPipeline` this resource uses.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — shared base classes and `SavingsPeriodFrequencyType`.

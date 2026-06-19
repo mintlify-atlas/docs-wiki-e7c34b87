@@ -1,0 +1,405 @@
+---
+title: "Send and Purge External Events — Spring Batch Job Reference"
+sidebarTitle: "Send & Purge Jobs"
+description: "Apache Fineract's SEND_ASYNCHRONOUS_EVENTS and PURGE_EXTERNAL_EVENTS jobs: tasklets, batch sizing, partition fan-out, retention configuration, schedules, and operator runbooks."
+---
+
+Two Spring Batch jobs in `fineract-core` drive the external event outbox once a row is sitting in `m_external_event`. `SEND_ASYNCHRONOUS_EVENTS` runs minute-by-minute by default, reads `TO_BE_SENT` rows in business-date order, hands them to the configured `ExternalEventProducer`, and marks them `SENT` on success. `PURGE_EXTERNAL_EVENTS` runs nightly, deleting `SENT` rows older than the configured retention window. Both jobs are seeded into the platform `job` table by Liquibase changesets and share two `c_configuration` keys for runtime tuning. This page is the runbook: what each tasklet does, how to tune it, what to do when rows stack up, and where to look in the source.
+
+<Note>
+Together, these jobs implement the **outbox-pattern poller** Apache Fineract relies on. The send job is the only place that consumes rows from `m_external_event`; the purge job is the only place that deletes them. Both are idempotent — re-running them is safe.
+</Note>
+
+## Job table summary
+
+| Job (`JobName.name()`)        | Default cron       | Default `is_active` | Tasklet                        | Step name                          |
+| ----------------------------- | ------------------ | ------------------- | ------------------------------ | ---------------------------------- |
+| `SEND_ASYNCHRONOUS_EVENTS`    | `0 0/1 * * *  ?`   | `true`              | `SendAsynchronousEventsTasklet`| `SEND_ASYNCHRONOUS_EVENTS_STEP`    |
+| `PURGE_EXTERNAL_EVENTS`       | `0 1 0 1/1 * ? *`  | `false`             | `PurgeExternalEventsTasklet`   | `PURGE_EXTERNAL_EVENTS` (job name) |
+
+(`Cron` columns are stored verbatim in the `job.cron_expression` column — verify in your environment, since admins often override them.)
+
+The names come from the central enum:
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java
+SEND_ASYNCHRONOUS_EVENTS("Send Asynchronous Events"), //
+PURGE_EXTERNAL_EVENTS("Purge External Events"), //
+```
+
+and the send job's step uses:
+
+```java
+// fineract-core/.../jobs/service/StepName.java
+SEND_ASYNCHRONOUS_EVENTS_STEP //
+```
+
+## `SEND_ASYNCHRONOUS_EVENTS`
+
+### Job + step config
+
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/jobs/SendAsynchronousEventsConfig.java`:
+
+```java
+@Configuration
+public class SendAsynchronousEventsConfig {
+    @Autowired private JobRepository jobRepository;
+    @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private SendAsynchronousEventsTasklet tasklet;
+
+    @Bean
+    protected Step sendAsynchronousEventsStep() {
+        return new StepBuilder(StepName.SEND_ASYNCHRONOUS_EVENTS_STEP.name(), jobRepository)
+                .tasklet(tasklet, transactionManager).build();
+    }
+
+    @Bean
+    public Job sendAsynchronousEventsJob() {
+        return new JobBuilder(JobName.SEND_ASYNCHRONOUS_EVENTS.name(), jobRepository)
+                .start(sendAsynchronousEventsStep())
+                .incrementer(new RunIdIncrementer()).build();
+    }
+}
+```
+
+Single-step Spring Batch job, a `RunIdIncrementer` to make repeated executions distinct. The Fineract scheduler (`SchedulerJobListener`) reads `job.cron_expression` and triggers `JobExecution` instances when the time matches.
+
+### Tasklet — the full pipeline
+
+`fineract-core/.../jobs/SendAsynchronousEventsTasklet.java`:
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Component
+public class SendAsynchronousEventsTasklet implements Tasklet {
+
+    private final FineractProperties fineractProperties;
+    private final ExternalEventRepository repository;
+    private final ExternalEventProducer eventProducer;
+    private final MessageFactory messageFactory;
+    private final ByteBufferConverter byteBufferConverter;
+    private final ConfigurationDomainService configurationDomainService;
+    private final TransactionTemplate transactionTemplate;
+    @Qualifier(TaskExecutorConstant.EVENT_MARKS_AS_SENT_EXECUTOR_BEAN_NAME)
+    private final ThreadPoolTaskExecutor threadPoolTaskExecutor;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+        try {
+            if (isDownstreamChannelEnabled()) {
+                List<ExternalEventView> events = getQueuedEventsBatch();
+                log.debug("Queued events size: {}", events.size());
+                sendEvents(events);
+            }
+        } catch (Exception e) {
+            log.error("Error occurred while processing events: ", e);
+        }
+        return RepeatStatus.FINISHED;
+    }
+```
+
+| Step                          | Source                                                            |
+| ----------------------------- | ----------------------------------------------------------------- |
+| Channel check                 | `isDownstreamChannelEnabled` → either JMS or Kafka must be on, else early return |
+| Read                          | `getQueuedEventsBatch` → `findByStatusOrderByBusinessDateAscIdAsc(TO_BE_SENT, Pageable.ofSize(batchSize))` |
+| Partition by aggregate        | `generatePartitions` → `Map<Long, List<byte[]>>` keyed by `aggregate_root_id` (or `-1L`) |
+| Convert to wire bytes         | `createMessages` → `MessageFactory.createMessage(view).toByteBuffer()` |
+| Send                          | `eventProducer.sendEvents(partitions)` (JMS / Kafka / Noop)        |
+| Mark sent                     | `markEventsAsSent(ids)` — partitioned `markEventsSent` with `eventMarksAsSentExecutor` |
+
+### Downstream channel guard
+
+```java
+protected boolean isDownstreamChannelEnabled() {
+    return fineractProperties.getEvents().getExternal().getProducer().getJms().isEnabled()
+        || fineractProperties.getEvents().getExternal().getProducer().getKafka().isEnabled();
+}
+```
+
+If **both** are off, the tasklet returns without reading anything. With the `Noop` producer (neither flag on), `m_external_event` rows stack up forever — see the operational notes.
+
+### Reading the batch
+
+```java
+private List<ExternalEventView> getQueuedEventsBatch() {
+    int readBatchSize = getBatchSize();
+    Pageable batchSize = PageRequest.ofSize(readBatchSize);
+    return measure(() -> repository.findByStatusOrderByBusinessDateAscIdAsc(
+                                     ExternalEventStatus.TO_BE_SENT, batchSize),
+        (events, timeTaken) -> log.debug("Loaded {} events in {}ms", events.size(), timeTaken.toMillis()));
+}
+
+private int getBatchSize() {
+    Long externalEventBatchSize = configurationDomainService.retrieveExternalEventBatchSize();
+    return externalEventBatchSize.intValue();
+}
+```
+
+| Detail              | Implication                                                       |
+| ------------------- | ----------------------------------------------------------------- |
+| Order               | `business_date asc, id asc` — preserves per-aggregate ordering    |
+| Batch size          | Read from `c_configuration` row `external-event-batch-size`       |
+| Projection          | `ExternalEventView` interface — Spring Data closed projection; rows are detached and the `data` BLOB is materialised lazily |
+
+### Partitioning
+
+```java
+private Map<Long, List<byte[]>> generatePartitions(List<ExternalEventView> queuedEvents) {
+    Map<Long, List<ExternalEventView>> initialPartitions = queuedEvents.stream().collect(groupingBy(externalEvent -> {
+        Long aggregateRootId = externalEvent.getAggregateRootId();
+        if (aggregateRootId == null) aggregateRootId = -1L;
+        return aggregateRootId;
+    }));
+    Map<Long, List<byte[]>> partitions = initialPartitions.entrySet().stream()
+        .collect(toMap(Map.Entry::getKey, e -> createMessages(e.getValue())));
+    return partitions;
+}
+```
+
+Each per-aggregate bucket carries its events in their queue order. Producers preserve that order on the wire (consistent hashing for JMS, key-based partitioning for Kafka).
+
+### Mark-as-sent partition fan-out
+
+```java
+private void markEventsAsSent(final List<Long> eventIds) {
+    OffsetDateTime sentAt = DateUtils.getAuditOffsetDateTime();
+    final int partitionSize = fineractProperties.getEvents().getExternal().getPartitionSize();
+    List<List<Long>> partitions = Lists.partition(eventIds, partitionSize);
+    List<Future<?>> tasks = new ArrayList<>();
+    final FineractContext context = ThreadLocalContextUtil.getContext();
+    partitions.forEach(partitionedEventIds -> tasks.add(threadPoolTaskExecutor.submit(() -> {
+        try {
+            ThreadLocalContextUtil.init(context);
+            transactionTemplate.execute((status) -> {
+                repository.markEventsSent(partitionedEventIds, sentAt);
+                return null;
+            });
+        } finally {
+            ThreadLocalContextUtil.reset();
+        }
+    })));
+    for (Future<?> task : tasks) task.get();   // wait for all to finish
+}
+```
+
+| Concern                         | Behaviour                                                                                                |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Partition size                  | `fineract.events.external.partition-size` (default `5000`) keeps `WHERE id IN (…)` under PostgreSQL's 65,535-parameter limit |
+| Thread pool                     | `eventMarksAsSentExecutor` — core / max / queue from `fineract.events.external.thread-pool-*-pool-size` and `…-queue-capacity` |
+| Context propagation             | Captures `FineractContext` so child threads get the same tenant / business-date                          |
+| Transaction                     | Each partition runs in its own `TransactionTemplate` transaction                                          |
+
+### Failure semantics
+
+- If `eventProducer.sendEvents` throws, `markEventsAsSent` is **not** called. Rows stay `TO_BE_SENT`; the next run retries from the start of the still-pending batch.
+- If `sendEvents` succeeds but the mark-as-sent thread pool throws (or the JVM crashes), rows are re-sent on the next run. Consumer dedup via `idempotencyKey` covers this — see [Event Idempotency](/events/event-idempotency).
+
+### Sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant Sched as Quartz Scheduler
+    participant Job as Spring Batch JobLauncher
+    participant Step as SEND_ASYNCHRONOUS_EVENTS_STEP
+    participant Tk as SendAsynchronousEventsTasklet
+    participant DB as m_external_event
+    participant MF as MessageFactory
+    participant Prod as ExternalEventProducer
+    participant Pool as eventMarksAsSentExecutor
+    Sched->>Job: trigger SEND_ASYNCHRONOUS_EVENTS
+    Job->>Step: launch
+    Step->>Tk: execute
+    Tk->>Tk: isDownstreamChannelEnabled? (jms || kafka)
+    Tk->>DB: findByStatus(TO_BE_SENT, Pageable.ofSize(batchSize))
+    DB-->>Tk: List<ExternalEventView>
+    Tk->>Tk: groupingBy(aggregate_root_id)
+    loop each event
+        Tk->>MF: createMessage(view) → MessageV1
+        MF-->>Tk: ByteBuffer
+        Tk->>Tk: byteBufferConverter.convert → byte[]
+    end
+    Tk->>Prod: sendEvents(Map<Long, List<byte[]>>)
+    Prod-->>Tk: ok / throw
+    alt sent ok
+        loop partitions of eventIds
+            Tk->>Pool: submit(markEventsSent(ids, sentAt))
+            Pool->>DB: UPDATE status=SENT, sent_at=?
+        end
+    else error
+        Tk->>Tk: log.error; rows remain TO_BE_SENT
+    end
+```
+
+## `PURGE_EXTERNAL_EVENTS`
+
+### Job + step config
+
+`fineract-core/src/main/java/org/apache/fineract/infrastructure/event/external/jobs/PurgeExternalEventsConfig.java`:
+
+```java
+@Configuration
+public class PurgeExternalEventsConfig {
+    @Autowired private JobRepository jobRepository;
+    @Autowired private PlatformTransactionManager transactionManager;
+    @Autowired private PurgeExternalEventsTasklet tasklet;
+
+    @Bean
+    protected Step purgeExternalEventsStep() {
+        return new StepBuilder(JobName.PURGE_EXTERNAL_EVENTS.name(), jobRepository)
+                .tasklet(tasklet, transactionManager).build();
+    }
+
+    @Bean
+    public Job purgeExternalEventsJob() {
+        return new JobBuilder(JobName.PURGE_EXTERNAL_EVENTS.name(), jobRepository)
+                .start(purgeExternalEventsStep())
+                .incrementer(new RunIdIncrementer()).build();
+    }
+}
+```
+
+Note that the step name reuses the job name — both reference `JobName.PURGE_EXTERNAL_EVENTS.name()` (`"PURGE_EXTERNAL_EVENTS"`).
+
+### Tasklet
+
+`fineract-core/.../jobs/PurgeExternalEventsTasklet.java`:
+
+```java
+@Slf4j
+@AllArgsConstructor
+@Component
+public class PurgeExternalEventsTasklet implements Tasklet {
+
+    private final ExternalEventRepository repository;
+    private final ConfigurationDomainService configurationDomainService;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+        try {
+            Long numberOfDaysForPurgeCriteria =
+                configurationDomainService.retrieveExternalEventsPurgeDaysCriteria();
+            LocalDate dateForPurgeCriteria =
+                DateUtils.getBusinessLocalDate().minusDays(numberOfDaysForPurgeCriteria);
+            repository.deleteOlderEventsWithSentStatus(
+                ExternalEventStatus.SENT, dateForPurgeCriteria);
+        } catch (Exception e) {
+            log.error("Error occurred while purging external events: ", e);
+        }
+        return RepeatStatus.FINISHED;
+    }
+}
+```
+
+The repository query:
+
+```java
+@Modifying(flushAutomatically = true)
+@Query("delete from ExternalEvent e where e.status = :status and e.businessDate <= :dateForPurgeCriteria")
+void deleteOlderEventsWithSentStatus(@Param("status") ExternalEventStatus status,
+                                     @Param("dateForPurgeCriteria") LocalDate dateForPurgeCriteria);
+```
+
+| Behaviour                              | Notes                                                              |
+| -------------------------------------- | ------------------------------------------------------------------ |
+| Only deletes `status = SENT`           | `TO_BE_SENT` rows are never touched, even if very old              |
+| Cutoff is `business_date <= today − N` | `N` from `c_configuration` row `purge-external-events-older-than-days` (default 30) |
+| One JPQL bulk delete                   | Uses the `m_external_event_business_date_index` for filtering      |
+| Errors swallowed and logged            | The job never fails — tasklet always returns `FINISHED`            |
+
+## Configuration keys
+
+### `c_configuration` rows
+
+| Key                                          | Default value | Liquibase changeset                                              | Read by                                                       |
+| -------------------------------------------- | ------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
+| `purge-external-events-older-than-days`      | `30`          | `0053_add_external_events_purge_job.xml`                         | `ConfigurationDomainService.retrieveExternalEventsPurgeDaysCriteria` |
+| `external-event-batch-size`                  | `1000`        | `0081_add_configuration_event_producer_batch_size.xml`           | `ConfigurationDomainService.retrieveExternalEventBatchSize`   |
+
+Both rows are seeded with `enabled = false` — applications interpret missing or disabled rows differently:
+
+| Configuration row                           | If `enabled = false`                                                                  |
+| ------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `purge-external-events-older-than-days`     | `retrieveExternalEventsPurgeDaysCriteria()` returns the seeded default (30)           |
+| `external-event-batch-size`                 | Same — returns the seeded `value` (1000)                                              |
+
+To override, change the `value` column and set `enabled = true` via the global-configuration API (`/v1/configurations/{configId}`).
+
+### `application.properties` (sizing)
+
+| Property                                                  | Default | Effect                                                                  |
+| --------------------------------------------------------- | ------- | ----------------------------------------------------------------------- |
+| `fineract.events.external.partition-size`                 | `5000`  | `Lists.partition(eventIds, partitionSize)` for `markEventsSent`         |
+| `fineract.events.external.thread-pool-core-pool-size`     | `2`     | `eventMarksAsSentExecutor` core threads                                 |
+| `fineract.events.external.thread-pool-max-pool-size`      | `25`    | Max threads                                                             |
+| `fineract.events.external.thread-pool-queue-capacity`     | `500`   | Queue capacity                                                          |
+
+### `job.cron_expression`
+
+The Liquibase seed sets the default cron expressions but operators routinely change them. `0049_add_send_asynchronous_events_job.xml` ships `0 0/1 * * *  ?` (every minute) and `is_active = true`; `0053_add_external_events_purge_job.xml` ships `0 1 0 1/1 * ? *` (00:01 every day) and `is_active = false` — the purge job is **off** by default.
+
+## Operator runbook
+
+### "Rows are stacking up — `TO_BE_SENT` grows unbounded"
+
+Step through:
+
+1. Check `fineract.events.external.enabled` — if `false`, no rows are written anyway. Look at the wall-clock count of new rows.
+2. Check `fineract.events.external.producer.{jms,kafka}.enabled` — at least one must be `true` for the send job to act. If both are `false`, the tasklet returns without reading.
+3. Check the `job` table: `is_active`, `cron_expression`, `currently_running`, `previous_run_start_time`. The job is enabled by default; if `is_active = false`, enable it via `/v1/jobs/{jobId}`.
+4. Tail the application log for `Loaded N events in Mms` — that's the send job working.
+5. If the producer is throwing, look for `Error occurred while processing events:` and `Could not send the messages` / `Error while obtaining message producers`.
+
+### "The send job is running but throughput is too slow"
+
+- Increase `external-event-batch-size` from 1000 to 5000–10000 (transactional read; bigger batches = fewer round-trips).
+- Increase `fineract.events.external.producer.jms.producer-count` (JMS) or partitions / `linger.ms` (Kafka).
+- Increase `fineract.events.external.thread-pool-{core,max,queue-capacity}` for the mark-as-sent worker pool.
+- Check broker / consumer-side back-pressure.
+
+### "Outbox table is too big — query plans slow"
+
+- Enable `PURGE_EXTERNAL_EVENTS` (`is_active = true`) so the daily nightly clean runs.
+- Lower `purge-external-events-older-than-days` from 30 to, say, 7.
+- Confirm `m_external_event_status_index` and `m_external_event_business_date_index` exist (`\d+ m_external_event` on PostgreSQL) — they're created by `0043_add_external_event_table.xml`.
+
+### "We had a producer outage and need to replay"
+
+The outbox is durable, but `SENT` rows aren't re-sent automatically. Two options:
+
+1. **Re-emit a window**: `UPDATE m_external_event SET status = 'TO_BE_SENT', sent_at = NULL WHERE id BETWEEN ? AND ?` (or `WHERE business_date = ?`). The next send-job iteration picks them up and re-emits — consumer dedup absorbs the doubled traffic that was already delivered.
+2. **Restore from a backup** if rows were purged before delivery — replay into a new outbox or directly into the downstream.
+
+### "Purge job ran but rows weren't deleted"
+
+The purge only removes `status = SENT`. If the rows you expected gone are `TO_BE_SENT`, you have a stalled send pipeline — see the "stacking up" runbook above.
+
+## Source map
+
+| Path                                                                              | Purpose                            |
+| --------------------------------------------------------------------------------- | ---------------------------------- |
+| `fineract-core/.../jobs/SendAsynchronousEventsConfig.java`                        | Spring Batch job + step beans      |
+| `fineract-core/.../jobs/SendAsynchronousEventsTasklet.java`                       | Read / partition / send / mark-sent|
+| `fineract-core/.../jobs/PurgeExternalEventsConfig.java`                           | Purge job + step beans             |
+| `fineract-core/.../jobs/PurgeExternalEventsTasklet.java`                          | Bulk delete tasklet                |
+| `fineract-core/.../config/EventTaskExecutorConfig.java`                           | `eventMarksAsSentExecutor` bean    |
+| `fineract-core/.../service/JobName.java`                                          | Enum entries                       |
+| `fineract-core/.../service/StepName.java`                                         | Step enum                          |
+| `fineract-core/.../api/GlobalConfigurationConstants.java`                         | Configuration key strings          |
+| `fineract-provider/src/main/resources/db/changelog/tenant/parts/0049_add_send_asynchronous_events_job.xml` | Send job row              |
+| `fineract-provider/src/main/resources/db/changelog/tenant/parts/0053_add_external_events_purge_job.xml`    | Purge job row + config    |
+| `fineract-provider/src/main/resources/db/changelog/tenant/parts/0081_add_configuration_event_producer_batch_size.xml` | Batch size config      |
+
+## Related reading
+
+- [Events Overview](/events/overview)
+- [External Event Domain](/events/external-event-domain) — the table the jobs read from
+- [Event Producer (JMS)](/events/event-producer-jms)
+- [Event Producer (Kafka)](/events/event-producer-kafka)
+- [Event Idempotency](/events/event-idempotency)
+- [Serialization & Mappers](/events/event-serialization-mappers)
+- [Avro Schemas](/events/avro-schemas)
+- [Core: External Events](/core/event-external)
+- [External Event Flow](/flows/external-event-flow)
+- [Job Names](/jobs/job-names-enumeration)
+- [Spring Batch Manager/Worker](/jobs/spring-batch-manager-worker)

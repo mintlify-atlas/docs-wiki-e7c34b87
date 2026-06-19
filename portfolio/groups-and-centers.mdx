@@ -1,0 +1,334 @@
+---
+title: "Groups and Centers: Hierarchy, Workflow and APIs"
+sidebarTitle: "Groups & Centers"
+description: "Reference for the Fineract Group entity, GroupLevel, GroupingTypeStatus, GroupsApiResource and CentersApiResource, with the center → group → client hierarchy."
+---
+
+# Groups and Centers
+
+Groups and centers are the two grouping party types in Apache Fineract.
+Both map to the same `Group` entity and the same `m_group` table — only
+the `level_id` foreign key distinguishes them. A **center** sits at level
+1, a **group** sits at level 2; groups may be standalone or nested under
+a center as a `parent`. Group members are `Client`s through the
+`m_group_client` join table.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `Group`, `GroupLevel`, `GroupRole`, `StaffAssignmentHistory`, `GroupingTypeStatus` | `fineract-core` | `org.apache.fineract.portfolio.group.domain` |
+| `GroupTypes` (CENTER / GROUP discriminator) | `fineract-provider` | `org.apache.fineract.portfolio.group.domain` |
+| `GroupsApiResource`, `CentersApiResource`, `GroupsLevelApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.group.api` |
+| `GroupingTypesWritePlatformService(JpaRepositoryImpl)` | `fineract-provider` | `org.apache.fineract.portfolio.group.service` |
+| `CenterReadPlatformService(Impl)`, `GroupReadPlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.group.service` |
+| `GroupRolesWritePlatformService(JpaRepositoryImpl)` | `fineract-provider` | `org.apache.fineract.portfolio.group.service` |
+
+See [Clients](/portfolio/clients) for the party records that populate
+group members and [Meetings](/portfolio/meetings) /
+[Calendar](/portfolio/calendar) for the collection-schedule infrastructure
+that groups/centers usually carry.
+
+## The Group entity
+
+```java
+@Entity
+@Getter
+@Setter
+@Table(name = "m_group")
+public final class Group extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "external_id", length = 100, unique = true)
+    private String externalId;
+
+    @Column(name = "status_enum", nullable = false)
+    private Integer status;
+
+    @Column(name = "activation_date") private LocalDate activationDate;
+
+    @ManyToOne @JoinColumn(name = "office_id", nullable = false)
+    private Office office;
+
+    @ManyToOne @JoinColumn(name = "staff_id")
+    private Staff staff;
+
+    @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "parent_id")
+    private Group parent;
+
+    @ManyToOne @JoinColumn(name = "level_id", nullable = false)
+    private GroupLevel groupLevel;
+
+    @Column(name = "display_name", length = 100, unique = true)
+    private String name;
+
+    @Column(name = "hierarchy", length = 100)
+    private String hierarchy;
+
+    @OneToMany(fetch = FetchType.EAGER) @JoinColumn(name = "parent_id")
+    private List<Group> groupMembers = new ArrayList<>();
+
+    @ManyToMany
+    @JoinTable(name = "m_group_client",
+        joinColumns = @JoinColumn(name = "group_id"),
+        inverseJoinColumns = @JoinColumn(name = "client_id"))
+    private Set<Client> clientMembers = new HashSet<>();
+
+    @Column(name = "account_no", length = 20, unique = true, nullable = false)
+    private String accountNumber;
+}
+```
+
+### Field map
+
+| Column | Java field | Notes |
+| --- | --- | --- |
+| `external_id` | `externalId` | Unique secondary key for integrators |
+| `status_enum` | `status` | `GroupingTypeStatus` integer |
+| `activation_date` | `activationDate` | Set on activate |
+| `office_id` | `office` | Mandatory; controls visibility |
+| `staff_id` | `staff` | Loan officer |
+| `parent_id` | `parent` | NULL for centers (and standalone groups) |
+| `level_id` | `groupLevel` | FK into `m_group_level` (1 = center, 2 = group) |
+| `display_name` | `name` | Unique across the platform |
+| `hierarchy` | `hierarchy` | Path string like `.1.5.` for fast subtree queries |
+| `account_no` | `accountNumber` | Auto-generated; unique |
+| `submittedon_date` / `submittedon_userid` | submission trail | Audit fields |
+| `closedon_date` / `closedon_userid` / `closure_reason_cv_id` | closure trail | Audit fields |
+
+The same row therefore plays double duty as either a center or a group;
+client code distinguishes by `groupLevel.id`.
+
+## GroupingTypeStatus
+
+```java
+public enum GroupingTypeStatus {
+    INVALID(0,  "groupingStatusType.invalid"),
+    PENDING(100, "groupingStatusType.pending"),
+    ACTIVE(300, "groupingStatusType.active"),
+    TRANSFER_IN_PROGRESS(303, "clientStatusType.transfer.in.progress"),
+    TRANSFER_ON_HOLD(304, "clientStatusType.transfer.on.hold"),
+    CLOSED(600, "groupingStatusType.closed");
+}
+```
+
+Mirrors the client status code space (100/300/600) so dashboards can use
+shared formatters.
+
+| Code | State | Allowed transitions |
+| --- | --- | --- |
+| 100 | `PENDING` | → `ACTIVE` (activate), → DELETE (only if no members) |
+| 300 | `ACTIVE` | → `CLOSED` (close) |
+| 303 | `TRANSFER_IN_PROGRESS` | → `TRANSFER_ON_HOLD`, → `ACTIVE` |
+| 304 | `TRANSFER_ON_HOLD` | → `TRANSFER_IN_PROGRESS`, → `ACTIVE` |
+| 600 | `CLOSED` | terminal |
+
+## GroupTypes
+
+```java
+public enum GroupTypes {
+    INVALID(0L, "lendingStrategy.invalid",  "invalid"),
+    CENTER(1L,  "groupTypes.center",       "center"),
+    GROUP(2L,   "groupTypes.group",        "group");
+}
+```
+
+Used in events and dispatch so listeners can react differently to a
+center-level vs group-level change.
+
+## GroupLevel
+
+`m_group_level` is a tiny lookup with `parent_id` for the hierarchical
+constraint. Default rows:
+
+| `id` | `level_name` | `parent_id` | `super_parent` | `recurring_able` |
+| --- | --- | --- | --- | --- |
+| 1 | `Center` | NULL | true | true |
+| 2 | `Group`  | 1    | false | true |
+
+`Group.groupLevel` is required at insert. The validators check that a
+group's level is a legal child of its parent's level (a group cannot
+parent another group, etc.).
+
+## GroupsApiResource
+
+Mounted at `/v1/groups`. All write endpoints are funneled through
+`CommandsSourceWritePlatformService` so every change is audited.
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/groups/template?officeId=&center=` | Template (offices, staff, levels) | `READ_GROUP` |
+| `GET` | `/v1/groups` | Paged list (filters: `officeId`, `staffId`, `name`, `underHierarchy`, `paged`) | `READ_GROUP` |
+| `GET` | `/v1/groups/{groupId}?associations=…` | Single group | `READ_GROUP` |
+| `POST` | `/v1/groups` | Create | `CREATE_GROUP` |
+| `PUT` | `/v1/groups/{groupId}` | Update | `UPDATE_GROUP` |
+| `DELETE` | `/v1/groups/{groupId}` | Delete (PENDING only) | `DELETE_GROUP` |
+| `POST` | `/v1/groups/{groupId}?command=…` | State / membership / roles | per command |
+| `POST` | `/v1/groups/{groupId}/command/unassign_staff` | Compat path for unassign | `UPDATE_GROUP` |
+| `GET` | `/v1/groups/{groupId}/accounts` | Loans/savings roll-up | `READ_GROUP` |
+| `GET` | `/v1/groups/{groupId}/glimaccounts` | GLIM (group loan, individual monitoring) | `READ_GROUP` |
+| `GET` | `/v1/groups/{groupId}/gsimaccounts` | GSIM (group savings, individual monitoring) | `READ_SAVINGS` |
+| `GET` | `/v1/groups/downloadtemplate` | Bulk-import XLSX | `READ_GROUP` |
+| `POST` | `/v1/groups/uploadtemplate` | Bulk-import upload | `CREATE_GROUP` |
+
+### `command=` switch (groups)
+
+`POST /v1/groups/{groupId}?command=<name>` accepts:
+
+| Command | Effect |
+| --- | --- |
+| `activate` | PENDING → ACTIVE |
+| `associateClients` | Add `Client` ids to `clientMembers` |
+| `disassociateClients` | Remove clients (errors on active JLG loans) |
+| `transferClients` | Move clients to another group (`destinationGroupId`, optional `inheritDestinationGroupLoanOfficer`, `transferActiveLoans`) |
+| `generateCollectionSheet` | Read-only — JLG schedule for a given `calendarId`/`transactionDate` |
+| `saveCollectionSheet` | Bulk JLG repayments + disbursements |
+| `assignStaff` / `unassignStaff` | Loan officer attach/detach (`inheritStaffForClientAccounts` optional) |
+| `close` | Activated → Closed; rejects if any non-closed loans/savings |
+| `assignRole` | Assign a `GroupRole` (CodeValue `GROUPROLE`) to a member |
+| `unassignRole` (`?roleId=`) | Remove a member role |
+| `updateRole` (`?roleId=`) | Update an existing role |
+
+The implementation is the long `if (is(commandParam, "...")) … else if`
+chain in `activateOrGenerateCollectionSheet`, dispatching to
+`CommandWrapperBuilder` methods like `activateGroup`,
+`associateClientsToGroup`, `disassociateClientsFromGroup`,
+`transferClientsBetweenGroups`, `assignGroupStaff`, `closeGroup`,
+`assignRole`, `unassignRole`, `updateRole`, and
+`saveGroupCollectionSheet`. Unknown commands throw
+`UnrecognizedQueryParamException`.
+
+### Create request (group)
+
+```json
+{
+  "officeId": 1,
+  "name": "Roma Sunday Group",
+  "externalId": "RM-SUN-01",
+  "active": false,
+  "submittedOnDate": "27 January 2025",
+  "centerId": 12,
+  "clientMembers": [109, 110, 117],
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+If `centerId` is omitted the group is standalone (no parent). When
+`active=true` an `activationDate` must also be supplied.
+
+### Group roles
+
+`m_group_client_role` joins `(client_id, group_id, role_cv_id)`. The
+`GROUPROLE` system code defines roles like *Group leader*,
+*Treasurer*, *Secretary*. The role write-service is
+`GroupRolesWritePlatformService`.
+
+## CentersApiResource
+
+Mounted at `/v1/centers`.
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/centers/template` | Template | `READ_CENTER` |
+| `GET` | `/v1/centers?paged=true&offset=&limit=` | Paged list | `READ_CENTER` |
+| `GET` | `/v1/centers/{centerId}` | Single center | `READ_CENTER` |
+| `POST` | `/v1/centers` | Create | `CREATE_CENTER` |
+| `PUT` | `/v1/centers/{centerId}` | Update | `UPDATE_CENTER` |
+| `DELETE` | `/v1/centers/{centerId}` | Delete (PENDING only) | `DELETE_CENTER` |
+| `POST` | `/v1/centers/{centerId}?command=…` | State / membership | per command |
+| `GET` | `/v1/centers/{centerId}/accounts` | Group accounts under the center | `READ_CENTER` |
+| `GET` | `/v1/centers/downloadtemplate`, `POST .../uploadtemplate` | Bulk import | per role |
+
+### `command=` switch (centers)
+
+```text
+activate                  → activateCenter
+generateCollectionSheet   → read-only JLG sheet
+saveCollectionSheet       → saveCenterCollectionSheet
+close                     → closeCenter
+associateGroups           → associateGroupsToCenter
+disassociateGroups        → disassociateGroupsFromCenter
+```
+
+(See the `if (is(commandParam, "..."))` chain in `CentersApiResource.activate`.)
+
+## GroupsLevelApiResource
+
+`GET /v1/groups/levels` returns the list of available `GroupLevel` rows
+(used by UIs to render dropdowns when calling
+`POST /v1/groups?levelId=…`).
+
+## Workflow
+
+### Create → Activate → Members → Loans
+
+```text
+              POST /v1/groups            POST .../{id}?command=activate
+   create  ─────────────────────►  ─────────────────────────────►
+   (PENDING)                       (ACTIVE)
+                                          │
+                                          ├─ associateClients (members)
+                                          ├─ assignStaff      (loan officer)
+                                          ├─ create JLG loans (loan/api)
+                                          └─ generate/save CollectionSheet
+                                          │
+                                          ▼
+                                       close
+                                          │
+                                          ▼
+                                       (CLOSED)
+```
+
+### Center → Group hierarchy
+
+```text
+Center (level 1)
+   │ associateGroups
+   ├── Group A (level 2, parent=Center)
+   │      └── clientMembers: 109, 117, 122
+   └── Group B (level 2, parent=Center)
+          └── clientMembers: 201, 207
+```
+
+`Group.hierarchy` is maintained as a path string (`.{parentId}.{ownId}.`)
+similar to office hierarchies, so subtree queries can use a single
+`LIKE 'centerHierarchy%'`.
+
+## Transfers
+
+Group transfers across offices follow the same pattern as client
+transfers: status moves `ACTIVE → TRANSFER_IN_PROGRESS → ACTIVE` and an
+intermediate `TRANSFER_ON_HOLD` can be used to pause for manual review.
+The relevant codes are `303` and `304`.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `GroupNotFoundException` | Bad `groupId` / external id |
+| `InvalidGroupStateTransitionException` | E.g. activate an already active group |
+| `ClientExistInGroupException` | `associateClients` with an already-member |
+| `ClientNotInGroupException` | `disassociateClients` with a non-member |
+| `GroupExistsInCenterException` | `associateGroups` with an already-member |
+| `GroupNotExistsInCenterException` | `disassociateGroups` on a non-member |
+
+## Events emitted
+
+- `GroupCreateBusinessEvent`, `GroupActivateBusinessEvent`,
+  `GroupCloseBusinessEvent`
+- `CenterCreateBusinessEvent`, `CenterActivateBusinessEvent`,
+  `CenterCloseBusinessEvent`
+- `GroupAssociateClientsBusinessEvent`,
+  `GroupDisassociateClientsBusinessEvent`
+- Roles: `GroupRoleAddBusinessEvent`, `GroupRoleRemoveBusinessEvent`
+
+(See `org.apache.fineract.infrastructure.event.business.domain.group`.)
+
+## Cross-references
+
+- [Clients](/portfolio/clients) — member parties
+- [Meetings](/portfolio/meetings),
+  [Calendar](/portfolio/calendar) — group-level meeting schedules
+- [Loan overview](/loan/overview) — JLG / GLIM loans
+- [Savings overview](/savings/overview) — GSIM accounts
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `Office`,
+  `Staff`, `CodeValue`
+- [Portfolio APIs index](/api/portfolio-apis)

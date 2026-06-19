@@ -1,0 +1,496 @@
+---
+title: "Provider Security Config: Basic Auth and OAuth2 Chains"
+sidebarTitle: "Security Config"
+description: "SecurityConfig and AuthorizationServerConfig — how basic-auth and OAuth2 modes build mutually-exclusive Spring Security filter chains over /api/**."
+---
+
+Apache Fineract supports two mutually-exclusive HTTP authentication modes,
+configured by two `@Configuration` classes inside `fineract-provider`:
+
+- **Basic authentication** — `SecurityConfig` in
+  `org.apache.fineract.infrastructure.core.config`.
+- **OAuth2 / JWT** — `AuthorizationServerConfig` in
+  `org.apache.fineract.infrastructure.security.config`.
+
+Exactly one of the two is activated per JVM. Which one is chosen is decided by
+`SecurityValidationConfig` at `@PostConstruct` time. This page walks both
+classes and the validation that gates them. For the deeper security
+architecture (CommandSource auditing, two-factor flows, permission model), see
+[/security/security-config](/security/security-config).
+
+## Activation: SecurityValidationConfig
+
+Both configs are annotated with mutually exclusive
+`@ConditionalOnProperty` predicates:
+
+```java
+@ConditionalOnProperty("fineract.security.basicauth.enabled")    // SecurityConfig
+@ConditionalOnProperty("fineract.security.oauth2.enabled")       // AuthorizationServerConfig
+```
+
+`SecurityValidationConfig` enforces the "exactly one" rule:
+
+```java
+@Configuration
+public class SecurityValidationConfig {
+
+    @Value("${fineract.security.basicauth.enabled}")
+    private Boolean basicAuthEnabled;
+
+    @Value("${fineract.security.oauth2.enabled}")
+    private Boolean oauthEnabled;
+
+    @PostConstruct
+    public void validate() {
+        if (!Boolean.TRUE.equals(basicAuthEnabled) && !Boolean.TRUE.equals(oauthEnabled)) {
+            throw new IllegalArgumentException(
+                "No authentication scheme selected. Please decide if you want to use basic OR OAuth2 authentication.");
+        }
+        if (basicAuthEnabled && oauthEnabled) {
+            throw new IllegalArgumentException(
+                "Too many authentication schemes selected. Please decide if you want to use basic OR OAuth2 authentication.");
+        }
+    }
+}
+```
+
+If both or neither flag is on, bean creation throws and Spring Boot aborts
+startup.
+
+## SecurityConfig — basic authentication chain
+
+Source:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/SecurityConfig.java`
+
+Annotation:
+
+```java
+@Configuration
+@ConditionalOnProperty("fineract.security.basicauth.enabled")
+@EnableMethodSecurity
+public class SecurityConfig { ... }
+```
+
+`@EnableMethodSecurity` (Spring Security 6) enables `@PreAuthorize`,
+`@PostAuthorize`, `@PreFilter` and `@PostFilter` on Fineract's service-layer
+beans.
+
+### filterChain bean
+
+There is exactly one `SecurityFilterChain` bean. It scopes itself to `/api/**`
+and builds an authorization manager pipeline plus a long ordered filter list.
+
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.securityMatcher(API_MATCHER.matcher("/api/**")).authorizeHttpRequests(auth -> {
+
+        List<AuthorizationManager<RequestAuthorizationContext>> authorizationManagers = new ArrayList<>();
+        authorizationManagers.add(fullyAuthenticated());
+
+        if (fineractProperties.getSecurity().getTwoFactor().isEnabled()) {
+            authorizationManagers.add(hasAuthority("TWOFACTOR_AUTHENTICATED"));
+        }
+        ...
+    });
+}
+```
+
+`API_MATCHER` is a static `PathPatternRequestMatcher.Builder`:
+
+```java
+private static final PathPatternRequestMatcher.Builder API_MATCHER = PathPatternRequestMatcher.withDefaults();
+```
+
+Using `PathPatternRequestMatcher` (rather than the legacy `AntPathRequestMatcher`)
+sticks with Spring's recommended path matcher and aligns with the
+`@Path("/api/...")` patterns Jersey enforces.
+
+### Per-endpoint authority matrix
+
+The `filterChain` then encodes a *very* long endpoint → authority map. A
+representative slice (taken verbatim):
+
+```java
+.requestMatchers(API_MATCHER.matcher(HttpMethod.OPTIONS, "/api/**")).permitAll()
+.requestMatchers(API_MATCHER.matcher(HttpMethod.POST, "/api/*/echo")).permitAll()
+.requestMatchers(API_MATCHER.matcher(HttpMethod.POST, "/api/*/authentication")).permitAll()
+.requestMatchers(API_MATCHER.matcher(HttpMethod.PUT, "/api/*/instance-mode")).permitAll()
+// businessdate
+.requestMatchers(API_MATCHER.matcher(HttpMethod.GET, "/api/*/businessdate/*"))
+    .hasAnyAuthority(ALL_FUNCTIONS, ALL_FUNCTIONS_READ, "READ_BUSINESS_DATE")
+.requestMatchers(API_MATCHER.matcher(HttpMethod.POST, "/api/*/businessdate"))
+    .hasAnyAuthority(ALL_FUNCTIONS, ALL_FUNCTIONS_WRITE, "UPDATE_BUSINESS_DATE")
+// external
+.requestMatchers(API_MATCHER.matcher(HttpMethod.GET, "/api/*/externalevents/configuration"))
+    .hasAnyAuthority(ALL_FUNCTIONS, ALL_FUNCTIONS_READ, "READ_EXTERNAL_EVENT_CONFIGURATION")
+```
+
+The constants:
+
+```java
+private static final String ALL_FUNCTIONS = "ALL_FUNCTIONS";
+private static final String ALL_FUNCTIONS_READ = "ALL_FUNCTIONS_READ";
+private static final String ALL_FUNCTIONS_WRITE = "ALL_FUNCTIONS_WRITE";
+```
+
+These map to Fineract's own permission system stored in `m_permission` /
+`m_role_permission`. `ALL_FUNCTIONS` is the superuser flag — granting it to a
+role bypasses every fine-grained check. `ALL_FUNCTIONS_READ` and
+`ALL_FUNCTIONS_WRITE` are coarse read/write grants.
+
+The matrix covers notes, documents, images, payment types, currencies,
+business dates, external events, MIX taxonomy/mapping/reports, working days,
+interest rate charts/slabs, bulk import, and more. New endpoint families are
+expected to add their entries here at the time they are introduced.
+
+### Endpoint patterns to know
+
+- `permitAll` on `OPTIONS /api/**` — preflight bypasses authentication.
+- `permitAll` on `POST /api/*/authentication` — the login endpoint.
+- `permitAll` on `POST /api/*/echo` — used by load balancers as a liveness ping.
+- `permitAll` on `PUT /api/*/instance-mode` — used to flip the instance between
+  read-only / read-write at runtime.
+- Anything not in the matrix falls through to the catch-all `authorizationManagers`
+  chain at the end, which requires `fullyAuthenticated()` plus (optionally)
+  `TWOFACTOR_AUTHENTICATED`.
+
+### Filter chain composition (basic-auth)
+
+After the authorization rules, the chain attaches filters:
+
+```java
+http.csrf(AbstractHttpConfigurer::disable)
+    .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+    .addFilterAfter(tenantAwareBasicAuthenticationFilter(), SecurityContextHolderFilter.class)
+    .addFilterAfter(requestResponseFilter(),       ExceptionTranslationFilter.class)
+    .addFilterAfter(correlationHeaderFilter(),     RequestResponseFilter.class)
+    .addFilterAfter(fineractInstanceModeApiFilter(), CorrelationHeaderFilter.class);
+
+if (!Objects.isNull(loanCOBFilterHelper)) {
+    http.addFilterAfter(loanCOBApiFilter(), FineractInstanceModeApiFilter.class)
+        .addFilterAfter(idempotencyStoreFilter(), LoanCOBApiFilter.class);
+    http.addFilterBefore(progressiveLoanModelCheckerFilter, LoanCOBApiFilter.class);
+} else {
+    http.addFilterAfter(idempotencyStoreFilter(), FineractInstanceModeApiFilter.class);
+    http.addFilterAfter(progressiveLoanModelCheckerFilter, FineractInstanceModeApiFilter.class);
+}
+
+if (fineractProperties.getIpTracking().isEnabled()) {
+    http.addFilterAfter(callerIpTrackingFilter(), RequestResponseFilter.class);
+}
+if (fineractProperties.getSecurity().getTwoFactor().isEnabled()) {
+    http.addFilterAfter(twoFactorAuthenticationFilter(), CorrelationHeaderFilter.class);
+}
+if (serverProperties.getSsl().isEnabled()) {
+    http.requiresChannel(channel ->
+        channel.requestMatchers(API_MATCHER.matcher("/api/**")).requiresSecure());
+}
+if (fineractProperties.getSecurity().getHsts().isEnabled()) {
+    http.requiresChannel(channel -> channel.anyRequest().requiresSecure()).headers(
+        headers -> headers.httpStrictTransportSecurity(
+            hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31536000)));
+}
+if (fineractProperties.getSecurity().getCors().isEnabled()) {
+    http.cors(Customizer.withDefaults());
+}
+```
+
+`SessionCreationPolicy.STATELESS` is the right choice for an API server — no
+`JSESSIONID` cookie is issued and credentials must accompany every request.
+
+Each filter is created from a non-`@Bean` factory method on the configuration —
+they are *not* exposed as application beans on their own (Fineract wires them
+manually so they apply only to the `/api/**` chain and not to any other URL).
+
+### TenantAwareBasicAuthenticationFilter
+
+The custom replacement for Spring's `BasicAuthenticationFilter`:
+
+```java
+public TenantAwareBasicAuthenticationFilter tenantAwareBasicAuthenticationFilter() throws Exception {
+    TenantAwareBasicAuthenticationFilter filter = new TenantAwareBasicAuthenticationFilter(
+            authenticationManagerBean(),
+            basicAuthenticationEntryPoint(),
+            toApiJsonSerializer,
+            configurationDomainService,
+            cacheWritePlatformService,
+            userNotificationService,
+            basicAuthTenantDetailsService,
+            businessDateReadPlatformService);
+    filter.setRequestMatcher(API_MATCHER.matcher("/api/**"));
+    return filter;
+}
+```
+
+It reads `Fineract-Platform-TenantId` from the request, resolves the tenant via
+`AuthTenantDetailsService`, switches the per-tenant `DataSource` on the
+`RoutingDataSource`, decodes the `Authorization: Basic …` header and runs the
+provided credentials through `authenticationManagerBean()` →
+`DaoAuthenticationProvider`.
+
+### DaoAuthenticationProvider and password encoder
+
+```java
+@Bean(name = "customAuthenticationProvider")
+public DaoAuthenticationProvider authProvider() {
+    DaoAuthenticationProvider authProvider = new DaoAuthenticationProvider();
+    authProvider.setUserDetailsService(userDetailsService);    // TenantAwareJpaPlatformUserDetailsService
+    authProvider.setPasswordEncoder(passwordEncoder());
+    authProvider.setPostAuthenticationChecks(platformUserDetailsChecker);
+    return authProvider;
+}
+
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return PasswordEncoderFactories.createDelegatingPasswordEncoder();
+}
+
+@Bean
+public AuthenticationManager authenticationManagerBean() throws Exception {
+    ProviderManager providerManager = new ProviderManager(authProvider());
+    providerManager.setEraseCredentialsAfterAuthentication(false);
+    return providerManager;
+}
+```
+
+- `userDetailsService` is the tenant-aware JPA-backed `UserDetailsService`.
+- `PasswordEncoderFactories.createDelegatingPasswordEncoder()` returns a
+  delegating encoder. The default ID is `bcrypt`; stored hashes are prefixed
+  with `{bcrypt}` / `{argon2}` / `{noop}` etc. so the platform can migrate
+  algorithms over time.
+- `setEraseCredentialsAfterAuthentication(false)` keeps the raw credentials on
+  the `Authentication` object — Fineract's `cacheWritePlatformService` uses
+  them after authentication.
+
+## AuthorizationServerConfig — OAuth2 chain
+
+Source:
+`fineract-provider/src/main/java/org/apache/fineract/infrastructure/security/config/AuthorizationServerConfig.java`
+
+Annotation:
+
+```java
+@Configuration
+@EnableWebSecurity
+@ConditionalOnProperty("fineract.security.oauth2.enabled")
+@EnableConfigurationProperties(FineractProperties.class)
+public class AuthorizationServerConfig { ... }
+```
+
+This class builds **three** `SecurityFilterChain` beans in priority order:
+
+| Order | Bean | Scope |
+| --- | --- | --- |
+| 1 | `publicEndpoints` | Swagger UI, `/fineract.json`, `/actuator/**`, `/legacy-docs/apiLive.htm` |
+| 2 | `authorizationServerSecurityFilterChain` | The OAuth2 token endpoints |
+| 3 | `protectedEndpoints` | Everything else (the `/api/**` surface) |
+
+### publicEndpoints
+
+```java
+@Bean @Order(1)
+public SecurityFilterChain publicEndpoints(HttpSecurity http) throws Exception {
+    http.securityMatcher("/swagger-ui/**", "/fineract.json", "/actuator/**", "/legacy-docs/apiLive.htm")
+        .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+        .csrf(AbstractHttpConfigurer::disable);
+
+    if (fineractProperties.getSecurity().getCors().isEnabled()) {
+        http.cors(Customizer.withDefaults());
+    }
+    return http.build();
+}
+```
+
+These URLs need to be reachable without authentication so docs and health
+probes work.
+
+### authorizationServerSecurityFilterChain
+
+The OAuth2 endpoints themselves (token, authorize, JWKS, …) are configured
+via Spring's `OAuth2AuthorizationServerConfigurer`:
+
+```java
+@Bean @Order(2)
+public SecurityFilterChain authorizationServerSecurityFilterChain(HttpSecurity http) throws Exception {
+    OAuth2AuthorizationServerConfigurer authorizationServerConfigurer = new OAuth2AuthorizationServerConfigurer();
+
+    http.securityMatcher(authorizationServerConfigurer.getEndpointsMatcher())
+        .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
+        .csrf(AbstractHttpConfigurer::disable)
+        .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED))
+        .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(new LoginUrlAuthenticationEntryPoint("/login")))
+        .apply(authorizationServerConfigurer);
+    ...
+}
+```
+
+### protectedEndpoints
+
+The big one — all of `/api/**` plus the filter chain:
+
+```java
+@Bean @Order(3)
+public SecurityFilterChain protectedEndpoints(HttpSecurity http) throws Exception {
+    http.csrf(AbstractHttpConfigurer::disable)
+        .authorizeHttpRequests(auth -> {
+            auth.anyRequest().authenticated();
+            if (fineractProperties.getSecurity().getTwoFactor().isEnabled()) {
+                auth.anyRequest().hasAuthority("TWOFACTOR_AUTHENTICATED");
+            }
+        })
+        .formLogin(form -> form.loginPage("/login")
+                                .authenticationDetailsSource(tenantAuthDetailsSource()).permitAll())
+        .oauth2ResourceServer(rs -> rs.jwt(jwt -> jwt.jwtAuthenticationConverter(authenticationConverter())))
+        .addFilterAfter(tenantAwareAuthenticationFilter(), SecurityContextHolderFilter.class)
+        .addFilterAfter(businessDateFilter(), TenantAwareAuthenticationFilter.class)
+        .addFilterAfter(requestResponseFilter(), ExceptionTranslationFilter.class)
+        .addFilterAfter(correlationHeaderFilter(), RequestResponseFilter.class)
+        .addFilterAfter(fineractInstanceModeApiFilter(), CorrelationHeaderFilter.class);
+    ...
+}
+```
+
+Notable filters:
+
+- **`TenantAwareAuthenticationFilter`** — peers at the
+  `Fineract-Platform-TenantId` header and resolves the tenant before the JWT is
+  validated. The OAuth2 equivalent of `TenantAwareBasicAuthenticationFilter`.
+- **`BusinessDateFilter`** — pins the business date on the per-request context,
+  so any subsequent service call uses the right "as-of" date.
+- **`jwtAuthenticationConverter`** is a `FineractJwtAuthenticationTokenConverter`
+  that maps the `scope` claim → granted authorities and the `tenant` claim →
+  tenant context.
+
+### Registered clients and JWT customizer
+
+OAuth2 clients are populated from `FineractProperties`:
+
+```java
+@Bean
+public RegisteredClientRepository registeredClientRepository(FineractProperties fineractProperties) {
+    List<RegisteredClient> clients = fineractProperties.getSecurity().getOauth2()
+        .getClient().getRegistrations().values().stream()
+        .map(reg -> RegisteredClient.withId(UUID.randomUUID().toString())
+            .clientId(reg.getClientId())
+            .clientAuthenticationMethods(methods -> methods.add(ClientAuthenticationMethod.NONE))
+            .scopes(scopes -> scopes.addAll(reg.getScopes()))
+            .authorizationGrantTypes(grants -> reg.getAuthorizationGrantTypes()
+                .forEach(grant -> grants.add(new AuthorizationGrantType(grant))))
+            .redirectUris(uris -> uris.addAll(reg.getRedirectUris()))
+            .clientSettings(ClientSettings.builder()
+                .requireAuthorizationConsent(reg.isRequireAuthorizationConsent()).build())
+            .build())
+        .toList();
+
+    return new InMemoryRegisteredClientRepository(clients);
+}
+```
+
+So the property file structure is:
+
+```
+fineract.security.oauth2.client.registrations.<key>.clientId
+fineract.security.oauth2.client.registrations.<key>.scopes[]
+fineract.security.oauth2.client.registrations.<key>.authorizationGrantTypes[]
+fineract.security.oauth2.client.registrations.<key>.redirectUris[]
+fineract.security.oauth2.client.registrations.<key>.requireAuthorizationConsent
+```
+
+Issued JWTs include three custom claims (`scope`, `role`, `tenant`):
+
+```java
+@Bean
+public OAuth2TokenCustomizer<JwtEncodingContext> tokenCustomizer() {
+    return context -> {
+        UsernamePasswordAuthenticationToken authentication = context.getPrincipal();
+        TenantAuthenticationDetails details = (TenantAuthenticationDetails) authentication.getDetails();
+        AppUser appUser = (AppUser) authentication.getPrincipal();
+        List<String> roles = appUser.getRoles().stream().map(Role::getName).toList();
+        List<String> scope = appUser.getAuthorities().stream()
+            .map(GrantedAuthority::getAuthority).collect(Collectors.toList());
+        context.getClaims()
+            .claim("scope", scope)
+            .claim("role", roles)
+            .claim("tenant", details.getTenantId());
+    };
+}
+```
+
+The `tenant` claim is essential — without it the resource server cannot route
+requests to the correct per-tenant `DataSource`.
+
+### TenantAuthenticationDetailsSource
+
+The login form is overridden to capture the `tenantId` query/form parameter:
+
+```java
+@Bean
+@Scope("prototype")
+public AuthenticationDetailsSource<HttpServletRequest, TenantAuthenticationDetails> tenantAuthDetailsSource() {
+    return request -> {
+        String tenantId = request.getParameter(TENANT_ID);
+        String username = request.getParameter(UsernamePasswordAuthenticationFilter.SPRING_SECURITY_FORM_USERNAME_KEY);
+        String password = request.getParameter(UsernamePasswordAuthenticationFilter.SPRING_SECURITY_FORM_PASSWORD_KEY);
+        return new TenantAuthenticationDetails(username, tenantId, password);
+    };
+}
+```
+
+`tenantId` is read from the form/query string and attached to the
+`UsernamePasswordAuthenticationToken.details`, then carried through to the
+token customizer above.
+
+## Common building blocks (shared by both modes)
+
+Both `SecurityConfig` and `AuthorizationServerConfig` instantiate the same
+filter helper objects manually:
+
+```java
+public RequestResponseFilter requestResponseFilter() { return new RequestResponseFilter(); }
+public LoanCOBApiFilter loanCOBApiFilter() { return new LoanCOBApiFilter(loanCOBFilterHelper); }
+public TwoFactorAuthenticationFilter twoFactorAuthenticationFilter() {
+    TwoFactorService twoFactorService = applicationContext.getBean(TwoFactorService.class);
+    return new TwoFactorAuthenticationFilter(twoFactorService);
+}
+public FineractInstanceModeApiFilter fineractInstanceModeApiFilter() {
+    return new FineractInstanceModeApiFilter(fineractProperties);
+}
+public IdempotencyStoreFilter idempotencyStoreFilter() {
+    return new IdempotencyStoreFilter(fineractRequestContextHolder, idempotencyStoreHelper, fineractProperties);
+}
+public CorrelationHeaderFilter correlationHeaderFilter() {
+    return new CorrelationHeaderFilter(fineractProperties, mdcWrapper);
+}
+public CallerIpTrackingFilter callerIpTrackingFilter() {
+    return new CallerIpTrackingFilter(fineractProperties);
+}
+```
+
+These are *not* `@Bean`s — they are created on demand so each filter chain
+gets its own instance, and the filters are not registered on the global servlet
+filter list (which would apply them to non-`/api` URLs too).
+
+## Picking a mode in practice
+
+For day-to-day development the default `application.properties` ships with:
+
+```
+fineract.security.basicauth.enabled=true
+fineract.security.oauth2.enabled=false
+```
+
+To switch to OAuth2 you flip both flags and provide at least one client
+registration. Restart the JVM — `SecurityValidationConfig` confirms exactly one
+is enabled, then either `SecurityConfig` or `AuthorizationServerConfig` is
+selected by its `@ConditionalOnProperty`.
+
+## Related pages
+
+- [/security/security-config](/security/security-config) — architectural deep dive
+  into the permission model, COB filter integration and CommandSource auditing.
+- [Web Config](/provider/web-config) — the CORS source and Jersey integration.
+- [Server Application Entrypoint](/provider/server-application-entrypoint) — how
+  `@EnableWebSecurity` is bootstrapped.
+- [Logging and Correlation](/runtime/logging-and-correlation) — the MDC values
+  the correlation filter injects.

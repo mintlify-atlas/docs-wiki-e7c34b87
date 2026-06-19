@@ -1,0 +1,283 @@
+---
+title: "Scheduler API: GET, Start, Stop the Cron Scheduler"
+sidebarTitle: "Scheduler API"
+description: "Reference for SchedulerApiResource at /v1/scheduler — read the suspended flag and toggle the global Quartz scheduler on or off through the start and stop commands."
+---
+
+# Scheduler API (`/v1/scheduler`)
+
+This endpoint is the **global on/off switch** for every cron job in **Apache Fineract**. It does not run a job — it reads or flips `SchedulerDetail.isSuspended`, which `SchedulerVetoer` consults on every Quartz trigger fire. A scheduler that is suspended will keep its cron schedules registered and continue to compute `nextRunTime`, but every fired trigger will be rejected before the target method is invoked.
+
+Source: `org.apache.fineract.infrastructure.jobs.api.SchedulerApiResource` in `fineract-provider`.
+
+For per-job control (cron edits, single-shot execution), see [`/jobs/scheduler-job-api`](/jobs/scheduler-job-api). For the underlying mechanics, see [`/jobs/scheduler-and-quartz`](/jobs/scheduler-and-quartz).
+
+## Resource and permissions
+
+```java
+@Path("/v1/scheduler")
+@Component
+@Tag(name = "Scheduler", description = "")
+public class SchedulerApiResource {
+    // GET — requires READ on SCHEDULER permission
+    // POST — requires "ALL_FUNCTIONS" OR "UPDATE_SCHEDULER" permission
+}
+```
+
+| Endpoint | Permission required | Returned |
+| --- | --- | --- |
+| `GET  /v1/scheduler` | `READ_SCHEDULER` | `SchedulerDetailData` |
+| `POST /v1/scheduler?command=start` | `ALL_FUNCTIONS` or `UPDATE_SCHEDULER` | `202 Accepted` |
+| `POST /v1/scheduler?command=stop` | `ALL_FUNCTIONS` or `UPDATE_SCHEDULER` | `202 Accepted` |
+| `POST /v1/scheduler?command=<anything else>` | — | `UnrecognizedQueryParamException` |
+
+Authorisation is checked through `PlatformSecurityContext.authenticatedUser().validateHasReadPermission(...)` and `.hasNotPermissionForAnyOf(...)`. The string `"SCHEDULER"` is `SchedulerJobApiConstants.SCHEDULER_RESOURCE_NAME`.
+
+## `GET /v1/scheduler`
+
+The method simply asks `JobRegisterService.isSchedulerRunning()` and wraps the answer in `SchedulerDetailData`:
+
+```java
+@GET
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+public String retrieveStatus(@Context final UriInfo uriInfo) {
+    this.context.authenticatedUser().validateHasReadPermission(SchedulerJobApiConstants.SCHEDULER_RESOURCE_NAME);
+    final boolean isSchedulerRunning = this.jobRegisterService.isSchedulerRunning();
+    final ApiRequestJsonSerializationSettings settings =
+            this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    final SchedulerDetailData schedulerDetailData = new SchedulerDetailData().setActive(isSchedulerRunning);
+    return this.toApiJsonSerializer.serialize(
+            settings, schedulerDetailData,
+            SchedulerJobApiConstants.SCHEDULER_DETAIL_RESPONSE_DATA_PARAMETERS);
+}
+```
+
+`isSchedulerRunning()` is the negation of `SchedulerDetail.isSuspended`:
+
+```java
+@Override
+public boolean isSchedulerRunning() {
+    return !this.schedularWritePlatformService.retriveSchedulerDetail().isSuspended();
+}
+```
+
+### Response shape
+
+```json
+{
+  "active": true
+}
+```
+
+`SchedulerDetailData` is a single-field DTO:
+
+```java
+@Data
+@NoArgsConstructor
+@Accessors(chain = true)
+public class SchedulerDetailData {
+    @SuppressWarnings("unused")
+    private boolean active;
+}
+```
+
+The whitelisted parameter set:
+
+```java
+static final Set<String> SCHEDULER_DETAIL_RESPONSE_DATA_PARAMETERS =
+        new HashSet<>(Arrays.asList("active"));
+```
+
+So even if you append `?fields=...`, only `active` will ever be projected.
+
+### Example
+
+```bash
+curl -u admin:password \
+     -H 'Fineract-Platform-TenantId: default' \
+     http://localhost:8080/fineract-provider/api/v1/scheduler
+```
+
+```json
+{
+  "active": false
+}
+```
+
+`active: false` is what you see immediately after a `POST ?command=stop` (or after `scheduler_detail.is_suspended` was flipped in the database). The cron triggers are still registered in Quartz; only the vetoer is suppressing them.
+
+## `POST /v1/scheduler?command=...`
+
+```java
+@POST
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+public Response changeSchedulerStatus(
+        @QueryParam(SchedulerJobApiConstants.COMMAND) final String commandParam) {
+    final boolean hasNotPermission = this.context.authenticatedUser()
+            .hasNotPermissionForAnyOf("ALL_FUNCTIONS", "UPDATE_SCHEDULER");
+    if (hasNotPermission) {
+        throw new NoAuthorizationException("User has no authority to update scheduler status");
+    }
+    Response response = Response.status(400).build();
+    if (is(commandParam, SchedulerJobApiConstants.COMMAND_START_SCHEDULER)) {
+        this.jobRegisterService.startScheduler();
+        response = Response.status(202).build();
+    } else if (is(commandParam, SchedulerJobApiConstants.COMMAND_STOP_SCHEDULER)) {
+        this.jobRegisterService.pauseScheduler();
+        response = Response.status(202).build();
+    } else {
+        throw new UnrecognizedQueryParamException(SchedulerJobApiConstants.COMMAND, commandParam);
+    }
+    return response;
+}
+```
+
+The accepted command strings come from `SchedulerJobApiConstants`:
+
+```java
+public static final String COMMAND_EXECUTE_JOB     = "executeJob";
+public static final String COMMAND_STOP_SCHEDULER  = "stop";
+public static final String COMMAND_START_SCHEDULER = "start";
+public static final String COMMAND                 = "command";
+```
+
+`executeJob` is **not** valid on `/v1/scheduler` — it lives on `/v1/jobs/{id}`. Calling `/v1/scheduler?command=executeJob` raises `UnrecognizedQueryParamException`.
+
+### What `start` does internally
+
+```java
+@Override
+public void startScheduler() {
+    final SchedulerDetail schedulerDetail = this.schedularWritePlatformService.retriveSchedulerDetail();
+    if (schedulerDetail.isSuspended()) {
+        schedulerDetail.setSuspended(false);
+        this.schedularWritePlatformService.updateSchedulerDetail(schedulerDetail);
+        if (schedulerDetail.isExecuteInstructionForMisfiredJobs()) {
+            final List<ScheduledJobDetail> scheduledJobDetails = this.schedularWritePlatformService
+                    .retrieveAllJobs(fineractProperties.getNodeId());
+            for (final ScheduledJobDetail jobDetail : scheduledJobDetails) {
+                if (jobDetail.isTriggerMisfired()) {
+                    if (jobDetail.isActiveSchedular()) {
+                        executeJob(jobDetail, SchedulerServiceConstants.TRIGGER_TYPE_CRON, Collections.emptySet());
+                        jobDetail.setMismatchedJob(false);
+                    }
+                    // refresh next run time from the trigger
+                    jobDetail.setTriggerMisfired(false);
+                    this.schedularWritePlatformService.saveOrUpdate(jobDetail);
+                }
+            }
+        }
+    }
+}
+```
+
+Sequence:
+
+1. Read `SchedulerDetail`.
+2. If already running, do nothing.
+3. Otherwise flip `isSuspended` to `false` and persist.
+4. If `isExecuteInstructionForMisfiredJobs` is on, walk every `ScheduledJobDetail` owned by this node. For each row whose `is_misfired = true`:
+   - Execute the job now (cron trigger type) if it is still active.
+   - Clear `is_mismatched_job` (because we just executed it).
+   - Refresh `next_run_time` from the trigger.
+   - Clear `is_misfired`.
+
+`isExecuteInstructionForMisfiredJobs` is itself a column on `scheduler_detail` and defaults to true in the seed data. Operators who want a "silent" resume can set it to `false`.
+
+### What `stop` does internally
+
+```java
+@Override
+public void pauseScheduler() {
+    final SchedulerDetail schedulerDetail = this.schedularWritePlatformService.retriveSchedulerDetail();
+    if (!schedulerDetail.isSuspended()) {
+        schedulerDetail.setSuspended(true);
+        this.schedularWritePlatformService.updateSchedulerDetail(schedulerDetail);
+    }
+}
+```
+
+Quartz keeps running. Triggers keep firing. `SchedulerVetoer.veto` rejects every fire by reading `SchedulerDetail.isSuspended`. That means:
+
+- `BATCH_JOB_EXECUTION` rows are **not** created during a suspended window.
+- `ScheduledJobRunHistory` rows are **not** created either (the listener only persists when execution actually completes).
+- A `nextRunTime` update still happens through the trigger's own `getNextFireTime()` resolution.
+- Pending Spring Batch jobs already in flight when `stop` is called are **not** interrupted; the suspension only blocks future triggers.
+
+### Examples
+
+Stop:
+
+```bash
+curl -u admin:password -X POST \
+     -H 'Fineract-Platform-TenantId: default' \
+     'http://localhost:8080/fineract-provider/api/v1/scheduler?command=stop'
+# HTTP/1.1 202 Accepted
+```
+
+Start (and replay misfires):
+
+```bash
+curl -u admin:password -X POST \
+     -H 'Fineract-Platform-TenantId: default' \
+     'http://localhost:8080/fineract-provider/api/v1/scheduler?command=start'
+# HTTP/1.1 202 Accepted
+```
+
+Unknown command:
+
+```bash
+curl -u admin:password -X POST \
+     -H 'Fineract-Platform-TenantId: default' \
+     'http://localhost:8080/fineract-provider/api/v1/scheduler?command=reset'
+# HTTP/1.1 400 Bad Request
+# { "developerMessage": "Unrecognized query parameter ..." }
+```
+
+The page directive mentions a `reset` command — the source code does **not** implement one. `reset` semantics are achieved by `SchedulerDetail.isResetSchedulerOnBootup`, applied automatically by `JobSchedulerServiceImpl` on context refresh.
+
+## Decision flow
+
+```mermaid
+flowchart TD
+    A[Request: POST /v1/scheduler?command=...] --> B{User has<br/>ALL_FUNCTIONS or<br/>UPDATE_SCHEDULER?}
+    B -- no --> X[NoAuthorizationException 401]
+    B -- yes --> C{command}
+    C -->|start| D[JobRegisterService.startScheduler]
+    C -->|stop|  E[JobRegisterService.pauseScheduler]
+    C -->|other| F[UnrecognizedQueryParamException 400]
+    D --> G[202 Accepted]
+    E --> G
+    D --> H{isExecuteInstructionForMisfiredJobs?}
+    H -- yes --> I[For each is_misfired job<br/>re-run + clear flags]
+    H -- no --> J[end]
+```
+
+## Behaviour summary
+
+| Aspect | Behaviour |
+| --- | --- |
+| Idempotent on `stop` | Yes. Repeated calls have no additional effect. |
+| Idempotent on `start` | Mostly — but if `isExecuteInstructionForMisfiredJobs` is true and there are misfires, the start will execute them. Repeated immediate calls will not re-execute already-cleared misfires. |
+| Multi-node | The flag lives in the **tenant** schema (`scheduler_detail`), so flipping it from any node affects every batch-manager node sharing that tenant. |
+| Per-tenant | Yes — `SchedulerDetail` is a per-tenant row, so `start`/`stop` only affects the tenant on the request's `Fineract-Platform-TenantId` header. |
+| HTTP semantics | Both `start` and `stop` return `202 Accepted` to signal "command queued for processing"; the flag change itself is synchronous in the same transaction. |
+
+## Related commands wrapper paths
+
+The `commands` module wraps `executeScheduler`-style writes in the `CommandWrapper` pipeline. The handlers under `org.apache.fineract.infrastructure.jobs.handler` are:
+
+- `UpdateJobDetailCommandhandler` — for `PUT /v1/jobs/{id}`.
+- `ExecuteJobCommandHandler` — for `POST /v1/jobs/{id}?command=executeJob`.
+
+`POST /v1/scheduler` does **not** route through a `CommandWrapper`; it calls `JobRegisterService` directly. This is the only write endpoint in the jobs layer that bypasses the maker-checker pipeline. If you need maker-checker on the suspend/resume flag, you have to gate it externally (e.g. with an API gateway policy) — there is no `entity = "SCHEDULER", action = "UPDATE"` handler in tree.
+
+## Related pages
+
+- [`/jobs/scheduler-and-quartz`](/jobs/scheduler-and-quartz) — how the suspended flag is enforced.
+- [`/jobs/scheduler-job-api`](/jobs/scheduler-job-api) — per-job CRUD and execute.
+- [`/jobs/inline-job-api`](/jobs/inline-job-api) — synchronous inline COB execution (bypasses scheduler entirely).
+- [`/jobs/overview`](/jobs/overview) — high-level subsystem map.
+- [`/api/jobs-and-cob-apis`](/api/jobs-and-cob-apis) — REST-catalogue view of the same surface.

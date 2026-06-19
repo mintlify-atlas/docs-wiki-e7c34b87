@@ -1,0 +1,461 @@
+---
+title: "Ad-Hoc Query: Saved SQL Reports and Scheduled Execution"
+sidebarTitle: "Ad-Hoc Query"
+description: "Reference for Fineract's AdHocApiResource at /v1/adhocquery, the AdHoc entity, and the GENERATE_ADHOC_CLIENT_SCHEDULE Spring Batch job."
+---
+
+The Ad-Hoc Query module under `org.apache.fineract.adhocquery` lets
+operators store named SQL queries and have them executed on a schedule
+into a destination table. It is not strictly part of the credit bureau
+package but is grouped here on the wiki because credit bureau ETL flows
+(score backfills, NRC-keyed batches) are the most common consumers. The
+REST resource lives at `/v1/adhocquery`, the entity is `AdHoc` in
+`m_adhoc`, and the actual scheduled execution runs through Spring Batch as
+the `GENERATE_ADHOC_CLIENT_SCHEDULE` job.
+
+## Package layout
+
+| Sub-package | Purpose |
+| --- | --- |
+| `api/` | `AdHocApiResource` (`/v1/adhocquery`), `AdHocJsonInputParams` enum |
+| `domain/` | `AdHoc` JPA entity, `AdHocRepository`, `ReportRunFrequency` enum |
+| `data/` | `AdHocData` (response), `AdHocRequest` (request body) |
+| `service/` | `AdHocReadPlatformServiceImpl`, `AdHocWritePlatformServiceJpaRepositoryImpl`, `AdHocDataValidator` |
+| `handler/` | `CreateAdHocCommandHandler`, `UpdateAdHocCommandHandler`, `DeleteAdHocCommandHandler` |
+| `exception/` | `AdHocNotFoundException` |
+| `starter/` | `AdhocQueryConfiguration` (Spring `@Configuration`) |
+
+The scheduled job that actually executes the stored SQL is in a different
+package: `org.apache.fineract.portfolio.savings.jobs.generateadhocclientschhedule`.
+
+## REST resource
+
+Source: `adhocquery/api/AdHocApiResource.java`.
+
+```java
+@Path("/v1/adhocquery")
+@Component
+@Tag(name = "AdhocQuery Api", description = "")
+@RequiredArgsConstructor
+public class AdHocApiResource {
+
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = new HashSet<>(
+        Arrays.asList("id", "name", "query", "tableName", "tableField", "isActive",
+                      "createdBy", "createdOn", "createdById", "updatedById",
+                      "updatedOn", "email"));
+
+    private final PlatformSecurityContext context;
+    private final AdHocReadPlatformService adHocReadPlatformService;
+    private final DefaultToApiJsonSerializer<AdHocData> toApiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+```
+
+### Endpoint matrix
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/v1/adhocquery` | `retrieveAll()` → `List<AdHocData>` |
+| `GET` | `/v1/adhocquery/template` | `template()` → empty `AdHocData` with `reportRunFrequencies` enum options |
+| `POST` | `/v1/adhocquery` | `createAdHocQuery(adHocRequest)` → `CommandProcessingResult` |
+| `GET` | `/v1/adhocquery/{adHocId}` | `retrieveAdHocQuery(adHocId)` → `AdHocData` |
+| `PUT` | `/v1/adhocquery/{adHocId}` | `update(adHocId, adHocRequest)` |
+| `DELETE` | `/v1/adhocquery/{adHocId}` | `deleteAdHocQuery(adHocId)` |
+
+All operations call `this.context.authenticatedUser()` first; writes route
+through the [command pipeline](/command/overview).
+
+```java
+@POST
+public CommandProcessingResult createAdHocQuery(final AdHocRequest adHocRequest) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createAdHoc()
+            .withJson(toApiJsonSerializer.serialize(adHocRequest)).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The `template` endpoint pre-populates the dropdown of `reportRunFrequencies`
+via:
+
+```java
+public static AdHocData template() {
+    List<EnumOptionData> reportRunFrequencies = Arrays.stream(ReportRunFrequency.values())
+            .map(rrf -> new EnumOptionData(rrf.getValue(), rrf.getCode(), rrf.getCode()))
+            .collect(Collectors.toList());
+    return new AdHocData().setReportRunFrequencies(reportRunFrequencies);
+}
+```
+
+## AdHoc entity
+
+Source: `adhocquery/domain/AdHoc.java`. Table `m_adhoc`. Extends
+`AbstractAuditableCustom`, so it automatically carries `createdby_id`,
+`created_date`, `lastmodifiedby_id`, `lastmodified_date`.
+
+```java
+@Entity
+@Table(name = "m_adhoc")
+@Getter @Setter @NoArgsConstructor @Accessors(chain = true)
+public class AdHoc extends AbstractAuditableCustom {
+
+    @Column(name = "name", length = 100)         private String name;
+    @Column(name = "query", length = 2000)       private String query;
+    @Column(name = "table_name", length = 100)   private String tableName;
+    @Column(name = "table_fields", length = 2000) private String tableFields;
+    @Column(name = "email", length = 500)        private String email;
+
+    @Column(name = "report_run_frequency_code")  private Long reportRunFrequency;
+    @Column(name = "report_run_every")           private Long reportRunEvery;
+
+    @Column(name = "is_active", nullable = false) private boolean active;
+```
+
+| Column | Type | Length | Purpose |
+| --- | --- | --- | --- |
+| `id` | `BIGINT` | — | PK |
+| `name` | `VARCHAR(100)` | 100 | Unique business name; enforced by `unq_name` constraint |
+| `query` | `VARCHAR(2000)` | 2000 | Selectable SQL body |
+| `table_name` | `VARCHAR(100)` | 100 | Destination table |
+| `table_fields` | `VARCHAR(2000)` | 2000 | Comma-separated column list of the destination table |
+| `email` | `VARCHAR(500)` | 500 | Optional notification email (consumed by external mailer) |
+| `report_run_frequency_code` | `BIGINT` | — | Maps to `ReportRunFrequency.value` |
+| `report_run_every` | `BIGINT` | — | Used by `CUSTOM` frequency: days between runs |
+| `is_active` | `BOOLEAN` | — | Only active queries are picked up by the job |
+| `last_run` | `TIMESTAMP(6)` | — | Updated by the Spring Batch tasklet after each run |
+| `created_date`, `createdby_id`, `lastmodified_date`, `lastmodifiedby_id` | inherited from `AbstractAuditableCustom` | | |
+
+### fromJson
+
+```java
+public static AdHoc fromJson(final JsonCommand command) {
+    final String name = command.stringValueOfParameterNamed(AdHocJsonInputParams.NAME.getValue());
+    final String query = command.stringValueOfParameterNamed(AdHocJsonInputParams.QUERY.getValue());
+    final String tableName = command.stringValueOfParameterNamed(AdHocJsonInputParams.TABLENAME.getValue());
+    final String tableFields = command.stringValueOfParameterNamed(AdHocJsonInputParams.TABLEFIELDS.getValue());
+    final String email = command.stringValueOfParameterNamed(AdHocJsonInputParams.EMAIL.getValue());
+    final Long reportRunFrequency = command.longValueOfParameterNamed(AdHocJsonInputParams.REPORT_RUN_FREQUENCY.getValue());
+    final Long reportRunEvery = command.longValueOfParameterNamed(AdHocJsonInputParams.REPORT_RUN_EVERY.getValue());
+    final boolean active = command.booleanPrimitiveValueOfParameterNamed(AdHocJsonInputParams.ACTIVE.getValue());
+
+    return new AdHoc()
+            .setName(StringUtils.defaultIfEmpty(name, null))
+            .setQuery(StringUtils.defaultIfEmpty(query, null))
+            .setTableName(StringUtils.defaultIfEmpty(tableName, null))
+            .setTableFields(StringUtils.defaultIfEmpty(tableFields, null))
+            .setEmail(StringUtils.defaultIfEmpty(email, null))
+            .setReportRunFrequency(reportRunFrequency)
+            .setReportRunEvery(reportRunEvery)
+            .setActive(false);
+}
+```
+
+Note that even when the request body has `"isActive": true`, `fromJson`
+hardcodes `setActive(false)` on creation — activation is performed
+separately via the toggle methods on the write service.
+
+## AdHocJsonInputParams
+
+```java
+public enum AdHocJsonInputParams {
+    ID("id"),
+    NAME("name"),
+    QUERY("query"),
+    TABLENAME("tableName"),
+    TABLEFIELDS("tableFields"),
+    ACTIVE("isActive"),
+    REPORT_RUN_FREQUENCY("reportRunFrequency"),
+    REPORT_RUN_EVERY("reportRunEvery"),
+    EMAIL("email");
+}
+```
+
+These are the **only** parameters accepted by `AdHocDataValidator`.
+
+## ReportRunFrequency
+
+Source: `adhocquery/domain/ReportRunFrequency.java`.
+
+```java
+public enum ReportRunFrequency {
+    DAILY  (1, "reportRunFrequency.daily"),
+    WEEKLY (2, "reportRunFrequency.weekly"),
+    MONTHLY(3, "reportRunFrequency.monthly"),
+    YEARLY (4, "reportRunFrequency.yearly"),
+    CUSTOM (5, "reportRunFrequency.custom");
+}
+```
+
+The persisted column `report_run_frequency_code` stores the `value`
+(1–5). `CUSTOM` requires `report_run_every` (days between runs).
+
+## AdHocRequest / AdHocData
+
+`adhocquery/data/AdHocRequest.java` is the request body:
+
+```java
+@Data @NoArgsConstructor @AllArgsConstructor
+public class AdHocRequest implements Serializable {
+    private Long    id;
+    private String  name;
+    private String  query;
+    private String  tableName;
+    private String  tableFields;
+    private String  email;
+    private Long    reportRunFrequency;
+    private Long    reportRunEvery;
+    private Boolean isActive;
+}
+```
+
+`AdHocData` is the response — adds `createdOn`, `createdById`,
+`updatedById`, `updatedOn`, `createdBy` (username), `lastRun`, and the
+`reportRunFrequencies` enum list (for templates).
+
+## AdHocReadPlatformServiceImpl
+
+The read service uses a single `AdHocMapper` schema (joining
+`m_appuser` twice to produce `createdBy` username):
+
+```java
+" r.id as id, r.name as name, r.query as query, "
++ " r.table_name as tableName, r.table_fields as tableField, "
++ " r.is_active as isActive, r.email as email, "
++ " r.report_run_frequency_code, r.report_run_every, r.last_run, "
++ " r.created_date as createdDate, r.createdby_id as createdById, "
++ " cb.username as createdBy, "
++ " r.lastmodifiedby_id as updatedById, "
++ " r.lastmodified_date as updatedOn "
++ " from m_adhoc r "
++ " left join m_appuser cb on cb.id=r.createdby_id "
++ " left join m_appuser mb on mb.id=r.lastmodifiedby_id"
+```
+
+`retrieveAllActiveAdHocQuery()` adds `where r.is_active = true`, escaped
+through `DatabaseSpecificSQLGenerator` for portability across MySQL and
+PostgreSQL.
+
+`retrieveOne(id)` throws `AdHocNotFoundException(id, e)` on
+`EmptyResultDataAccessException`.
+
+## AdHocDataValidator
+
+Source: `adhocquery/service/AdHocDataValidator.java`.
+
+| Parameter | Create rules | Update rules |
+| --- | --- | --- |
+| `name` | notBlank, ≤ 100 | notBlank, ≤ 100 (if present) |
+| `query` | notBlank, ≤ 2000 | notBlank, ≤ 2000 (if present) |
+| `tableName` | notBlank, ≤ 100 | notBlank, ≤ 100 (if present) |
+| `tableFields` | notBlank, ≤ 1000 | notBlank, ≤ 2000 (if present) |
+| `email` | ignoreIfNull, ≤ 500 | ignoreIfNull, ≤ 500 (if present) |
+| `reportRunFrequency` | optional, in `[DAILY.value, CUSTOM.value]` | same (if present) |
+| `reportRunEvery` | optional, integerGreaterThanZero | optional, integerGreaterThanZero |
+
+```java
+private static final Set<String> supportedParameters = new HashSet<>(
+    Arrays.asList(NAME, QUERY, TABLE_NAME, TABLE_FIELDS, EMAIL,
+                  "isActive", REPORT_RUN_FREQUENCY, REPORT_RUN_EVERY));
+```
+
+Any other parameter results in `PlatformApiDataValidationException`.
+
+## AdHocWritePlatformServiceJpaRepositoryImpl
+
+Source: `adhocquery/service/AdHocWritePlatformServiceJpaRepositoryImpl.java`.
+The create path uses the SQL validator to harden against injection:
+
+```java
+String commandQuery = command.stringValueOfParameterNamed(
+        AdHocJsonInputParams.QUERY.getValue());
+sqlValidator.validate("adhoc", commandQuery);
+```
+
+The validator (`SqlValidator` in `infrastructure.security.service`) parses
+the SQL and rejects multi-statement or DDL queries. See
+[Security services](/core/security-services).
+
+Duplicate `name`s trigger:
+
+```java
+if (realCause.getMessage().contains("unq_name")) {
+    throw new PlatformDataIntegrityException(
+        "error.msg.adhocquery.duplicate.name",
+        "AdHocQuery with name `" + name + "` already exists", "name", name);
+}
+```
+
+### Toggle methods
+
+The write service exposes `disableAdHocQuery(Long)` and
+`enableAdHocQuery(Long)` — note the inverted semantics in the current
+source:
+
+```java
+@Override
+public CommandProcessingResult disableAdHocQuery(Long adHocId) {
+    ...
+    adHoc.setActive(true);   // <-- yes, "disable" sets active = true
+    this.adHocRepository.save(adHoc);
+    ...
+}
+
+@Override
+public CommandProcessingResult enableAdHocQuery(Long adHocId) {
+    ...
+    adHoc.setActive(false);
+    this.adHocRepository.save(adHoc);
+    ...
+}
+```
+
+The names are misleading in the codebase — preserved here verbatim for
+fidelity. Callers should rely on the value, not the method name.
+
+## Command handlers
+
+| Handler | `@CommandType` |
+| --- | --- |
+| `CreateAdHocCommandHandler` | `entity = "ADHOC"`, `action = "CREATE"` |
+| `UpdateAdHocCommandHandler` | `entity = "ADHOC"`, `action = "UPDATE"` |
+| `DeleteAdHocCommandHandler` | `entity = "ADHOC"`, `action = "DELETE"` |
+
+Resolved by `CommandWrapperBuilder.createAdHoc()`, `.updateAdHoc(adHocId)`,
+`.deleteAdHoc(adHocId)`. See [commands framework](/command/overview).
+
+## Scheduled execution
+
+Source: `portfolio/savings/jobs/generateadhocclientschhedule/`
+(`GenerateAdhocClientScheduleConfig.java` and
+`GenerateAdhocClientScheduleTasklet.java`). Registered under
+`JobName.GENERATE_ADHOC_CLIENT_SCHEDULE = "Generate AdhocClient Schedule"`.
+
+Note: the docs/`docs.json` parent prompt references this as the
+"RUN_ADHOC_QUERY" job, but the actual `JobName` enum value in this
+codebase is `GENERATE_ADHOC_CLIENT_SCHEDULE`.
+
+```java
+@Bean
+public Job generateAdhocClientScheduleJob() {
+    return new JobBuilder(JobName.GENERATE_ADHOC_CLIENT_SCHEDULE.name(), jobRepository)
+            .start(generateAdhocClientScheduleStep())
+            .incrementer(new RunIdIncrementer()).build();
+}
+```
+
+### Tasklet
+
+```java
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) {
+    final Collection<AdHocData> adhocs = adHocReadPlatformService.retrieveAllActiveAdHocQuery();
+    if (!adhocs.isEmpty()) {
+        adhocs.forEach(adhoc -> {
+            boolean run = true;
+            LocalDate next = null;
+            if (adhoc.getReportRunFrequency() != null) {
+                if (adhoc.getLastRun() != null) {
+                    LocalDate start = adhoc.getLastRun().toLocalDate();
+                    LocalDate end = ZonedDateTime.now(DateUtils.getDateTimeZoneOfTenant()).toLocalDate();
+                    switch (ReportRunFrequency.fromId(adhoc.getReportRunFrequency())) {
+                        case DAILY -> {
+                            next = start.plusDays(1);
+                            run = DateUtils.getExactDifferenceInDays(start, end) >= 1;
+                        }
+                        case WEEKLY -> {
+                            next = start.plusDays(7);
+                            run = DateUtils.getExactDifferenceInDays(start, end) >= 7;
+                        }
+                        case MONTHLY -> {
+                            next = start.plusMonths(1);
+                            run = DateUtils.getExactDifference(start, end, ChronoUnit.MONTHS) >= 1;
+                        }
+                        case YEARLY -> {
+                            next = start.plusYears(1);
+                            run = DateUtils.getExactDifference(start, end, ChronoUnit.YEARS) >= 1;
+                        }
+                        case CUSTOM -> {
+                            next = start.plusDays((long) adhoc.getReportRunEvery());
+                            run = DateUtils.getExactDifferenceInDays(start, end) >= adhoc.getReportRunEvery();
+                        }
+                    }
+                }
+            }
+
+            if (run) {
+                final StringBuilder insertSqlBuilder = new StringBuilder(900);
+                insertSqlBuilder.append("INSERT INTO ").append(adhoc.getTableName())
+                                .append("(").append(adhoc.getTableFields()).append(") ")
+                                .append(adhoc.getQuery());
+                if (!insertSqlBuilder.isEmpty()) {
+                    final int result = jdbcTemplate.update(insertSqlBuilder.toString());
+                    log.debug("{}: Records affected by generateClientSchedule: {}",
+                              ThreadLocalContextUtil.getTenant().getName(), result);
+                    jdbcTemplate.update("UPDATE m_adhoc SET last_run=? WHERE id=?",
+                                        new Date(), adhoc.getId());
+                }
+            }
+        });
+    }
+}
+```
+
+The composed SQL has the shape:
+
+```sql
+INSERT INTO <tableName> (<tableFields>) <query>
+```
+
+That is, the saved `query` is a `SELECT` that produces rows matching the
+destination column list. After execution, `last_run` is updated.
+
+### Frequency truthtable
+
+| Frequency | Run condition |
+| --- | --- |
+| `DAILY` | `today - lastRun >= 1 day` |
+| `WEEKLY` | `today - lastRun >= 7 days` |
+| `MONTHLY` | `today - lastRun >= 1 month` (calendar months) |
+| `YEARLY` | `today - lastRun >= 1 year` |
+| `CUSTOM` | `today - lastRun >= reportRunEvery days` |
+
+If `lastRun` is null (first ever run), the query executes immediately.
+
+## Sample create
+
+```http
+POST /api/v1/adhocquery
+Content-Type: application/json
+
+{
+  "name": "DailyOverduesSummary",
+  "query": "SELECT branch_id, COUNT(*) FROM m_loan WHERE overdue_since_date < CURRENT_DATE GROUP BY branch_id",
+  "tableName": "rpt_daily_overdue_summary",
+  "tableFields": "branch_id, overdue_count",
+  "reportRunFrequency": 1,
+  "email": "reports@example.org",
+  "isActive": true
+}
+```
+
+Note: `isActive` in the request is ignored by `fromJson` — call the
+toggle endpoint, or update with `PUT /v1/adhocquery/{id}` to flip it.
+
+## Security
+
+The resource only checks `authenticatedUser()`. Per-command authorisation
+(`CREATE_ADHOC`, `UPDATE_ADHOC`, `DELETE_ADHOC`) is performed downstream in
+`logCommandSource`. Because the user-supplied `query` is executed verbatim,
+operators **must** restrict who can create AdHocQuery entries.
+`sqlValidator.validate("adhoc", commandQuery)` further blocks
+multi-statement and DDL queries — see [Security services](/core/security-services).
+
+## See also
+
+- [Credit bureau overview](/creditbureau/overview)
+- [Configuration API](/creditbureau/configuration-api)
+- [Integration API](/creditbureau/integration-api)
+- [Commands framework](/command/overview)
+- [Jobs domain](/core/jobs-domain) for `JobName` enum and the
+  `GENERATE_ADHOC_CLIENT_SCHEDULE` job
+- [Security services](/core/security-services) — `SqlValidator`
+- [User administration domain](/core/useradministration-domain)
+- [`/api/adhoc-query`](/api/adhoc-query) — public API page

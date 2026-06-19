@@ -1,0 +1,328 @@
+---
+title: "Provisioning Categories — Standard, Sub-Standard, Doubtful and Loss"
+sidebarTitle: "Provisioning Categories"
+description: "Apache Fineract ProvisioningCategory entity, the four bootstrap categories, ProvisioningCategoryApiResource CRUD endpoints and category usage in criteria."
+---
+
+In Apache Fineract a **`ProvisioningCategory`** is a named bucket — `STANDARD`, `SUB-STANDARD`, `DOUBTFUL`, `LOSS` — that anchors one row of a [provisioning criteria](/organisation/provisioning-criteria) definition table. Categories are deliberately separated from criteria so multiple criteria (per regulator, per geography, per product family) can reuse the same nomenclature. The platform ships four seed rows and exposes a small CRUD via `ProvisioningCategoryApiResource` (`/v1/provisioningcategory`).
+
+<Note>
+Categories are *not* enum constants in Java — they are persisted rows. The four seeded values (`STANDARD`, `SUB-STANDARD`, `DOUBTFUL`, `LOSS`) are conventional but additional categories can be inserted; downstream code looks them up by id, not by name.
+</Note>
+
+## Module layout
+
+| Layer | Class | Module |
+| --- | --- | --- |
+| Entity | `ProvisioningCategory` | `fineract-provider` |
+| Data | `ProvisioningCategoryData` | `fineract-core` |
+| Repository | `ProvisioningCategoryRepository` | `fineract-provider` |
+| Read service | `ProvisioningCategoryReadPlatformService` (interface in core) / `ProvisioningCategoryReadPlatformServiceImpl` | core / provider |
+| Write service | `ProvisioningCategoryWritePlatformService` (interface in core) / `ProvisioningCategoryWritePlatformServiceJpaRepositoryImpl` | core / provider |
+| Validator | `ProvisioningCategoryDefinitionJsonDeserializer` | `fineract-provider` |
+| Handlers | `CreateProvisioningCategoryRequestCommandHandler`, `UpdateProvisioningCategoryRequestCommandHandler`, `DeleteProvisioningCategoryRequestCommandHandler` | `fineract-provider` |
+| JAX-RS | `ProvisioningCategoryApiResource` (`/v1/provisioningcategory`) | `fineract-provider` |
+| Exceptions | `ProvisioningCategoryNotFoundException`, `ProvisioningCategoryCannotBeDeletedException` | `fineract-provider` |
+
+## `ProvisioningCategory` entity
+
+```java
+// fineract-provider/.../provisioning/domain/ProvisioningCategory.java
+@Entity
+@Table(name = "m_provision_category",
+       uniqueConstraints = { @UniqueConstraint(columnNames = {"category_name"}, name = "category_name") })
+public class ProvisioningCategory extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "category_name", nullable = false, unique = true)
+    private String categoryName;
+
+    @Column(name = "description", nullable = true)
+    private String categoryDescription;
+
+    public static ProvisioningCategory fromJson(JsonCommand jsonCommand) {
+        final String categoryName  = jsonCommand.stringValueOfParameterNamed("categoryname");
+        final String description   = jsonCommand.stringValueOfParameterNamed("description");
+        return new ProvisioningCategory(categoryName, description);
+    }
+}
+```
+
+### Column inventory
+
+| Column | Field | Constraint | Meaning |
+| --- | --- | --- | --- |
+| `id` | inherited | PK | Surrogate id used by `ProvisioningCriteriaDefinition.category_id` FK |
+| `category_name` | `categoryName` | unique, `NOT NULL` | Display name (uppercase by convention) |
+| `description` | `categoryDescription` | nullable | Free text |
+
+### Why the JSON key is `categoryname` (lowercase)
+
+`fromJson(...)` reads `command.stringValueOfParameterNamed("categoryname")` — the JSON key is **all lower case, no separator**. The `update(...)` method uses the same lower-case key for description (`categorydescription`). Be careful when composing requests by hand; the more conventional camelCase keys `categoryName` / `categoryDescription` will be silently ignored.
+
+### Equality
+
+`ProvisioningCategory` overrides `equals`/`hashCode` to use `categoryName + id`:
+
+```java
+@Override
+public boolean equals(Object obj) {
+    if (obj == null) return false;
+    if (obj == this) return true;
+    if (!(obj instanceof ProvisioningCategory)) return false;
+    ProvisioningCategory pc = (ProvisioningCategory) obj;
+    return pc.getCategoryName().equals(this.categoryName);
+}
+
+@Override
+public int hashCode() {
+    return categoryName.hashCode() ^ getId().hashCode();
+}
+```
+
+Important: only `categoryName` is compared in `equals`, but `hashCode` mixes in the id — this is technically a violation of the equals/hashCode contract that you may need to work around in `Set`s of categories. Do not store `ProvisioningCategory` in a hash-based collection without resolving identity by id first.
+
+## Seed data — the four system-defined categories
+
+The Liquibase changeset `0002_initial_data.xml` inserts four rows on tenant bootstrap:
+
+```xml
+<insert tableName="m_provision_category">
+  <column name="id" valueNumeric="1"/>
+  <column name="category_name" value="STANDARD"/>
+  <!-- description Punctual Payment without any dues -->
+</insert>
+<insert tableName="m_provision_category">
+  <column name="id" valueNumeric="2"/>
+  <column name="category_name" value="SUB-STANDARD"/>
+  <!-- description Principal and/or Interest overdue by x days -->
+</insert>
+<insert tableName="m_provision_category">
+  <column name="id" valueNumeric="3"/>
+  <column name="category_name" value="DOUBTFUL"/>
+  <!-- description Principal and/or Interest overdue by x days and less than y -->
+</insert>
+<insert tableName="m_provision_category">
+  <column name="id" valueNumeric="4"/>
+  <column name="category_name" value="LOSS"/>
+</insert>
+```
+
+| id | category_name | description |
+| --- | --- | --- |
+| 1 | `STANDARD` | Punctual Payment without any dues |
+| 2 | `SUB-STANDARD` | Principal and/or Interest overdue by x days |
+| 3 | `DOUBTFUL` | Principal and/or Interest overdue by x days and less than y |
+| 4 | `LOSS` | (no default description) |
+
+These four cover most regulator schedules. Some MFIs add intermediate buckets (`SPECIAL-MENTION`, `WATCH`) before sub-standard; the API allows it.
+
+## `ProvisioningCategoryApiResource` — `/v1/provisioningcategory`
+
+```java
+@Path("/v1/provisioningcategory")
+@Component
+@Tag(name = "Provisioning Category", description = "")
+@RequiredArgsConstructor
+public class ProvisioningCategoryApiResource {
+    private final PlatformSecurityContext                       platformSecurityContext;
+    private final ProvisioningCategoryReadPlatformService       provisioningCategoryReadPlatformService;
+    private final PortfolioCommandSourceWritePlatformService    commandsSourceWritePlatformService;
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Handler | Command | Purpose |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/provisioningcategory` | `retrieveAll` | — | List all categories |
+| POST | `/v1/provisioningcategory` | `createProvisioningCategory` | `CREATE_PROVISIONINGCATEGORY` | Add a new category |
+| PUT | `/v1/provisioningcategory/{categoryId}` | `updateProvisioningCategory` | `UPDATE_PROVISIONINGCATEGORY` | Edit name/description |
+| DELETE | `/v1/provisioningcategory/{categoryId}` | `deleteProvisioningCategory` | `DELETE_PROVISIONINGCATEGORY` | Remove if unused |
+
+There is no GET-by-id endpoint — only the list. Clients typically cache the four rows on first access.
+
+### `GET /v1/provisioningcategory`
+
+```java
+@GET
+public List<ProvisioningCategoryData> retrieveAll() {
+    platformSecurityContext.authenticatedUser();
+    return provisioningCategoryReadPlatformService.retrieveAllProvisionCategories();
+}
+```
+
+Sample response:
+
+```json
+[
+  { "id": 1, "categoryName": "STANDARD",     "categoryDescription": "Punctual Payment without any dues" },
+  { "id": 2, "categoryName": "SUB-STANDARD", "categoryDescription": "Principal and/or Interest overdue by x days" },
+  { "id": 3, "categoryName": "DOUBTFUL",     "categoryDescription": "Principal and/or Interest overdue by x days and less than y" },
+  { "id": 4, "categoryName": "LOSS",         "categoryDescription": null }
+]
+```
+
+### `POST /v1/provisioningcategory`
+
+```java
+@POST
+public CommandProcessingResult createProvisioningCategory(final String apiRequestBodyAsJson) {
+    platformSecurityContext.authenticatedUser();
+    CommandWrapper commandWrapper = new CommandWrapperBuilder()
+        .createProvisioningCategory().withJson(apiRequestBodyAsJson).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+Body (note the unusual lower-case keys honoured by `ProvisioningCategory.fromJson`):
+
+```json
+{
+  "categoryname": "SPECIAL-MENTION",
+  "description":  "Early-warning bucket below 30 days overdue"
+}
+```
+
+Mandatory: `categoryname`. Optional: `description`. Validator: `ProvisioningCategoryDefinitionJsonDeserializer.validateForCreate(...)` enforces uniqueness of name (also enforced by the DB unique constraint as a backstop).
+
+### `PUT /v1/provisioningcategory/{categoryId}`
+
+```java
+@PUT @Path("{categoryId}")
+public CommandProcessingResult updateProvisioningCategory(@PathParam("categoryId") final Long categoryId,
+        final String apiRequestBodyAsJson) {
+    platformSecurityContext.authenticatedUser();
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .updateProvisioningCategory(categoryId).withJson(apiRequestBodyAsJson).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The entity's `update(JsonCommand)` diffs `categoryname` and `categorydescription`. Re-using an existing name fails with the unique constraint error.
+
+### `DELETE /v1/provisioningcategory/{categoryId}`
+
+```java
+@DELETE @Path("{categoryId}")
+public CommandProcessingResult deleteProvisioningCategory(@PathParam("categoryId") final Long categoryId) {
+    platformSecurityContext.authenticatedUser();
+    final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .deleteProvisioningCategory(categoryId).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The handler checks whether **any** `ProvisioningCriteriaDefinition` references the category. If yes, deletion is blocked with `ProvisioningCategoryCannotBeDeletedException` (HTTP 409, `error.msg.provisioningcategory.in.use`). This is why the four seed rows almost never get deleted in practice — they are referenced by the very first criteria an admin creates.
+
+## Repositories
+
+`ProvisioningCategoryRepository extends JpaRepository<ProvisioningCategory, Long>` — a plain Spring Data interface with one custom finder:
+
+```java
+ProvisioningCategory findByCategoryName(String categoryName);
+```
+
+The assembler in [provisioning criteria](/organisation/provisioning-criteria) uses both the id lookup and the name lookup. There is intentionally no wrapper class — the small surface area did not warrant the `…NotFoundException` indirection used by other organisation entities; the handlers raise `ProvisioningCategoryNotFoundException` directly when the entity manager returns null.
+
+## Exceptions
+
+| Exception | HTTP | Message key | When |
+| --- | --- | --- | --- |
+| `ProvisioningCategoryNotFoundException` | 404 | `error.msg.provisioningcategory.id.invalid` | Lookup miss |
+| `ProvisioningCategoryCannotBeDeletedException` | 409 | `error.msg.provisioningcategory.in.use` | Referenced by at least one `ProvisioningCriteriaDefinition` |
+| `PlatformApiDataValidationException` | 400 | `validation.msg.provisioningcategory.<field>.<rule>` | Other validation failures |
+
+## Permission codes
+
+| Code | Purpose |
+| --- | --- |
+| `READ_PROVISIONINGCATEGORY` | List |
+| `CREATE_PROVISIONINGCATEGORY`, `CREATE_PROVISIONINGCATEGORY_CHECKER` | Create + maker–checker |
+| `UPDATE_PROVISIONINGCATEGORY`, `UPDATE_PROVISIONINGCATEGORY_CHECKER` | Update |
+| `DELETE_PROVISIONINGCATEGORY`, `DELETE_PROVISIONINGCATEGORY_CHECKER` | Delete |
+
+## Naming conventions worth knowing
+
+Even though the API accepts any string for `categoryname`, downstream systems (regulatory exports, reports, dashboards) often pattern-match against the four shipped names. Inserting a new category with the same semantics as `SUB-STANDARD` but a different name (`SUBSTANDARD`, `SUB_STANDARD`, `SS`) will not break Fineract itself but may break:
+
+- IRACP / Basel mapping in any custom export job.
+- Stretchy report templates filtering by `m_provision_category.category_name`.
+- External reconciliation tools that expect exactly the seeded strings.
+
+When in doubt, keep the four seed rows untouched and *add* additional buckets at the boundaries (e.g. a `SPECIAL-MENTION` between `STANDARD` and `SUB-STANDARD`).
+
+## Auditing
+
+`ProvisioningCategory` extends `AbstractPersistableCustom<Long>` rather than `AbstractAuditableCustom`. This is deliberate — categories are reference data, so the platform does **not** track `createdBy`/`createdDate`/`lastModifiedBy`/`lastModifiedDate` for them. If you need an audit trail for category edits, it has to come from the surrounding `m_portfolio_command_source` row that the command pipeline writes; that row carries the calling user and timestamp for the `CREATE_PROVISIONINGCATEGORY` / `UPDATE_PROVISIONINGCATEGORY` / `DELETE_PROVISIONINGCATEGORY` action.
+
+By contrast, `ProvisioningCriteria` *does* extend `AbstractAuditableCustom` — see [provisioning criteria](/organisation/provisioning-criteria) for why the heavier base class was needed there.
+
+## Programmatic lookup pattern
+
+When you need to look up a category from code, use the named finder rather than scanning all rows:
+
+```java
+@Autowired
+private ProvisioningCategoryRepository repository;
+
+public ProvisioningCategory loss() {
+    return repository.findByCategoryName("LOSS");
+}
+```
+
+The repository returns `null` on miss — callers raise `ProvisioningCategoryNotFoundException` themselves. Inside the validator-friendly assembler (`ProvisioningCriteriaAssembler`) the id-based lookup is preferred so a typo in the configuration triggers a 404 rather than a silent null reference.
+
+## Worked example — adding a `SPECIAL-MENTION` bucket
+
+A regulator updates its provisioning schedule to require a 0.40% provision against accounts 1–30 days overdue and a 1.00% provision against 31–60 days. The existing `STANDARD` (0–30) and `SUB-STANDARD` (31–90) buckets no longer line up. Two steps:
+
+### 1. Insert the new category
+
+```bash
+curl -X POST -u admin:password \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "categoryname": "SPECIAL-MENTION",
+    "description":  "Accounts overdue 1–60 days requiring elevated provisioning"
+  }' \
+  https://fineract.example/api/v1/provisioningcategory
+```
+
+Response:
+
+```json
+{ "officeId": null, "clientId": null, "loanId": null, "resourceId": 5, "changes": { "categoryname": "SPECIAL-MENTION" } }
+```
+
+### 2. Re-wire the criteria
+
+`PUT /v1/provisioningcriteria/{criteriaId}` with a refreshed `definitions` array that references the new id `5`:
+
+```json
+{
+  "criteriaName": "RBI IRACP",
+  "definitions": [
+    { "categoryId": 1, "minAge": 0,   "maxAge": 0,    "provisioningPercentage": 0.25, "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 5, "minAge": 1,   "maxAge": 60,   "provisioningPercentage": 0.4,  "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 2, "minAge": 61,  "maxAge": 90,   "provisioningPercentage": 5.0,  "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 3, "minAge": 91,  "maxAge": 365,  "provisioningPercentage": 25.0, "liabilityAccount": 21, "expenseAccount": 70 },
+    { "categoryId": 4, "minAge": 366, "maxAge": 9999, "provisioningPercentage": 100.0,"liabilityAccount": 21, "expenseAccount": 70 }
+  ],
+  "locale": "en"
+}
+```
+
+Caveats:
+
+- Overlap rule still applies — bands must remain disjoint.
+- Existing `m_loanproduct_provisioning_entry` rows are **not** retroactively reclassified; the next COB run uses the new criteria.
+- The new category cannot be deleted while any definition (any criteria) references it.
+
+## See also
+
+- [Provisioning criteria](/organisation/provisioning-criteria) — each definition row references one category and an age band.
+- [Organisation shared domain](/core/organisation-shared-domain) — package map.
+- [Accounting shared domain](/core/accounting-shared-domain) — GL accounts used downstream.
+- [Jobs domain](/core/jobs-domain) — "Generate Loan Loss Provisioning" job that uses categories indirectly via criteria.
+- [Organisation APIs](/api/organisation-apis) — Swagger payloads for `/v1/provisioningcategory`.
+- [Security overview](/security/overview) — `PROVISIONINGCATEGORY` permission resource.

@@ -1,0 +1,366 @@
+---
+title: "Cache Config: Ehcache 3 via JCache and Transaction Reset"
+sidebarTitle: "Cache Config"
+description: "CacheConfig wires an Ehcache 3 (JCache) CacheManager with reflective @Cacheable scanning, per-name allow lists and a TransactionBoundCacheManager."
+---
+
+`CacheConfig` is the Apache Fineract provider module's JSR-107 / Spring Cache
+wiring. It sets up an Ehcache 3 cache manager, reflectively discovers every
+`@Cacheable` / `@CacheConfig` cache name on the classpath, applies per-cache
+TTL and size templates from `FineractProperties`, then wraps everything in a
+gated `SpecifiedCacheSupportingCacheManager` and a `TransactionBoundCacheManager`.
+
+The runtime effect: only an explicitly-allowed subset of caches do any
+caching, and every cache is *cleared* at the start and end of every JPA
+transaction.
+
+This page walks the three classes in
+`infrastructure/core/config/cache/`.
+
+## File map
+
+```
+infrastructure/core/config/cache/
+├── CacheConfig.java                          ← @Configuration; wires beans
+├── SpecifiedCacheSupportingCacheManager.java ← Gate by cache name
+└── TransactionBoundCacheManager.java         ← Reset on transaction lifecycle
+```
+
+## CacheConfig — the main configuration
+
+```java
+@Configuration
+@Slf4j
+public class CacheConfig {
+
+    public static final String CONFIG_BY_NAME_CACHE_NAME = "configByName";
+
+    @Autowired
+    private FineractProperties fineractProperties;
+
+    @Bean
+    public TransactionBoundCacheManager defaultCacheManager(JCacheCacheManager ehCacheManager) {
+        SpecifiedCacheSupportingCacheManager cacheManager = new SpecifiedCacheSupportingCacheManager();
+        cacheManager.setNoOpCacheManager(new NoOpCacheManager());
+        cacheManager.setDelegateCacheManager(ehCacheManager);
+        cacheManager.setSupportedCaches(CONFIG_BY_NAME_CACHE_NAME);
+        return new TransactionBoundCacheManager(cacheManager);
+    }
+
+    @Bean
+    public JCacheCacheManager ehCacheManager() {
+        JCacheCacheManager jCacheCacheManager = new JCacheCacheManager();
+        jCacheCacheManager.setCacheManager(getInternalEhCacheManager());
+        return jCacheCacheManager;
+    }
+
+    private CacheManager getInternalEhCacheManager() {
+        CachingProvider provider = Caching.getCachingProvider();
+        CacheManager cacheManager = provider.getCacheManager();
+
+        Duration defaultTimeToLive = fineractProperties.getCache().getDefaultTemplate().getTtl();
+        Integer defaultMaxEntries = fineractProperties.getCache().getDefaultTemplate().getMaximumEntries();
+        javax.cache.configuration.Configuration<Object, Object> defaultTemplate =
+            generateCacheConfiguration(defaultMaxEntries, defaultTimeToLive);
+
+        Reflections reflections = new Reflections(new ConfigurationBuilder()
+            .setUrls(ClasspathHelper.forJavaClassPath())
+            .addScanners(Scanners.MethodsAnnotated, Scanners.TypesAnnotated));
+
+        // Methods annotated with @Cacheable
+        Set<Method> annotatedMethods = reflections.getMethodsAnnotatedWith(Cacheable.class);
+        Set<String> cacheNames = annotatedMethods.stream()
+            .map(method -> method.getAnnotation(Cacheable.class))
+            .flatMap(annotation -> Stream.concat(
+                Arrays.stream(annotation.value()),
+                Arrays.stream(annotation.cacheNames())))
+            .collect(Collectors.toSet());
+
+        // Types annotated with @Cacheable
+        Set<Class<?>> annotatedClasses = reflections.getTypesAnnotatedWith(Cacheable.class);
+        cacheNames.addAll(annotatedClasses.stream()
+            .map(clazz -> clazz.getAnnotation(Cacheable.class))
+            .flatMap(annotation -> Stream.concat(
+                Arrays.stream(annotation.value()),
+                Arrays.stream(annotation.cacheNames())))
+            .collect(Collectors.toSet()));
+
+        // Types annotated with @CacheConfig
+        Set<Class<?>> annotatedCacheConfigClasses = reflections
+            .getTypesAnnotatedWith(org.springframework.cache.annotation.CacheConfig.class);
+        cacheNames.addAll(annotatedCacheConfigClasses.stream()
+            .map(clazz -> clazz.getAnnotation(org.springframework.cache.annotation.CacheConfig.class))
+            .flatMap(annotation -> Arrays.stream(annotation.cacheNames()))
+            .collect(Collectors.toSet()));
+
+        // Register each discovered cache
+        cacheNames.forEach(cacheName -> {
+            if (cacheManager.getCache(cacheName) == null) {
+                javax.cache.configuration.Configuration<Object, Object> configurationTemplate =
+                    generateCustomCacheConfiguration(cacheName, defaultTemplate, defaultTimeToLive, defaultMaxEntries);
+                cacheManager.createCache(cacheName, configurationTemplate);
+            }
+        });
+
+        // Warn on custom templates for non-existent caches
+        Set<String> incorrectConfigurations = new HashSet<>(fineractProperties.getCache().getCustomTemplates().keySet());
+        incorrectConfigurations.removeAll(cacheNames);
+        if (!incorrectConfigurations.isEmpty()) {
+            log.warn("The following cache configurations are defined but cache does not exists: {}", incorrectConfigurations);
+        }
+        return cacheManager;
+    }
+}
+```
+
+## The three-bean chain
+
+```mermaid
+graph LR
+    JCM[JCacheCacheManager<br/>ehCacheManager] --> SCSM[SpecifiedCacheSupporting<br/>CacheManager]
+    SCSM --> TBCM[TransactionBound<br/>CacheManager]
+    TBCM --> APP[@Cacheable beans]
+```
+
+### Layer 1: `JCacheCacheManager` — the real cache
+
+```java
+@Bean
+public JCacheCacheManager ehCacheManager() {
+    JCacheCacheManager jCacheCacheManager = new JCacheCacheManager();
+    jCacheCacheManager.setCacheManager(getInternalEhCacheManager());
+    return jCacheCacheManager;
+}
+```
+
+`JCacheCacheManager` (Spring's adapter) bridges Spring Cache's `CacheManager`
+interface to the JSR-107 `javax.cache.CacheManager`. The internal cache manager
+is bootstrapped via the JCache discovery mechanism:
+
+```java
+CachingProvider provider = Caching.getCachingProvider();
+CacheManager cacheManager = provider.getCacheManager();
+```
+
+Because `org.ehcache:ehcache` is on the classpath, the discovered provider is
+Ehcache 3, and the cache manager is `EhcacheManager`.
+
+### Layer 2: `SpecifiedCacheSupportingCacheManager` — the gate
+
+```java
+@RequiredArgsConstructor
+public class SpecifiedCacheSupportingCacheManager implements CacheManager, InitializingBean {
+
+    private JCacheCacheManager delegateCacheManager;
+    private NoOpCacheManager noOpCacheManager;
+
+    private final Set<String> supportedCacheNames = new LinkedHashSet<>(16);
+
+    @Override
+    public Cache getCache(String name) {
+        if (supportedCacheNames.contains(name)) {
+            Cache cache = delegateCacheManager.getCache(name);
+            return cache != null ? cache : noOpCacheManager.getCache(name);
+        } else {
+            return noOpCacheManager.getCache(name);
+        }
+    }
+
+    @Override
+    public Collection<String> getCacheNames() {
+        synchronized (supportedCacheNames) {
+            return Collections.unmodifiableSet(supportedCacheNames);
+        }
+    }
+    ...
+}
+```
+
+This is the trick that lets Fineract opt-in to caching name-by-name. Default
+behaviour:
+
+- A `@Cacheable("foo")` call requests the cache named `"foo"`.
+- If `"foo"` is in `supportedCacheNames` and exists on the JCache delegate,
+  return the real cache.
+- Otherwise, return a `NoOpCache` — the method runs every time, no caching
+  happens.
+
+`CacheConfig` configures exactly one supported cache name today:
+
+```java
+cacheManager.setSupportedCaches(CONFIG_BY_NAME_CACHE_NAME);   // "configByName"
+```
+
+So out of the box, *only* the `configByName` cache (used by
+`ConfigurationDomainService`) is actually cached. Every other `@Cacheable` is
+silently a no-op. This is a defensive design: caching across tenants is
+correctness-sensitive, so the platform opts in cache-by-cache.
+
+### Layer 3: `TransactionBoundCacheManager` — the reset
+
+```java
+@RequiredArgsConstructor
+public class TransactionBoundCacheManager implements TransactionLifecycleCallback, CacheManager {
+
+    private final CacheManager delegate;
+
+    @Override
+    public void afterCompletion() { resetCaches(); }
+
+    @Override
+    public void afterBegin() { resetCaches(); }
+
+    private void resetCaches() {
+        Collection<String> cacheNames = delegate.getCacheNames();
+        cacheNames.forEach(c -> {
+            Cache cache = delegate.getCache(c);
+            if (cache != null) {
+                cache.clear();
+            }
+        });
+    }
+
+    @Override public Cache getCache(String name) { return delegate.getCache(name); }
+    @Override public Collection<String> getCacheNames() { return delegate.getCacheNames(); }
+}
+```
+
+This is the multi-tenancy safety net. `TransactionLifecycleCallback` is
+implemented by `fineract-core`'s transaction infrastructure; both
+`afterBegin()` and `afterCompletion()` fire on every JPA transaction boundary.
+
+**Both** ends clear the caches:
+
+- **`afterBegin`** — clears stale entries before the new transaction reads
+  fresh data. Important when a long-running thread spans multiple tenants.
+- **`afterCompletion`** — clears any *uncommitted* speculative entries written
+  during a failed transaction.
+
+The trade-off is performance: a cache that resets per transaction is not a
+high-hit-rate cache. But for `configByName` — which is read many times per
+request and only changes on operator action — the win is that within a single
+request all reads hit the cache after the first.
+
+## Reflective cache-name discovery
+
+The cache manager bootstrap *creates* every cache that any `@Cacheable` /
+`@CacheConfig` annotation references, even ones that will be no-ops behind the
+gate. This is the loop:
+
+```java
+Set<Method> annotatedMethods = reflections.getMethodsAnnotatedWith(Cacheable.class);
+Set<String> cacheNames = annotatedMethods.stream()
+    .map(m -> m.getAnnotation(Cacheable.class))
+    .flatMap(a -> Stream.concat(Arrays.stream(a.value()), Arrays.stream(a.cacheNames())))
+    .collect(Collectors.toSet());
+```
+
+Three sources of cache names are scanned:
+
+1. Method-level `@Cacheable(value = "...")` or `@Cacheable(cacheNames = {...})`.
+2. Class-level `@Cacheable` (Spring honours it on the type).
+3. Class-level `@CacheConfig(cacheNames = {...})` (Spring's class-level
+   default-name annotation).
+
+Each unique cache name gets its own JCache cache created with either the
+default template or — if defined — a custom one keyed by cache name.
+
+Why pre-create caches that are no-ops? Because Spring's
+`SimpleCacheResolver` rejects an unknown cache name with an exception. Having
+every cache exist (even if hidden behind the no-op gate) keeps Spring happy.
+
+## Cache configuration templates
+
+```java
+private static javax.cache.configuration.Configuration<Object, Object>
+        generateCacheConfiguration(Integer defaultMaxEntries, Duration defaultTimeToLive) {
+    return Eh107Configuration.fromEhcacheCacheConfiguration(
+        CacheConfigurationBuilder
+            .newCacheConfigurationBuilder(Object.class, Object.class,
+                ResourcePoolsBuilder.heap(defaultMaxEntries))
+            .withExpiry(ExpiryPolicyBuilder.timeToLiveExpiration(defaultTimeToLive))
+            .build());
+}
+```
+
+Each cache is heap-only (no off-heap, no disk tier) and uses a TTL expiration
+policy. The keys and values are typed as `Object` because the various
+`@Cacheable` consumers store different types.
+
+Custom templates per cache name come from `FineractProperties`:
+
+```properties
+fineract.cache.defaultTemplate.ttl=PT5M
+fineract.cache.defaultTemplate.maximumEntries=1000
+
+fineract.cache.customTemplates.configByName.ttl=PT15M
+fineract.cache.customTemplates.configByName.maximumEntries=500
+```
+
+The lookup:
+
+```java
+if (fineractProperties.getCache().getCustomTemplates().containsKey(cacheIdentifier)) {
+    Duration ttl = Objects.requireNonNullElse(
+        fineractProperties.getCache().getCustomTemplates().get(cacheIdentifier).getTtl(),
+        defaultTimeToLive);
+    Integer max = Objects.requireNonNullElse(
+        fineractProperties.getCache().getCustomTemplates().get(cacheIdentifier).getMaximumEntries(),
+        defaultMaxEntries);
+    return generateCacheConfiguration(max, ttl);
+}
+return defaultTemplate;
+```
+
+Either value can be null in the custom template — the defaults fill in the
+gaps.
+
+## Warnings for misconfigured templates
+
+```java
+Set<String> incorrectConfigurations = new HashSet<>(fineractProperties.getCache().getCustomTemplates().keySet());
+incorrectConfigurations.removeAll(cacheNames);
+if (!incorrectConfigurations.isEmpty()) {
+    log.warn("The following cache configurations are defined but cache does not exists: {}", incorrectConfigurations);
+}
+```
+
+If you typo a cache name in the properties file, you get a warning on startup
+listing the unmatched names. This catches both typos and stale templates left
+over after a cache was removed.
+
+## Where caches are actually used
+
+A grep for `@Cacheable` across the codebase shows annotations in:
+
+- `infrastructure.configuration.domain.ConfigurationDomainServiceJpa` — backs
+  `configByName` (the one cache actually enabled).
+- A handful of `*ReadPlatformServiceImpl` classes for currency, code values,
+  and permissions.
+
+Most of these caches exist (as JCache entries) but are gated to no-op. To
+enable one, add its name to `setSupportedCaches(...)` in `CacheConfig`. That is
+intentionally a code change rather than a runtime flag — enabling caching for
+a cross-tenant entity has correctness implications that must be reviewed.
+
+## Why the transaction-bound reset?
+
+Consider a worker thread that handles a JMS message for tenant A, then a
+second message for tenant B. Without the reset:
+
+1. Worker reads `configByName(global-key)` for tenant A → caches A's value.
+2. Worker now processes tenant B's message.
+3. Worker reads `configByName(global-key)` for tenant B → gets A's cached value.
+4. Corruption.
+
+Because every JPA transaction boundary clears the cache, and the worker opens
+a new transaction per message, this can't happen — by the time tenant B's
+transaction starts, the cache is empty and the read goes to the database.
+
+## Related pages
+
+- [Provider Overview](/provider/overview) — module map.
+- [JPA and EclipseLink](/provider/jpa-and-eclipselink) — the transaction
+  infrastructure whose lifecycle callbacks fire the cache reset.
+- [/runtime/transaction-management](/runtime/transaction-management) — the
+  transaction boundary semantics.

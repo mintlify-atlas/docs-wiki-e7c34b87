@@ -1,0 +1,299 @@
+---
+title: "Notification REST API — Inbox, Pagination, and Mark-as-Read"
+sidebarTitle: "Notification API"
+description: "The Apache Fineract notification REST surface: GET /v1/notifications with unread filtering, pagination, sort order, and a single PUT that marks every notification of the caller as read."
+---
+
+The user-facing slice of the Apache Fineract notification subsystem is exposed by `NotificationApiResource` at `/v1/notifications`. There are exactly two operations: a paginated `GET` that returns notifications addressed to the authenticated user (with a default unread-only filter), and a `PUT` that flips every unread row for the same user to read. The resource is backed by `NotificationReadPlatformServiceImpl`, which goes straight to JDBC against the `notification_mapper` ⋈ `notification_generator` join.
+
+## Resource source
+
+```java
+// fineract-provider/src/main/java/org/apache/fineract/notification/api/NotificationApiResource.java
+@Path("/v1/notifications")
+@Component
+@Tag(name = "Notification", description = "")
+@RequiredArgsConstructor
+public class NotificationApiResource {
+
+    private final PlatformSecurityContext context;
+    private final NotificationReadPlatformService notificationReadPlatformService;
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final ToApiJsonSerializer<NotificationData> toApiJsonSerializer;
+    private final SqlValidator sqlValidator;
+
+    @GET
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String getAllNotifications(@Context final UriInfo uriInfo,
+            @QueryParam("orderBy")   final String orderBy,
+            @QueryParam("limit")     final Integer limit,
+            @QueryParam("offset")    final Integer offset,
+            @QueryParam("sortOrder") final String sortOrder,
+            @QueryParam("isRead")    final boolean isRead) {
+
+        this.context.authenticatedUser();
+        final Page<NotificationData> notificationData;
+        sqlValidator.validate(orderBy);
+        sqlValidator.validate(sortOrder);
+        final SearchParameters searchParameters = SearchParameters.builder()
+                .limit(limit).offset(offset).orderBy(orderBy).sortOrder(sortOrder).build();
+        if (!isRead) {
+            notificationData = this.notificationReadPlatformService.getAllUnreadNotifications(searchParameters);
+        } else {
+            notificationData = this.notificationReadPlatformService.getAllNotifications(searchParameters);
+        }
+        final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+        return this.toApiJsonSerializer.serialize(settings, notificationData);
+    }
+
+    @PUT
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public void update() {
+        this.context.authenticatedUser();
+        this.notificationReadPlatformService.updateNotificationReadStatus();
+    }
+}
+```
+
+Both methods require an authenticated user — they call `context.authenticatedUser()` purely for side-effect validation (and to surface the user id inside the service layer).
+
+## Endpoint reference
+
+| Method | Path | Query parameters | Returns |
+| --- | --- | --- | --- |
+| `GET` | `/v1/notifications` | `isRead` (default `false`), `limit`, `offset`, `orderBy`, `sortOrder` | `Page<NotificationData>` JSON. |
+| `PUT` | `/v1/notifications` | — | No body. Marks every unread row for the caller as read. |
+
+The `isRead` parameter is a Java primitive `boolean`, so when omitted it defaults to `false`. The branch in the resource then dispatches to `getAllUnreadNotifications` for `false` and `getAllNotifications` for `true`. There is **no** way through this endpoint to ask for read-only notifications — `isRead=true` returns *all* notifications regardless of read state.
+
+## Behaviour matrix
+
+| `isRead` query param | Backend method | Effective filter |
+| --- | --- | --- |
+| not provided | `getAllUnreadNotifications` | `nm.user_id = :user AND nm.is_read = false` |
+| `false` | `getAllUnreadNotifications` | `nm.user_id = :user AND nm.is_read = false` |
+| `true` | `getAllNotifications` | `nm.user_id = :user` (read + unread) |
+
+This means consumers polling the inbox simply call `GET /v1/notifications` with no query string — they get unread items only, ordered newest first.
+
+## Response shape
+
+The DTO is `NotificationData` (`fineract-core`), serialized through `ToApiJsonSerializer`:
+
+```json
+{
+  "totalFilteredRecords": 12,
+  "pageItems": [
+    {
+      "id": 482,
+      "objectType": "loan",
+      "objectId": 9921,
+      "action": "approved",
+      "actorId": 17,
+      "content": "New loan approved",
+      "isRead": false,
+      "isSystemGenerated": false,
+      "createdAt": "2025-03-04 14:32:11.0"
+    }
+  ]
+}
+```
+
+The columns are produced by the SQL `RowMapper` in `NotificationReadPlatformServiceImpl.NotificationDataRow` and are pulled from the join of `notification_mapper nm` ⋈ `notification_generator ng`:
+
+```java
+"SELECT " + sqlGenerator.calcFoundRows() +
+"  ng.id as id, nm.user_id as userId, ng.object_type as objectType, " +
+"  ng.object_identifier as objectId, ng.actor as actor, " +
+"  ng." + sqlGenerator.escape("action") + " as action, " +
+"  ng.notification_content as content, ng.is_system_generated as isSystemGenerated, " +
+"  nm.created_at as createdAt " +
+"FROM notification_mapper nm INNER JOIN notification_generator ng ON nm.notification_id = ng.id " +
+"WHERE nm.user_id = ? AND nm.is_read = false " +   // omitted for getAllNotifications
+"order by nm.created_at desc"
+```
+
+The `action` column is escaped through `sqlGenerator.escape(...)` because `ACTION` is a reserved word on some database dialects (the `DatabaseSpecificSQLGenerator` rewrites it). See [`/core/serialization-and-json`](/core/serialization-and-json) for the `ToApiJsonSerializer` machinery and [`/core/persistence-and-jpa`](/core/persistence-and-jpa) for the SQL generator.
+
+## Pagination
+
+`SearchParameters` is built from the `limit` / `offset` / `orderBy` / `sortOrder` query params. `NotificationReadPlatformServiceImpl.getNotificationDataPage` appends `ORDER BY` and the dialect-specific `LIMIT` to the base SQL:
+
+```java
+private Page<NotificationData> getNotificationDataPage(SearchParameters searchParameters, Long appUserId, String sql) {
+    final StringBuilder sqlBuilder = new StringBuilder(200);
+    sqlBuilder.append(sql);
+
+    if (searchParameters.hasOrderBy()) {
+        sqlBuilder.append(" order by ").append(searchParameters.getOrderBy());
+        this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getOrderBy());
+        if (searchParameters.hasSortOrder()) {
+            sqlBuilder.append(' ').append(searchParameters.getSortOrder());
+            this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getSortOrder());
+        }
+    }
+
+    if (searchParameters.hasLimit()) {
+        sqlBuilder.append(" ");
+        if (searchParameters.hasOffset()) {
+            sqlBuilder.append(sqlGenerator.limit(searchParameters.getLimit(), searchParameters.getOffset()));
+        } else {
+            sqlBuilder.append(sqlGenerator.limit(searchParameters.getLimit()));
+        }
+    }
+
+    Object[] params = new Object[] { appUserId };
+    return this.paginationHelper.fetchPage(this.jdbcTemplate, sqlBuilder.toString(), params, this.notificationDataRow);
+}
+```
+
+| Behaviour | Detail |
+| --- | --- |
+| Default order | The base SQL ends with `ORDER BY nm.created_at desc` (newest first). |
+| `orderBy` override | Replaces the default by appending another `ORDER BY ...` after the existing one — many databases use the *last* clause, but you should not rely on this; supply both `orderBy` and `sortOrder` to be explicit. |
+| `sortOrder` | Goes through `SqlValidator.validate` *and* `ColumnValidator.validateSqlInjection`. Either `ASC` or `DESC`. |
+| `limit` / `offset` | Materialised through `DatabaseSpecificSQLGenerator.limit(...)` so the right dialect (MySQL `LIMIT n OFFSET m` vs PostgreSQL etc.) is produced. |
+| Total count | `calcFoundRows()` plus `PaginationHelper.fetchPage` populates `totalFilteredRecords` in the response. |
+
+Sample paging request:
+
+```http
+GET /fineract-provider/api/v1/notifications?limit=50&offset=0&isRead=true HTTP/1.1
+Authorization: Basic ...
+Fineract-Platform-TenantId: default
+```
+
+## Mark all as read
+
+```java
+@Override
+public void updateNotificationReadStatus() {
+    final Long appUserId = context.authenticatedUser().getId();
+    String sql = "UPDATE notification_mapper SET is_read = true WHERE is_read = false and user_id = ?";
+    this.jdbcTemplate.update(sql, appUserId);
+}
+```
+
+The `PUT /v1/notifications` endpoint is bulk-only. There is no `PUT /v1/notifications/{id}` route — clients that want to mark a single notification as read have to call this and re-fetch, or update the row directly. The `is_read = false` predicate keeps the write narrow when most rows are already read.
+
+## SQL injection guards
+
+`NotificationApiResource` runs both `orderBy` and `sortOrder` through `SqlValidator.validate` before constructing the `SearchParameters`. The service layer additionally runs `ColumnValidator.validateSqlInjection` on the concatenated SQL — both defences are needed because `orderBy` is interpolated directly into the SQL string.
+
+If a malicious value passes both validators, the JDBC driver still rejects it (the query becomes syntactically invalid), but you should treat both guards as part of the contract.
+
+## Unread-flag cache
+
+There is a second read path that is **not** exposed through `NotificationApiResource` directly but is used elsewhere in the platform (e.g. by the homepage / session bootstrap that calls `UserNotificationService.hasUnreadUserNotifications(Long)`):
+
+```java
+@Override
+public boolean hasUnreadNotifications(Long appUserId) {
+    Long tenantId = ThreadLocalContextUtil.getTenant().getId();
+    Long now = System.currentTimeMillis() / 1000L;
+    if (this.tenantNotificationResponseHeaderCache.containsKey(tenantId)) {
+        HashMap<Long, CacheNotificationResponseHeader> notificationResponseHeaderCache =
+            this.tenantNotificationResponseHeaderCache.get(tenantId);
+        if (notificationResponseHeaderCache.containsKey(appUserId)) {
+            Long lastFetch = notificationResponseHeaderCache.get(appUserId).getLastFetch();
+            if ((now - lastFetch) > 1) {
+                return this.createUpdateCacheValue(appUserId, now, notificationResponseHeaderCache);
+            } else {
+                return notificationResponseHeaderCache.get(appUserId).hasNotifications();
+            }
+        } else {
+            return this.createUpdateCacheValue(appUserId, now, notificationResponseHeaderCache);
+        }
+    } else {
+        return this.initializeTenantNotificationResponseHeaderCache(tenantId, now, appUserId);
+    }
+}
+```
+
+Key properties:
+
+* `tenantNotificationResponseHeaderCache` is a `HashMap<Long, HashMap<Long, CacheNotificationResponseHeader>>` — outer key tenant id, inner key app user id.
+* The cache lives one second — `(now - lastFetch) > 1` is the staleness predicate, with `now = epoch / 1000`.
+* On a hit-and-fresh miss, the cache repeats the JDBC check:
+
+  ```java
+  String sql = "SELECT id, notification_id as notificationId, user_id as userId, " +
+               "       is_read as isRead, created_at as createdAt " +
+               "FROM notification_mapper WHERE user_id = ? AND is_read = false";
+  ```
+
+  and stores whether the result set was non-empty.
+
+The cache lives inside the bean — it is **not** a clustered cache. If two Fineract instances both serve the same user, each maintains its own staleness window. Mark-as-read on instance A is not reflected in instance B's cached `hasNotifications` flag until the one-second window elapses.
+
+## Authentication and tenancy
+
+`PlatformSecurityContext.authenticatedUser()` does two things:
+
+1. Throws `UnAuthenticatedUserException` if there is no `SecurityContextHolder` principal.
+2. Returns the `AppUser` whose `id` is used by every JDBC query in this resource.
+
+The tenant is resolved upstream by the standard `TenantAwareBasicAuthenticationFilter` and lands in `ThreadLocalContextUtil` — the read service uses `ThreadLocalContextUtil.getTenant().getId()` for the cache key. See [`/core/datasource-tenant-routing`](/core/datasource-tenant-routing) for the tenant resolution chain and [`/core/security-services`](/core/security-services) for `PlatformSecurityContext`.
+
+## Working examples
+
+### Polling the inbox
+
+```bash
+curl -s -u mifos:password \
+     -H 'Fineract-Platform-TenantId: default' \
+     'https://fineract.local/fineract-provider/api/v1/notifications?limit=25'
+```
+
+Returns at most 25 unread notifications, newest first.
+
+### Loading all notifications, paginated
+
+```bash
+curl -s -u mifos:password \
+     -H 'Fineract-Platform-TenantId: default' \
+     'https://fineract.local/fineract-provider/api/v1/notifications?limit=50&offset=50&isRead=true'
+```
+
+### Marking everything as read
+
+```bash
+curl -s -X PUT -u mifos:password \
+     -H 'Fineract-Platform-TenantId: default' \
+     -H 'Content-Type: application/json' \
+     'https://fineract.local/fineract-provider/api/v1/notifications'
+```
+
+Returns `204 No Content` (the method is `void`). Idempotent.
+
+## Failure modes
+
+| Symptom | Cause |
+| --- | --- |
+| 401 Unauthorized | `PlatformSecurityContext.authenticatedUser()` failed. The Basic / OAuth / 2FA chain rejected the request. |
+| 400 Bad Request — SQL injection guard | Bad `orderBy` or `sortOrder` value. Check `SqlValidator.validate` rules. |
+| Empty page despite recent business events | Either the feature flag is off (`fineract.notification.user-notification-system.enabled=false`), the producer side filtered the actor out, or the relevant permission was missing from the user's roles. |
+| Stale unread flag in one instance | One-second per-instance cache; mark-as-read on another node has not propagated yet. |
+| `read.action.error` SQL error | `action` is a reserved word; the SQL generator handles this for the shipped paths but custom SQL must use `sqlGenerator.escape("action")`. |
+
+## Schema cheatsheet
+
+| Table | Key columns |
+| --- | --- |
+| `notification_generator` | `id`, `object_type`, `object_identifier`, `action`, `actor`, `is_system_generated`, `notification_content`, `created_at` |
+| `notification_mapper` | `id`, `notification_id` (FK → `notification_generator.id`), `user_id` (FK → `m_appuser.id`), `is_read`, `created_at` |
+
+The `is_read` flag lives on `notification_mapper`, not on `notification_generator`, so per-user state never bleeds across recipients. See [`/core/notification-data`](/core/notification-data).
+
+## Cross references
+
+| Topic | Page |
+| --- | --- |
+| `NotificationData` DTO and JPA entities | [`/core/notification-data`](/core/notification-data) |
+| `SearchParameters`, `Page`, `PaginationHelper`, `DatabaseSpecificSQLGenerator` | [`/core/persistence-and-jpa`](/core/persistence-and-jpa) |
+| `ToApiJsonSerializer` and `ApiRequestJsonSerializationSettings` | [`/core/serialization-and-json`](/core/serialization-and-json) |
+| `PlatformSecurityContext` and authentication filters | [`/core/security-services`](/core/security-services) |
+| Producer side that fills the inbox | [`/notification/notification-event-listener`](/notification/notification-event-listener) |
+| Transport between producer and consumer | [`/notification/spring-and-activemq`](/notification/spring-and-activemq) |

@@ -1,0 +1,325 @@
+---
+title: "Metrics Config: Micrometer TimedAspect and AspectJ Wiring"
+sidebarTitle: "Metrics Config"
+description: "MetricsConfig: a minimal @Configuration enabling AspectJ auto-proxying and registering Micrometer's TimedAspect so @Timed annotations produce metrics."
+---
+
+`MetricsConfig` is the smallest configuration class in the Apache Fineract
+provider module — eight statements of meaningful code — but it is what makes
+the `@Timed` annotation actually do anything across the codebase. Without it,
+`@Timed` methods would be silently ignored.
+
+This page explains the class line-by-line and ties it into the broader
+Micrometer pipeline. For Actuator endpoints, scrape paths and the Prometheus
+metric naming scheme, see
+[/runtime/metrics-and-actuator](/runtime/metrics-and-actuator).
+
+## Source
+
+File: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/MetricsConfig.java`
+
+```java
+package org.apache.fineract.infrastructure.core.config;
+
+import io.micrometer.core.aop.TimedAspect;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
+
+@Configuration
+@EnableAspectJAutoProxy
+public class MetricsConfig {
+
+    @Bean
+    public TimedAspect timedAspect(MeterRegistry registry) {
+        return new TimedAspect(registry);
+    }
+}
+```
+
+## What `@EnableAspectJAutoProxy` brings
+
+This annotation tells Spring to use Spring AOP's AspectJ-style auto-proxying.
+Under the hood Spring creates a `AnnotationAwareAspectJAutoProxyCreator`
+`BeanPostProcessor` which inspects every bean for `@Aspect` classes (or
+beans that *contain* `@Around`, `@Before`, `@AfterReturning`, `@AfterThrowing`
+advice) and wraps them in CGLIB / JDK dynamic proxies as needed.
+
+In Fineract's case, the only `@Aspect` that absolutely needs proxying is
+Micrometer's `TimedAspect` — but the annotation is also a hint to any other
+aspect Fineract may add later (custom audit aspects, transaction aspects, etc.).
+
+`@EnableTransactionManagement` on `FineractWebApplicationConfiguration` already
+enables a flavor of AOP, but for transactions specifically. Adding
+`@EnableAspectJAutoProxy` here makes the broader AspectJ auto-proxy mechanism
+the canonical one — both work together.
+
+## What `TimedAspect` does
+
+`io.micrometer.core.aop.TimedAspect` is shipped by Micrometer Core. Once
+registered as a Spring bean, any method (or class) annotated with `@Timed`
+gets wrapped in a `Timer` measurement:
+
+```java
+@Timed(value = "fineract.loan.disburse", description = "Loan disbursement latency")
+public LoanDisbursementResult disburse(JsonCommand command) {
+    ...
+}
+```
+
+For each invocation, Micrometer records:
+
+- Total invocation time (`fineract.loan.disburse` histogram).
+- Whether the call threw (the `exception` tag).
+- Whether it was a long-running task (`@Timed(longTask = true)` uses
+  `LongTaskTimer` instead).
+
+The `TimedAspect` reads the `MeterRegistry` bean from the application context.
+Spring Boot Actuator auto-configures a Prometheus-registered `MeterRegistry`
+(when `io.micrometer:micrometer-registry-prometheus` is on the classpath) so
+that all `@Timed` metrics show up at `/actuator/prometheus`.
+
+## Where `@Timed` is used in Fineract
+
+A representative grep shows the annotation on:
+
+- Long-running batch tasklets (the COB chunk processors).
+- The credit-bureau integration write services.
+- Selected `*WritePlatformServiceImpl` methods on the hot paths.
+
+The platform does **not** sprinkle `@Timed` on every method by default —
+Micrometer recommends measuring at logical boundaries rather than every call.
+For broader coverage, the Spring Boot Actuator HTTP metrics
+(`http.server.requests`) automatically time every controller / Jersey resource
+method without code annotations.
+
+## How `MeterRegistry` is auto-wired
+
+The `MeterRegistry` parameter on the `timedAspect` factory method is satisfied
+by Spring Boot Actuator's `CompositeMeterRegistry`. When the Prometheus
+registry is on the classpath:
+
+```
+PrometheusMeterRegistry → CompositeMeterRegistry → MeterRegistry bean → @Autowired into TimedAspect
+```
+
+So the same Timer that `TimedAspect` writes to is the one Prometheus scrapes.
+
+## What `MetricsConfig` does NOT do
+
+For clarity, this class does *not*:
+
+- Register a `MeterRegistry`. That is auto-configured by Spring Boot when
+  `spring-boot-starter-actuator` and a `micrometer-registry-*` are present.
+- Enable Actuator endpoints. Those come from
+  `org.springframework.boot.actuator.autoconfigure.*`.
+- Configure JVM metrics, system metrics, JDBC metrics or Hikari metrics. Those
+  are likewise auto-configured.
+- Enable the `@Counted` annotation. Micrometer has a `CountedAspect` too — if
+  Fineract starts using `@Counted` it would need a parallel `@Bean` here.
+- Touch the `meter-filter` properties (`management.metrics.tags.*`,
+  `management.metrics.distribution.*`). Those are pure property bindings on
+  `MeterRegistryCustomizer`s elsewhere.
+
+## Interaction with @EnableTransactionManagement
+
+`@EnableTransactionManagement` (on `FineractWebApplicationConfiguration`) and
+`@EnableAspectJAutoProxy` (here) are not redundant. The former installs the
+transaction interceptor; the latter sets the *style* of proxying. Combined,
+they ensure:
+
+1. Transaction proxies are created with the same CGLIB strategy as other
+   AspectJ proxies — so `@Transactional` and `@Timed` on the same method
+   compose correctly.
+2. Self-invocations within a class do *not* hit the proxy. The standard AOP
+   limitation applies: if a method on the same `this` calls another `@Timed`
+   method, the inner timer will not fire. Inject the bean into itself
+   (`@Autowired private MyService self;`) or refactor if that matters.
+
+## Adding `@Timed` to a new method
+
+```java
+import io.micrometer.core.annotation.Timed;
+
+@Timed(value = "fineract.cob.partition.process",
+       extraTags = { "tenant", "platform" })
+public PartitionResult process(Partition partition) {
+    ...
+}
+```
+
+That's it. As long as the bean is a Spring bean (anywhere in the application
+context) `TimedAspect` will wrap the call.
+
+## Naming conventions
+
+Convention in the Fineract codebase:
+
+```
+fineract.<subdomain>.<action>
+```
+
+Examples:
+
+- `fineract.loan.disburse`
+- `fineract.cob.partition.process`
+- `fineract.creditbureau.thitsaworks.lookup`
+
+Dots are translated by the Prometheus registry into underscores for the
+exposed metric name. Snake-case tags are preferred for compatibility.
+
+## Verifying it works
+
+1. Add `@Timed("fineract.test.demo")` to a method.
+2. Call it once.
+3. `GET /actuator/prometheus` (after authenticating against the
+   `fineract.security.basicauth` chain — Actuator is typically permitted to
+   the management role).
+4. Search for `fineract_test_demo_seconds_count` — the value should be `1`.
+
+## How `@Timed` translates to Prometheus metrics
+
+A `@Timed` invocation produces several time series, all distinguishable by
+labels. For the example annotation:
+
+```java
+@Timed(value = "fineract.loan.disburse",
+       extraTags = { "channel", "branch-app" })
+public ... { }
+```
+
+Prometheus will see:
+
+| Time series | Type | Meaning |
+| --- | --- | --- |
+| `fineract_loan_disburse_seconds_count{channel="branch-app",exception="none"}` | Counter | Number of successful calls |
+| `fineract_loan_disburse_seconds_count{channel="branch-app",exception="LoanNotFoundException"}` | Counter | Number of calls that threw `LoanNotFoundException` |
+| `fineract_loan_disburse_seconds_sum{…}` | Counter (seconds) | Total CPU+wall time across calls |
+| `fineract_loan_disburse_seconds_max{…}` | Gauge | Max observed latency in a recent window |
+
+The `exception` tag is auto-applied by `TimedAspect` based on whether the
+target method threw. The literal value is the exception class' simple name, or
+`none` for successful calls. This is hugely useful for dashboarding —
+percentile latency vs error rate splits cleanly without writing custom code.
+
+Distribution percentiles (p50, p95, p99) can be enabled per-meter via
+`management.metrics.distribution.percentiles[name]=0.5,0.95,0.99` in
+`application.properties`. Histograms can be turned on via
+`management.metrics.distribution.percentiles-histogram[name]=true`.
+
+## Composition with `@Async` and `@Transactional`
+
+When a method carries multiple AOP annotations, the order of advice matters:
+
+```java
+@Async
+@Transactional
+@Timed("fineract.loan.archive")
+public void archiveLoan(Long loanId) { ... }
+```
+
+Spring orders aspects by their `@Order` value. The defaults:
+
+| Aspect | Default order |
+| --- | --- |
+| `AsyncAnnotationAdvisor` (`@Async`) | `Ordered.LOWEST_PRECEDENCE` |
+| `TransactionInterceptor` (`@Transactional`) | `Ordered.LOWEST_PRECEDENCE` |
+| `TimedAspect` | not explicitly set; defaults to LOWEST_PRECEDENCE |
+
+If two aspects have the same order, behaviour is undefined. In practice you
+should manually order them when you stack three on one method — most often by
+explicitly annotating the bean with `@Order(0)` on the aspect that should run
+outermost. For the Timed/Async/Transactional combo above, the typical desired
+ordering is: `Async` outermost (so the call returns immediately), then
+`Transactional` (start a new transaction on the worker thread), then `Timed`
+(measure the actual work). To force that ordering you generally have to break
+the method into two beans and annotate each separately.
+
+## Why a separate config file?
+
+`@EnableAspectJAutoProxy` and the `TimedAspect` bean could in principle live
+on `FineractWebApplicationConfiguration` or on any other
+`@Configuration`. Keeping them in their own file gives:
+
+- **Clarity.** Anyone searching for "where are the Fineract metrics enabled"
+  finds it in 30 seconds.
+- **Independence from web mode.** `MetricsConfig` carries no
+  `@Conditional` — it is always active, whether the application is running in
+  web mode or Liquibase-only mode. So if you ever ran the Liquibase pipeline
+  long enough to want to time it, `@Timed` already works.
+- **Testability.** A unit test that wants to assert metrics behaviour can
+  import just `MetricsConfig` without dragging in the rest of the application.
+
+## Common gotchas
+
+### `@Timed` on a private method
+
+AOP only sees the public surface of a Spring bean. Annotating a `private`
+method with `@Timed` does nothing — the proxy is generated against the
+public interface (or the public methods of a concrete class). Use AspectJ
+weaving if you really need to instrument internal calls — but the answer is
+almost always "refactor to a separate bean".
+
+### `@Timed` on a class without a public constructor
+
+Some Fineract beans are still package-private or have package-private
+constructors used by configurations. Spring CGLIB-proxies these but the proxy
+generated for AOP requires accessible methods. Stick to standard
+`public`-visibility beans and you won't hit edge cases.
+
+### Tag cardinality
+
+The `extraTags` mechanism is convenient but dangerous. Each unique combination
+of tag values produces a fresh Prometheus time series. Beware of:
+
+```java
+@Timed(value = "fineract.client.lookup",
+       extraTags = { "clientId", "${#root.args[0]}" })   // ❌ unbounded cardinality
+```
+
+A tag whose value is a client ID will produce millions of series. Use tags for
+*dimensions* (channel, tenant tier, product type) — never for IDs. The same
+rule applies in micrometer's `Tags.of(...)` helper.
+
+### `@Timed(longTask = true)`
+
+For methods that run for many seconds, `longTask = true` switches from
+`Timer` to `LongTaskTimer`. The difference: long-task timers report tasks
+*currently in flight*, which is what you want for things like a long-running
+report generation. They do not report a histogram of completed durations.
+Choose one or the other based on what you want to alert on.
+
+### Method-name collisions
+
+Two different methods both annotated `@Timed("foo")` will report to the same
+metric with no way to distinguish them. Either rename the metric or add
+`extraTags` to disambiguate. The Micrometer convention is `class.method` if
+you don't have a better name.
+
+## What to instrument
+
+A short checklist for choosing where to add `@Timed`:
+
+- ✅ Anything that calls out to the network (S3, OkHttp clients, JMS publishers).
+- ✅ Long-running batch tasklets.
+- ✅ Write-platform service entry points (one timer per command).
+- ✅ Anything wrapped in a `@Transactional` that touches more than a few rows.
+- ❌ Pure-CPU helpers (waste of metric cardinality).
+- ❌ Constructors and `@PostConstruct` methods (Spring AOP doesn't proxy them).
+- ❌ Getters / setters / accessors.
+- ❌ Code already covered by HTTP request metrics (Jersey resource methods are
+  timed automatically by `http.server.requests`).
+
+## Related pages
+
+- [/runtime/metrics-and-actuator](/runtime/metrics-and-actuator) — the
+  Actuator and Prometheus scrape configuration.
+- [Provider Overview](/provider/overview) — where `MetricsConfig` sits in the
+  module map.
+- [Spring Config](/provider/spring-config) — the sibling `@Configuration` that
+  registers AOP-adjacent infrastructure (event multicaster, security context).
+- [Task Executor Config](/provider/task-executor-config) — the executors whose
+  `@Timed` measurements are particularly interesting (background work latency).
+- [JPA and EclipseLink](/provider/jpa-and-eclipselink) — pairing
+  `@Transactional` with `@Timed` for accurate per-transaction timing.

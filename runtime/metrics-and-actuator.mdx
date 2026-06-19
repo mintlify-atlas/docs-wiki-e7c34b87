@@ -1,0 +1,351 @@
+---
+title: "Metrics, Micrometer and Spring Boot Actuator Endpoints"
+sidebarTitle: "Metrics & Actuator"
+description: "MetricsConfig, the @Timed aspect, Hikari per-tenant pool metrics, and the Actuator endpoints (health, info, prometheus) exposed by Fineract."
+---
+
+Fineract's observability stack is the standard Spring Boot Actuator +
+Micrometer combination, with two Fineract‑specific additions:
+
+1. **`MetricsConfig`** registers Micrometer's `TimedAspect` so any
+   `@Timed("…")` annotation in business code produces a timer in the
+   `MeterRegistry`.
+2. **`TenantConnectionPoolMetricsTrackerFactory`** plugs HikariCP's
+   per‑connection‑pool metrics into Micrometer, tagged with the tenant
+   identifier, so each per‑tenant pool produces an independent meter
+   family.
+
+Beyond that, everything is configured via `application.properties` —
+endpoint exposure, Prometheus/OTLP/CloudWatch exporters, health probes,
+HTTP server request histograms, and CORS for the management endpoints.
+
+See [`/runtime/server-application`](/runtime/server-application) for how
+`MetricsConfig` is loaded, and
+[`/runtime/datasource-and-connection-pooling`](/runtime/datasource-and-connection-pooling) for
+the Hikari side.
+
+## `MetricsConfig`
+
+```java MetricsConfig.java
+package org.apache.fineract.infrastructure.core.config;
+
+@Configuration
+@EnableAspectJAutoProxy
+public class MetricsConfig {
+
+    @Bean
+    public TimedAspect timedAspect(MeterRegistry registry) {
+        return new TimedAspect(registry);
+    }
+}
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/MetricsConfig.java`.
+
+The only bean it declares is `TimedAspect`. This is Micrometer's AOP
+aspect that intercepts methods annotated `@Timed("metric.name")` and
+records timing samples on the supplied `MeterRegistry`.
+
+The `MeterRegistry` itself is **not** declared here — it is wired by
+Spring Boot's `MetricsAutoConfiguration` (which is *not* excluded by
+`FineractWebApplicationConfiguration`). Spring Boot adds a `CompositeMeterRegistry`
+that, depending on `management.*.export.enabled` flags, wraps Prometheus,
+OTLP, and CloudWatch registries.
+
+`@EnableAspectJAutoProxy` activates the AspectJ proxy machinery so the
+`@Timed` advice can intercept method calls.
+
+### Example: where `@Timed` is used
+
+```java RunreportsApiResource.java
+@GET
+@Path("{reportName}")
+@Timed(value = "fineract.report.execution",
+       description = "Time taken to execute reports",
+       extraTags = { "component", "reporting" })
+public Response runReport(...) { ... }
+```
+
+Source: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/dataqueries/api/RunreportsApiResource.java`.
+
+This produces a Micrometer timer named `fineract.report.execution` with
+tags `application=fineract,component=reporting`.
+
+## Actuator endpoints
+
+```properties application.properties (lines 333-358)
+# FINERACT 1296
+management.endpoint.health.probes.enabled=true
+management.health.livenessState.enabled=true
+management.health.readinessState.enabled=true
+
+management.health.ratelimiters.enabled=${FINERACT_MANAGEMENT_HEALTH_RATELIMITERS_ENABLED:false}
+management.health.jms.enabled=${FINERACT_MANAGEMENT_HEALTH_JMS_ENABLED:false}
+
+management.endpoints.web.cors.allowed-origins=*
+management.endpoints.web.cors.allowed-methods=GET, POST, PUT, DELETE, OPTIONS
+management.endpoints.web.cors.allowed-headers=*
+
+# FINERACT-883
+management.info.git.mode=FULL
+management.endpoints.web.exposure.include=${FINERACT_MANAGEMENT_ENDPOINT_WEB_EXPOSURE_INCLUDE:health,info,prometheus}
+
+management.tracing.enabled=${FINERACT_MANAGEMENT_TRACIING_ENABLED:false}
+
+management.metrics.tags.application=${FINERACT_MANAGEMENT_METRICS_TAGS_APPLICATION:fineract}
+management.metrics.distribution.percentiles-histogram.http.server.requests=${FINERACT_MANAGEMENT_METRICS_DISTRIBUTION_HTTP_SERVER_REQUESTS:false}
+```
+
+Source: `fineract-provider/src/main/resources/application.properties` lines 331‑351.
+
+### Exposed endpoints by default
+
+`management.endpoints.web.exposure.include=health,info,prometheus`
+
+| Endpoint | Path under context | Source | Notes |
+| --- | --- | --- | --- |
+| `health` | `/fineract-provider/actuator/health` | Spring Boot Actuator | Supports liveness/readiness probes (see below). |
+| `info` | `/fineract-provider/actuator/info` | Spring Boot Actuator | Includes full Git metadata (`management.info.git.mode=FULL` from `git.properties`). |
+| `prometheus` | `/fineract-provider/actuator/prometheus` | Micrometer registry | Only present when `management.prometheus.metrics.export.enabled=true`. |
+
+Other endpoints (`metrics`, `env`, `beans`, `loggers`, etc.) are reachable
+only if you append them to the override env var
+`FINERACT_MANAGEMENT_ENDPOINT_WEB_EXPOSURE_INCLUDE=health,info,prometheus,metrics,env,loggers`.
+
+<Note>
+Actuator endpoints are **not** behind Spring Security in the default
+configuration because `SecurityConfig.filterChain` uses
+`http.securityMatcher(API_MATCHER.matcher("/api/**"))`, scoping the chain
+to `/api/**` only. The actuator paths sit outside that matcher. Lock them
+down with a reverse proxy or by adding another `SecurityFilterChain` bean.
+</Note>
+
+### Health probes
+
+| Property | Value | Effect |
+| --- | --- | --- |
+| `management.endpoint.health.probes.enabled` | `true` | Adds `/actuator/health/liveness` and `/actuator/health/readiness` sub‑paths. |
+| `management.health.livenessState.enabled` | `true` | Adds Kubernetes liveness probe semantics. |
+| `management.health.readinessState.enabled` | `true` | Adds Kubernetes readiness probe semantics. |
+| `management.health.ratelimiters.enabled` | `false` (default) | Disables Resilience4j rate‑limiter health (off by default in Fineract). |
+| `management.health.jms.enabled` | `false` (default) | Disables JMS broker health probe (on only when external events JMS is enabled). |
+
+Smoke‑test from `README.md`:
+
+```bash
+curl --insecure https://localhost:8443/fineract-provider/actuator/health
+```
+
+Expected response (paraphrased):
+
+```json
+{
+  "status": "UP",
+  "groups": ["liveness", "readiness"]
+}
+```
+
+## Metrics exporters
+
+Fineract supports three Micrometer registries simultaneously. Activate any
+subset via the `management.*.export.enabled` keys.
+
+### Prometheus
+
+```properties
+management.prometheus.metrics.export.enabled=${FINERACT_MANAGEMENT_PROMETHEUS_ENABLED:false}
+```
+
+When `true`, the `/actuator/prometheus` endpoint serves a text exposition
+of every meter in the `MeterRegistry`. Spring Boot adds the
+`PrometheusMeterRegistry` bean automatically (only requires
+`micrometer-registry-prometheus` on the classpath, which is present).
+
+### OpenTelemetry (OTLP)
+
+```properties
+management.otlp.metrics.export.enabled=${FINERACT_MANAGEMENT_OLTP_ENABLED:false}
+management.otlp.metrics.export.url=${FINERACT_MANAGEMENT_OLTP_METRICS_EXPORT_URL:http://tempo:4318/v1/traces}
+management.otlp.metrics.export.aggregationTemporality=${FINERACT_MANAGEMENT_OLTP_METRICS_EXPORT_AGGREGATION_TEMPORALITY:cumulative}
+```
+
+When `true`, Micrometer pushes meters via OTLP HTTP to the configured
+endpoint (Tempo / OTel collector / Grafana Cloud). Aggregation temporality
+defaults to `cumulative`, which is the OpenMetrics‑compatible choice.
+
+### CloudWatch
+
+```properties
+management.metrics.export.cloudwatch.enabled=${FINERACT_MANAGEMENT_CLOUDWATCH_ENABLED:false}
+management.metrics.export.cloudwatch.namespace=${FINERACT_MANAGEMENT_CLOUDWATCH_NAMESPACE:fineract}
+management.metrics.export.cloudwatch.step=${FINERACT_MANAGEMENT_CLOUDWATCH_STEP:1m}
+```
+
+When `true`, Spring Cloud AWS's CloudWatch registry pushes to the
+namespace `fineract` every minute by default. AWS credentials are picked
+up from the `spring.cloud.aws.*` block right next to it:
+
+```properties
+spring.cloud.aws.region.static=${FINERACT_AWS_REGION_STATIC:us-east-1}
+spring.cloud.aws.credentials.access-key=${FINERACT_AWS_CREDENTIALS_ACCESS_KEY:}
+spring.cloud.aws.credentials.secret-key=${FINERACT_AWS_CREDENTIALS_SECRET_KEY:}
+spring.cloud.aws.credentials.instance-profile=${FINERACT_AWS_CREDENTIALS_INSTANCE_PROFILE:false}
+spring.cloud.aws.credentials.profile.name=${FINERACT_AWS_CREDENTIALS_PROFILE_NAME:}
+spring.cloud.aws.credentials.profile.path=${FINERACT_AWS_CREDENTIALS_PROFILE_PATH:}
+```
+
+Fineract also excludes the noisy AWS autoconfigurations when CloudWatch is
+not used:
+
+```properties
+spring.autoconfigure.exclude=${FINERACT_AUTOCONFIGURE_EXCLUDE:io.awspring.cloud.autoconfigure.core.AwsAutoConfiguration,\
+  io.awspring.cloud.autoconfigure.core.CredentialsProviderAutoConfiguration}
+```
+
+## Common tags
+
+```properties
+management.metrics.tags.application=${FINERACT_MANAGEMENT_METRICS_TAGS_APPLICATION:fineract}
+```
+
+Every meter gets `application=fineract` by default. Override the env var to
+distinguish multiple Fineract deployments sharing one Prometheus.
+
+## HTTP server request histograms
+
+```properties
+management.metrics.distribution.percentiles-histogram.http.server.requests=${FINERACT_MANAGEMENT_METRICS_DISTRIBUTION_HTTP_SERVER_REQUESTS:false}
+```
+
+When `true`, Spring Boot's `http.server.requests` timer publishes a
+full latency histogram (suitable for Prometheus `histogram_quantile()`
+queries). Off by default to keep cardinality manageable.
+
+## Tracing
+
+```properties
+management.tracing.enabled=${FINERACT_MANAGEMENT_TRACIING_ENABLED:false}
+```
+
+When `true`, Spring Boot wires Micrometer Tracing (with the Brave or
+OpenTelemetry bridge present on the classpath). Span and trace IDs are
+injected into the log pattern via `%X{traceId}` / `%X{spanId}` from the
+`logging.pattern.level` definition (`logging.pattern.level=%5p
+[${spring.application.name:},%X{traceId:-},%X{spanId:-}]`). See
+[`/runtime/logging-and-correlation`](/runtime/logging-and-correlation).
+
+## CORS for management endpoints
+
+```properties
+management.endpoints.web.cors.allowed-origins=*
+management.endpoints.web.cors.allowed-methods=GET, POST, PUT, DELETE, OPTIONS
+management.endpoints.web.cors.allowed-headers=*
+```
+
+Open CORS so that Grafana dashboards and admin UIs can scrape the actuator
+endpoints directly from a browser context. Tighten in production.
+
+## Per‑tenant HikariCP metrics
+
+When a `MeterRegistry` is present, every per‑tenant Hikari pool gets a
+`TenantConnectionPoolMetricsTrackerFactory`:
+
+```java DataSourcePerTenantServiceFactory.java (excerpt)
+meterRegistry.ifPresent(registry -> config.setMetricsTrackerFactory(
+        new TenantConnectionPoolMetricsTrackerFactory(tenant.getTenantIdentifier(), registry)));
+```
+
+```java TenantConnectionPoolMetricsTrackerFactory.java
+@RequiredArgsConstructor
+public class TenantConnectionPoolMetricsTrackerFactory implements MetricsTrackerFactory {
+
+    private final String tenantIdentifier;
+    private final MeterRegistry registry;
+
+    @Override
+    public IMetricsTracker create(String poolName, PoolStats poolStats) {
+        return new TenantConnectionPoolMetricsTracker(tenantIdentifier, poolName, poolStats, registry);
+    }
+}
+```
+
+Source: `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/service/database/metrics/TenantConnectionPoolMetricsTrackerFactory.java`.
+
+The tracker tags every meter with `tenant=<identifier>` so Prometheus
+queries like `sum by (tenant) (hikaricp_connections_active)` work
+out of the box. HikariCP's stock meters
+(`hikaricp.connections`, `hikaricp.connections.active`,
+`hikaricp.connections.idle`, `hikaricp.connections.usage`,
+`hikaricp.connections.timeout`, etc.) become per‑tenant series.
+
+## Built‑in meters you can rely on
+
+Once `prometheus` is exposed and the registry is enabled, the following
+families are populated automatically by Boot's autoconfigurations:
+
+| Meter family | Source | Tags |
+| --- | --- | --- |
+| `http.server.requests` | Spring MVC + Actuator binder | `method`, `uri`, `status`, `exception`, `outcome` |
+| `jvm.memory.used` / `jvm.memory.max` / `jvm.gc.*` / `jvm.threads.*` | Micrometer JVM binders | (none by default) |
+| `system.cpu.usage` / `process.cpu.usage` | Micrometer system binders | — |
+| `logback.events` | Logback binder | `level` |
+| `tomcat.sessions.*` / `tomcat.threads.*` | Tomcat binders | — |
+| `hikaricp.connections.*` | HikariCP via `MetricsTrackerFactory` | per‑tenant `tenant` tag (Fineract addition) plus the standard `pool` tag |
+| `jdbc.connections.active` / `idle` | Spring Boot JDBC binder | — |
+| `spring.security.*` | Boot Security binder | — |
+| `spring.batch.*` | Spring Batch binders | `job.name`, `step.name`, `status` |
+| `fineract.report.execution` | `@Timed` on `RunreportsApiResource#runReport` | `component=reporting` |
+| Any `@Timed("...")` in module code | `TimedAspect` | as declared on the annotation |
+
+## Operational dashboards — quick recipes
+
+| You want | PromQL |
+| --- | --- |
+| Per‑tenant active connections | `sum by (tenant) (hikaricp_connections_active)` |
+| HTTP error rate per endpoint | `sum by (uri,status) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))` |
+| Average DB connection wait | `avg(rate(hikaricp_connections_acquire_seconds_sum[1m]) / rate(hikaricp_connections_acquire_seconds_count[1m]))` |
+| GC pause budget | `histogram_quantile(0.95, sum(rate(jvm_gc_pause_seconds_bucket[5m])) by (le))` |
+| Outstanding Spring Batch steps | `spring_batch_step_active_seconds_count - spring_batch_step_seconds_count` |
+
+## Adding a new metric
+
+For a Spring service:
+
+```java
+@Service
+public class FooService {
+
+    @Timed(value = "fineract.foo.bar", description = "Time spent doing foo bar")
+    public Foo doBarOnFoo(Long id) { ... }
+}
+```
+
+For ad‑hoc gauges and counters, inject `MeterRegistry`:
+
+```java
+@Service
+@RequiredArgsConstructor
+public class FooService {
+
+    private final MeterRegistry meterRegistry;
+
+    public void doSomething() {
+        meterRegistry.counter("fineract.foo.events", "type", "create").increment();
+    }
+}
+```
+
+The `TimedAspect` only intercepts `@Timed` on Spring‑proxied beans
+(everything in `@Service`, `@Component`, `@RestController` etc.). It will
+not work on plain `new`‑instantiated objects.
+
+## Cross‑references
+
+- [`/runtime/server-application`](/runtime/server-application) — `MetricsConfig` is loaded with the rest of the config classes.
+- [`/runtime/spring-boot-configuration`](/runtime/spring-boot-configuration) — autoconfig and the `MetricsConfig` table entry.
+- [`/runtime/datasource-and-connection-pooling`](/runtime/datasource-and-connection-pooling) — where `TenantConnectionPoolMetricsTrackerFactory` is wired into each per‑tenant pool.
+- [`/runtime/logging-and-correlation`](/runtime/logging-and-correlation) — correlation, trace and span IDs in the log pattern.
+- [`/runtime/transaction-management`](/runtime/transaction-management) — `@Timed` on transactional methods covers both DB and business latency.
+- [`/security/overview`](/security/overview) — actuator endpoints are *outside* the `/api/**` security matcher.
+- [`/tenancy/overview`](/tenancy/overview) — the `tenant` tag flows from `ThreadLocalContextUtil` into the per‑tenant pool tracker.
+- [`/core/overview`](/core/overview) — the metrics subpackage in `fineract-core` (`infrastructure/core/service/database/metrics/`).

@@ -1,0 +1,387 @@
+---
+title: "Share Accounts: Lifecycle, Transactions and Accounts API"
+sidebarTitle: "Share Accounts"
+description: "Reference for the ShareAccount entity, ShareAccountTransaction, the apply -> approve -> activate -> redeem lifecycle, and the AccountsApiResource at /accounts/share."
+---
+
+Apache Fineract supports cooperative-style equity holdings through the **share account** subsystem in `org.apache.fineract.portfolio.shareaccounts`. A share account represents a client's holding of shares in a `ShareProduct` (see [/portfolio/share-products](/portfolio/share-products)): the client applies for a number of shares, the cooperative approves and activates the application, dividends are declared from time to time on the product, and the client may apply for additional shares or redeem shares back to the cooperative.
+
+The REST surface is intentionally generic — the same `AccountsApiResource` at `/v1/accounts/{type}` handles "share" account variants (`/v1/accounts/share`) and was designed so other equity-style products can plug in by type. This page documents the entity model, the typed transaction enum, the status state machine, and how the resource dispatches the lifecycle commands.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ShareAccount` entity | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `ShareAccountTransaction` entity | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `ShareAccountCharge`, `ShareAccountChargePaidBy` | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `ShareAccountDividendDetails` | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `ShareAccountStatusType` enum | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `PurchasedSharesStatusType` enum | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.domain` |
+| `ShareAccount*Data` DTOs | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.data` |
+| `AccountsApiResource` (`/v1/accounts/{type}`) | `fineract-provider` | `org.apache.fineract.portfolio.accounts.api` |
+| `ShareAccountApiConstants` | `fineract-provider` | `org.apache.fineract.portfolio.accounts.constants` |
+| Handlers (Activate, Approve, Reject, Close, ApplyAdditional, Redeem…) | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.handler` |
+| Read / write services | `fineract-provider` | `org.apache.fineract.portfolio.shareaccounts.service` |
+
+The "accounts" resource lives in a separate package because it was designed as a multi-type facade, but today only `share` accounts are wired through it.
+
+## Entity
+
+```java
+// fineract-provider/.../portfolio/shareaccounts/domain/ShareAccount.java
+@Entity
+@Table(name = "m_share_account")
+public class ShareAccount extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "client_id")
+    private Client client;
+
+    @ManyToOne
+    @JoinColumn(name = "product_id")
+    private ShareProduct shareProduct;
+
+    @Column(name = "status_enum", nullable = false)
+    protected Integer status;
+
+    @Column(name = "submitted_date")
+    private LocalDate submittedDate;
+    @ManyToOne(optional = true) @JoinColumn(name = "submitted_userid") protected AppUser submittedBy;
+
+    @Column(name = "approved_date")          protected LocalDate approvedDate;
+    @ManyToOne(optional = true) @JoinColumn(name = "approved_userid")  protected AppUser approvedBy;
+
+    @Column(name = "rejected_date")          protected LocalDate rejectedDate;
+    @ManyToOne(optional = true) @JoinColumn(name = "rejected_userid")  protected AppUser rejectedBy;
+
+    @Column(name = "activated_date")         protected LocalDate activatedDate;
+    @ManyToOne(optional = true) @JoinColumn(name = "activated_userid") protected AppUser activatedBy;
+    // ...
+}
+```
+
+The header carries the lifecycle dates and the user who performed each transition. The class also holds:
+
+- `closedDate` / `closedBy` — set when the account is closed (after redemption to zero).
+- `totalApprovedShares`, `totalPendingShares` — running counts updated as transactions land.
+- `unitPrice` — the price-per-share captured at activation (in case the product market price changes later).
+- `currency` (embedded `MonetaryCurrency`).
+- `lockinPeriod`, `lockinPeriodType` — minimum hold period before redemption is allowed.
+- `minimumActivePeriod`, `minimumActivePeriodType` — minimum lifetime before dividends accrue.
+- `savingsAccountId` — the client's savings account where purchase debits and redemption credits land.
+- `accountNumber`, `externalId`.
+- A `Set<ShareAccountTransaction>` of purchase/redeem records, a `Set<ShareAccountCharge>` and a `Set<ShareAccountDividendDetails>`.
+
+## Status state machine
+
+```java
+// fineract-provider/.../portfolio/shareaccounts/domain/ShareAccountStatusType.java
+public enum ShareAccountStatusType {
+    INVALID(0,   "shareAccountStatusType.invalid"),
+    SUBMITTED_AND_PENDING_APPROVAL(100, "shareAccountStatusType.submitted.and.pending.approval"),
+    APPROVED(200, "shareAccountStatusType.approved"),
+    ACTIVE(300,   "shareAccountStatusType.active"),
+    REJECTED(500, "shareAccountStatusType.rejected"),
+    CLOSED(600,   "shareAccountStatusType.closed");
+    // ...
+}
+```
+
+Lifecycle transitions (each is its own `CommandHandler`):
+
+```
+SUBMITTED_AND_PENDING_APPROVAL (100)
+   │   ApproveShareAccountCommandHandler
+   ▼
+APPROVED (200)  ─── UndoApproveShareAccountCommandHandler ─▶ back to 100
+   │   ActivateShareAccountCommandHandler
+   ▼
+ACTIVE (300)
+   │   ApplyAddtionalSharesCommandHandler   (asynchronous: APPROVED transactions await approval)
+   │   ApproveAddtionalSharesCommandHandler
+   │   RejectAddtionalSharesCommandHandler
+   │   RedeemSharesCommandHandler
+   │   CloseShareAccountCommandHandler
+   ▼
+CLOSED (600)
+
+Any 100 → REJECTED (500) via RejectShareAccountCommandHandler.
+```
+
+`ShareAccountStatusType` exposes `isSubmittedAndPendingApproval()`, `isApproved()`, `isActive()`, `isClosed()`, `isRejected()` predicates used throughout the write paths.
+
+## Transactions
+
+```java
+// fineract-provider/.../portfolio/shareaccounts/domain/ShareAccountTransaction.java
+@Entity
+@Table(name = "m_share_account_transactions")
+public class ShareAccountTransaction extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "account_id", referencedColumnName = "id", nullable = false)
+    private ShareAccount shareAccount;
+
+    @Column(name = "transaction_date") private LocalDate transactionDate;
+    @Column(name = "total_shares")     private Long totalShares;
+    @Column(name = "unit_price")       private BigDecimal shareValue;
+    @Column(name = "amount")           private BigDecimal amount;
+    @Column(name = "amount_paid")      private BigDecimal amountPaid;
+    @Column(name = "charge_amount")    private BigDecimal chargeAmount;
+    @Column(name = "status_enum")      private Integer status;
+    @Column(name = "type_enum")        private Integer type;
+    @Column(name = "is_active")        private boolean active = true;
+
+    @OneToMany(cascade = CascadeType.ALL, mappedBy = "shareAccountTransaction",
+               orphanRemoval = true, fetch = FetchType.EAGER)
+    private Set<ShareAccountChargePaidBy> shareAccountChargesPaid = new HashSet<>();
+```
+
+Each transaction carries both a **status** (workflow) and a **type** (semantic), drawn from the same enum table:
+
+```java
+// fineract-provider/.../portfolio/shareaccounts/domain/PurchasedSharesStatusType.java
+public enum PurchasedSharesStatusType {
+    INVALID(0, "purchasedSharesStatusType.invalid"),
+    APPLIED(100, "purchasedSharesStatusType.applied"),
+    APPROVED(300, "purchasedSharesStatusType.approved"),
+    REJECTED(400, "purchasedSharesStatusType.rejected"),
+    PURCHASED(500, "purchasedSharesType.purchased"),
+    REDEEMED(600, "purchasedSharesType.redeemed"),
+    CHARGE_PAYMENT(700, "charge.payment");
+}
+```
+
+Common combinations:
+
+| Type | Status | Meaning |
+| --- | --- | --- |
+| `PURCHASED (500)` | `APPLIED (100)` | Additional shares applied for, awaiting approval. |
+| `PURCHASED (500)` | `APPROVED (300)` | Approved purchase; balance updated. |
+| `PURCHASED (500)` | `REJECTED (400)` | Approval refused; nothing booked. |
+| `REDEEMED (600)` | `APPROVED (300)` | Redemption processed and shares retired. |
+| `CHARGE_PAYMENT (700)` | `APPROVED (300)` | Charge taken in shares (rare) or charge paid from purchase amount. |
+
+The transaction constructor at the bottom of the class shows the default state for a new application:
+
+```java
+public ShareAccountTransaction(final LocalDate transactionDate, final Long totalShares, final BigDecimal shareValue) {
+    this.transactionDate = transactionDate;
+    this.totalShares = totalShares;
+    this.shareValue = shareValue;
+    this.status = PurchasedSharesStatusType.APPLIED.getValue();
+    this.type   = PurchasedSharesStatusType.PURCHASED.getValue();
+    this.amount = shareValue.multiply(BigDecimal.valueOf(totalShares));
+    this.amountPaid = new BigDecimal(this.amount.doubleValue());
+}
+```
+
+A `ShareAccountChargePaidBy` is a join row that captures which charge each `chargeAmount` slice paid for.
+
+## REST surface — `AccountsApiResource`
+
+The endpoint is mounted at `/v1/accounts/{type}` and the `{type}` is `share` for share accounts. The resource is a thin facade over `ShareAccountReadPlatformService` and the command pipeline:
+
+```java
+// fineract-provider/.../portfolio/accounts/api/AccountsApiResource.java
+@Path("/v1/accounts/{type}")
+@Component
+@Tag(name = "Share Account")
+@RequiredArgsConstructor
+public class AccountsApiResource {
+
+    private final ApiRequestParameterHelper apiRequestParameterHelper;
+    private final DefaultToApiJsonSerializer<AccountData> toApiJsonSerializer;
+    private final PlatformSecurityContext platformSecurityContext;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final BulkImportWorkbookService bulkImportWorkbookService;
+    private final BulkImportWorkbookPopulatorService bulkImportWorkbookPopulatorService;
+    private final ShareAccountReadPlatformService shareAccountReadPlatformService;
+```
+
+### Template
+
+```java
+@GET
+@Path("template")
+@Operation(summary = "Retrieve Share Account Template")
+public ShareAccountData template(@PathParam("type") final String accountType,
+                                 @QueryParam("clientId") final Long clientId,
+                                 @QueryParam("productId") final Long productId) {
+    this.platformSecurityContext.authenticatedUser();
+    return shareAccountReadPlatformService.retrieveTemplate(clientId, productId);
+}
+```
+
+The template returns: available share products, the client's savings accounts to link, the field defaults from the product, and the allowed value lists for `lockinPeriodType` etc.
+
+### Retrieve
+
+```java
+@GET
+@Path("{accountId}")
+public ShareAccountData retrieveAccount(@PathParam("accountId") final Long accountId,
+                                        @PathParam("type") final String accountType,
+                                        @Context final UriInfo uriInfo) {
+    final ApiRequestJsonSerializationSettings settings = this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return shareAccountReadPlatformService.retrieveOne(accountId, settings.isTemplate());
+}
+```
+
+### List
+
+```java
+@GET
+public Page<AccountData> retrieveAllAccounts(@PathParam("type") final String accountType,
+                                             @QueryParam("offset") final Integer offset,
+                                             @QueryParam("limit") final Integer limit) {
+    return shareAccountReadPlatformService.retrieveAll(offset, limit);
+}
+```
+
+### Create (submit application)
+
+```java
+@POST
+@Operation(summary = "Submit new share application")
+public CommandProcessingResult createAccount(@PathParam("type") final String accountType,
+                                             AccountRequest accountRequest) {
+    this.platformSecurityContext.authenticatedUser();
+    CommandWrapper commandWrapper = new CommandWrapperBuilder().createAccount(accountType)
+            .withJson(toApiJsonSerializer.serialize(accountRequest)).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+Mandatory fields: `clientId`, `productId`, `submittedDate`, `savingsAccountId`, `requestedShares`, `applicationDate`. Optional: `accountNo`, `externalId`. Several fields default from the product if omitted: `minimumActivePeriod`, `minimumActivePeriodFrequencyType`, `lockinPeriodFrequency`, `lockinPeriodFrequencyType`.
+
+### Update — pre-approval edits only
+
+```java
+@PUT
+@Path("{accountId}")
+@Operation(summary = "Modify a share application",
+           description = "Share application can only be modified when in 'Submitted and pending approval' state. ...")
+public CommandProcessingResult updateAccount(@PathParam("type") final String accountType,
+                                             @PathParam("accountId") final Long accountId,
+                                             AccountRequest accountRequest) {
+    this.platformSecurityContext.authenticatedUser();
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().updateAccount(accountType, accountId)
+            .withJson(toApiJsonSerializer.serialize(accountRequest)).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+### Lifecycle commands
+
+```java
+@POST
+@Path("{accountId}")
+@Operation(summary = "Approve share application | Undo approval ... | Reject share application | "
+                  + "Activate a share account | Close a share account | "
+                  + "Apply additional shares on a share account | Approve additional shares request ... | "
+                  + "Reject additional shares request ... | Redeem shares on a share account")
+public CommandProcessingResult handleCommands(@PathParam("type") final String accountType,
+                                              @PathParam("accountId") final Long accountId,
+                                              @QueryParam("command") final String commandParam,
+                                              final String apiRequestBodyAsJson) {
+    this.platformSecurityContext.authenticatedUser();
+    CommandWrapper commandWrapper = new CommandWrapperBuilder().createAccountCommand(accountType, accountId, commandParam)
+            .withJson(apiRequestBodyAsJson).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+Recognised `?command=` values:
+
+| Command | Handler |
+| --- | --- |
+| `approve` | `ApproveShareAccountCommandHandler` |
+| `undoApprove` | `UndoApproveShareAccountCommandHandler` |
+| `reject` | `RejectShareAccountCommandHandler` |
+| `activate` | `ActivateShareAccountCommandHandler` |
+| `close` | `CloseShareAccountCommandHandler` |
+| `applyAdditionalShares` | `ApplyAddtionalSharesCommandHandler` |
+| `approveAdditionalShares` | `ApproveAddtionalSharesCommandHandler` |
+| `rejectAdditionalShares` | `RejectAddtionalSharesCommandHandler` |
+| `redeem` | `RedeemSharesCommandHandler` |
+
+(The "Addtional" misspelling is preserved as in source.)
+
+### Bulk import
+
+The resource ships `downloadtemplate` and `uploadtemplate` endpoints that round-trip Excel workbooks for mass share-account creation. See [/core/bulk-import](/core/bulk-import) for the framework details.
+
+## Activation
+
+On activation:
+
+1. `ShareAccount.activate(...)` flips the status to `ACTIVE`, records `activatedDate` / `activatedBy`.
+2. The initial application's `PURCHASED/APPLIED` transaction is flipped to `PURCHASED/APPROVED`, the shares are added to `totalApprovedShares`.
+3. The savings account specified by `savingsAccountId` is debited for `requestedShares × unitPrice + chargeAmount`. If the savings account has insufficient balance, activation fails with `InsufficientAccountBalanceException`.
+4. If the product configures an `accountingRule = Cash`, the journal entries are posted at this point.
+
+## Additional purchases
+
+While the account is `ACTIVE`:
+
+1. `?command=applyAdditionalShares` creates a new `ShareAccountTransaction` with `status=APPLIED, type=PURCHASED` and the requested share count.
+2. `?command=approveAdditionalShares` flips the status to `APPROVED` and debits the savings account.
+3. `?command=rejectAdditionalShares` flips the status to `REJECTED`; nothing booked.
+
+`IssueableSharesExceededException` is raised when an approval would exceed the product's `totalShares - totalSharesIssued` cap.
+
+## Redemption
+
+`?command=redeem` checks the lockin period (`activatedDate + lockinPeriod`) and the minimum-active period before allowing redemption. It then creates a `ShareAccountTransaction` with `status=APPROVED, type=REDEEMED`, credits the savings account with `redeemedShares × unitPrice`, and decrements `totalApprovedShares`.
+
+## Close
+
+`?command=close` is only permitted when `totalApprovedShares == 0`. It flips status to `CLOSED` and records `closedDate` / `closedBy`.
+
+## Dividends
+
+The `ShareAccountDividendDetails` entity records per-account dividend payouts initiated by `ShareDividendApiResource` on the parent product (see [/portfolio/share-products](/portfolio/share-products)). Each detail row holds:
+
+- `dividendPayOutId` (link to product-level payout),
+- `amount` (proportional to the account's active shares during the dividend period),
+- `status` (`INITIATED`, `PAID`),
+- `payOutDate`.
+
+On approval, the corresponding amount is credited into the linked savings account.
+
+## Read service
+
+`ShareAccountReadPlatformService.retrieveOne(id, isTemplate)` returns a `ShareAccountData` with:
+
+- header (account number, status, currency, dates),
+- `purchasedShares` (transaction list),
+- `summary` (cached counters),
+- `charges` (active `ShareAccountCharge` set),
+- `dividendDetails`,
+- conditional template options when `isTemplate=true`.
+
+## Failure modes
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `ShareAccountNotFoundException` | 404 | `{accountId}` unknown. |
+| `IssueableSharesExceededException` | 400 | Approval would exceed the product's issuable share cap. |
+| `InsufficientAccountBalanceException` | 400 | Linked savings account cannot fund the purchase. |
+| `LockedInForPeriodException` | 400 | Redemption attempted before lockin period expiry. |
+
+## Permissions
+
+Standard CRUD permissions plus per-command permissions: `APPROVE_SHAREACCOUNT`, `REJECT_SHAREACCOUNT`, `ACTIVATE_SHAREACCOUNT`, `CLOSE_SHAREACCOUNT`, `APPLY_ADDITIONALSHARES_SHAREACCOUNT`, `APPROVE_ADDITIONALSHARES_SHAREACCOUNT`, `REJECT_ADDITIONALSHARES_SHAREACCOUNT`, `REDEEM_SHAREACCOUNT`, etc. Permission resource name is `SHAREACCOUNT`.
+
+## Cross-references
+
+- [/portfolio/share-products](/portfolio/share-products) — product, dividend periods, dividend API.
+- [/portfolio/account-details](/portfolio/account-details) — `ShareAccountSummaryData` in the client/group accounts overview.
+- [/savings/overview](/savings/overview) — the linked savings account that funds purchases and receives redemptions/dividends.
+- [/portfolio/payment-details](/portfolio/payment-details) — embeds `PaymentDetail` on each share transaction.
+- [/portfolio/payment-types](/portfolio/payment-types) — the `PaymentType` catalogue.
+- [/accounting/overview](/accounting/overview) — `Cash` accounting rule postings on activation / redemption.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder.createAccountCommand(...)`.

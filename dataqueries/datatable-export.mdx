@@ -1,0 +1,369 @@
+---
+title: "Datatable Export — CSV, JSON, PDF and S3 Report Output"
+sidebarTitle: "Datatable Export"
+description: "Apache Fineract datatable export: DatatableExportTargetParameter, the CSV/JSON/PDF/S3 export services, file-naming rules and S3 bucket configuration."
+---
+
+Apache Fineract's `DatatableReportingProcessService` (the `@ReportService(type = { "Table", "Chart", "SMS" })` implementation that handles every SQL-backed report) selects an output format at run time based on the query parameters and hands execution to a matching `DatatableReportExportService`. The bundled exports are CSV, JSON, PDF and S3 (CSV upload). Each export is a Spring bean wired into a `List<DatatableReportExportService>` and matched via the `supports(DatatableExportTargetParameter)` predicate. The target parameter is negotiated from the URL via `DatatableExportTargetParameter.resolverExportTarget(queryParams)`.
+
+For the running endpoint see [Run reports](/dataqueries/run-reports); for the wider module map see [Data queries overview](/dataqueries/overview).
+
+## Export target enum — `DatatableExportTargetParameter`
+
+```java
+// fineract-provider/.../infrastructure/dataqueries/service/DatatableExportTargetParameter.java
+public enum DatatableExportTargetParameter {
+    CSV("exportCSV"),
+    PDF("exportPDF"),
+    S3("exportS3"),
+    JSON("exportJSON"),
+    PRETTY_JSON("pretty");
+
+    public static DatatableExportTargetParameter resolverExportTarget(final MultivaluedMap<String, String> queryParams) {
+        for (DatatableExportTargetParameter parameter : DatatableExportTargetParameter.values()) {
+            String parameterName = parameter.getValue();
+            if (queryParams.getFirst(parameterName) != null) {
+                if ("true".equalsIgnoreCase(queryParams.getFirst(parameterName))) {
+                    return parameter;
+                }
+            }
+        }
+        return JSON;
+    }
+}
+```
+
+| Target | Query parameter | Default? | Service |
+|---|---|---|---|
+| `CSV` | `exportCSV=true` | no | `CsvDatatableReportExportServiceImpl` |
+| `PDF` | `exportPDF=true` | no | `PdfDatatableReportExportService` |
+| `S3` | `exportS3=true` | no, optional bean | `S3DatatableReportExportServiceImpl` |
+| `JSON` | `exportJSON=true` | yes (fallback) | `JsonDatatableReportExportService` |
+| `PRETTY_JSON` | `pretty=true` | no | `JsonDatatableReportExportService` |
+
+`resolverExportTarget` returns `JSON` when none of the matching flags is `true`. Multiple flags are processed in enum order — `CSV` wins over `JSON` if both are set.
+
+## Service contract — `DatatableReportExportService`
+
+```java
+public interface DatatableReportExportService {
+    ResponseHolder export(String reportName, MultivaluedMap<String,String> queryParams,
+                          Map<String,String> reportParams, String parameterTypeValue);
+    boolean supports(DatatableExportTargetParameter exportType);
+}
+```
+
+- `reportName` — the report being executed.
+- `queryParams` — full URL query map (includes all `R_*` plus the export flag and any provider-specific options).
+- `reportParams` — `Map<String,String>` derived from `queryParams` (the `R_*` prefix stripped; see [Run reports](/dataqueries/run-reports#datatablereportingprocessserviceprocessrequest)).
+- `parameterTypeValue` — `"report"` or `"parameter"`, forwarded to `ReadReportingService.retrieveGenericResultset(...)`.
+- `ResponseHolder` — record carrying `(status, contentType, fileName, entity, headers)`; `DatatableReportingProcessService` then materialises it into a JAX-RS `Response`.
+
+## JSON — `JsonDatatableReportExportService`
+
+The default path. Runs the report and serialises the `GenericResultsetData`:
+
+```java
+@Override
+public ResponseHolder export(...) {
+    final GenericResultsetData result = readExtraDataAndReportingService.retrieveGenericResultset(
+        reportName, parameterTypeValue, reportParams);
+    String json;
+    final boolean grsPassed = ApiParameterHelper.genericResultSetPassed(queryParams);
+    final boolean grs       = ApiParameterHelper.genericResultSet(queryParams);
+    if (grsPassed) {
+        json = grs
+            ? toApiJsonSerializer.serialize(result)                         // generic-resultset envelope
+            : genericDataService.generateJsonFromGenericResultsetData(result); // flat array of objects
+    } else {
+        json = toApiJsonSerializer.serialize(result);
+    }
+    return new ResponseHolder(Response.Status.OK).entity(json).contentType(MediaType.APPLICATION_JSON);
+}
+
+@Override public boolean supports(DatatableExportTargetParameter t) {
+    return t == DatatableExportTargetParameter.JSON || t == DatatableExportTargetParameter.PRETTY_JSON;
+}
+```
+
+Three response shapes are possible:
+
+| Caller query | Shape |
+|---|---|
+| (no `genericResultSet` param) | `{ "columnHeaders": [...], "data": [{"row":[...]}, ...] }` — the canonical generic resultset envelope |
+| `genericResultSet=true` | Same envelope as above, explicit |
+| `genericResultSet=false` | Flat `[ { "column1": "value1", "column2": "value2" }, ... ]` — column names become JSON keys via `GenericDataService.generateJsonFromGenericResultsetData(result)` |
+
+`pretty=true` is also handled here because `PRETTY_JSON` falls within `supports(...)` — the actual indentation is applied by the JAX-RS serializer settings derived from the query (`ApiRequestParameterHelper`).
+
+## CSV — `CsvDatatableReportExportServiceImpl`
+
+```java
+@Override
+public ResponseHolder export(...) {
+    final StreamingOutput result = readExtraDataAndReportingService.retrieveReportCSV(
+        reportName, parameterTypeValue, reportParams);
+    return new ResponseHolder(Response.Status.OK)
+        .contentType("text/csv")
+        .addHeader("Content-Disposition",
+                   "attachment;filename=" + DatatableExportUtil.generatePlainExportFileName(
+                       255, "csv", reportName, reportParams))
+        .entity(result);
+}
+```
+
+The actual CSV writing happens inside `ReadReportingServiceImpl.retrieveReportCSV(...)`:
+
+1. Runs the SQL via `retrieveGenericResultset(...)`.
+2. Wraps the result in a `StreamingOutput` that writes the column headers as the first CSV row.
+3. Streams each `ResultsetRowData.getRow()` as one CSV record using `org.apache.commons.csv.CSVPrinter` with `CSVFormat.DEFAULT`.
+4. Escaping follows Apache Commons CSV defaults: comma separator, double-quote for fields containing commas/newlines/double-quotes.
+
+The response header `Content-Disposition: attachment;filename=…` tells the browser to download rather than render. Filename rules are documented below.
+
+## PDF — `PdfDatatableReportExportService`
+
+```java
+@Override
+public ResponseHolder export(...) {
+    final String pdfFileName = readExtraDataAndReportingService.retrieveReportPDF(
+        reportName, parameterTypeValue, reportParams);
+    final File file = new File(pdfFileName);
+    return new ResponseHolder(Response.Status.OK)
+        .contentType("application/pdf")
+        .addHeader("Content-Disposition", "attachment; filename=\"" + pdfFileName + "\"")
+        .entity(file);
+}
+```
+
+`ReadReportingServiceImpl.retrieveReportPDF(...)`:
+
+1. Computes the on-disk path under `${fineract.content.filesystem.rootFolder}/{reportName}.pdf`.
+2. Creates the parent directory if missing.
+3. Runs the SQL via `retrieveGenericResultset(...)`.
+4. Builds a B0-rotated PDF via OpenPDF (`org.openpdf.text.Document` / `PdfPTable`); one column per result column, one row per result row.
+5. **Path-traversal guard.** The report name is validated against `^[a-zA-Z0-9_.-]+$` and the resolved `Path` is checked to be a descendant of the configured root:
+   ```java
+   if (!reportName.matches("^[a-zA-Z0-9_.-]+$")) {
+       throw new IllegalArgumentException("Invalid report name format");
+   }
+   Path validatedPath = Paths.get(fileLocation, reportName + ".pdf").normalize();
+   if (!validatedPath.startsWith(Paths.get(fileLocation))) {
+       throw new IllegalArgumentException("Path traversal attempt detected");
+   }
+   ```
+6. Writes to the validated path; returns the path so the export service can stream the `File` back.
+
+Note that the PDF is materialised on the application server's local filesystem. For high-throughput environments operators should monitor and prune the `rootFolder` directory.
+
+## S3 — `S3DatatableReportExportServiceImpl`
+
+The S3 export uploads a CSV rendering to an S3 bucket instead of streaming it back to the caller:
+
+```java
+@RequiredArgsConstructor
+public class S3DatatableReportExportServiceImpl implements DatatableReportExportService {
+    public static final int AWS_S3_MAXIMUM_KEY_LENGTH = 1024;
+
+    private final ReadReportingService readExtraDataAndReportingService;
+    private final ConfigurationDomainService configurationDomainService;
+    private final S3Client s3Client;
+    private final FineractProperties properties;
+
+    @Override
+    public ResponseHolder export(String reportName, MultivaluedMap<String,String> queryParams,
+                                 Map<String,String> reportParams, String parameterTypeValue) {
+        try {
+            StreamingOutput output = readExtraDataAndReportingService.retrieveReportCSV(
+                reportName, parameterTypeValue, reportParams);
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream()) {
+                output.write(baos);
+                String folder = configurationDomainService.retrieveReportExportS3FolderName();
+                String filePath = DatatableExportUtil.generateS3DatatableExportFileName(
+                    AWS_S3_MAXIMUM_KEY_LENGTH, folder, "csv", reportName, reportParams);
+                s3Client.putObject(
+                    builder -> builder.bucket(properties.getReport().getExport().getS3().getBucketName())
+                                      .key(filePath).build(),
+                    RequestBody.fromBytes(baos.toByteArray()));
+                return new ResponseHolder(Response.Status.NO_CONTENT);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Error while exporting to S3", e);
+        }
+    }
+
+    @Override public boolean supports(DatatableExportTargetParameter t) { return t == DatatableExportTargetParameter.S3; }
+}
+```
+
+Key behaviours:
+
+- **Bucket.** From `FineractProperties.report.export.s3.bucketName`, set by Spring properties (`fineract.report.export.s3.bucket-name`).
+- **Folder prefix.** From `c_configuration` — `ConfigurationDomainService.retrieveReportExportS3FolderName()` returns the configured `reportExportS3FolderName` row. Normalised by `DatatableExportUtil.normalizeFolderName(...)`.
+- **Key length cap.** `AWS_S3_MAXIMUM_KEY_LENGTH = 1024` is AWS's limit; the file-name generator (below) leaves headroom for the folder, timestamp and extension.
+- **Body.** A CSV rendering is generated in-memory (`ByteArrayOutputStream`) and uploaded via `s3Client.putObject(...)`. There is no streaming upload; the whole CSV sits in process memory before the PUT.
+- **Response.** `204 No Content` — the caller does not receive the file, only an acknowledgement. Operators retrieve the file from S3 themselves.
+- **Credentials and the S3 client.** The injected `S3Client` is configured by Spring with AWS credentials at startup. The bean is wired only if the export service is enabled.
+
+This export is the only one that does not stream content back through the HTTP response.
+
+### How the S3 service is registered
+
+The S3 service depends on having an `S3Client` bean available. When no AWS configuration is present the bean is omitted, and the auto-configuration for `S3DatatableReportExportServiceImpl` is skipped — `GET /v1/runreports/availableExports/{reportName}` then silently drops `S3` from the returned list (see [Run reports](/dataqueries/run-reports#available-exports)).
+
+To configure:
+
+1. Populate the `S3` external service via `PUT /v1/externalservice/S3` with `s3_bucket_name`, `s3_access_key`, `s3_secret_key` — see [Email configuration](/campaigns/email-configuration#sms-s3-and-notification-on-the-same-resource).
+2. Set the configured Spring properties (`fineract.report.export.s3.bucket-name`).
+3. Optionally set the `reportExportS3FolderName` row in `c_configuration` (else uploads land at the bucket root).
+
+## File naming — `DatatableExportUtil`
+
+The export file name is computed centrally:
+
+```java
+public static String generatePlainExportFileName(int maxLength, String extension,
+                                                 String reportName, Map<String,String> reportParams) { ... }
+
+public static String generateS3DatatableExportFileName(int maxLength, String folder, String extension,
+                                                       String reportName, Map<String,String> reportParams) { ... }
+```
+
+The plain version (`CsvDatatableReportExportServiceImpl` uses it with `maxLength=255`) and the S3 version (`maxLength=1024`) share `generateReportFileName(...)`:
+
+```java
+private static String generateReportFileName(int maxLength, String folder, String extension,
+                                             String reportName, Map<String,String> reportParams) {
+    String extensionWithDot = extension.startsWith(".") ? extension : "." + extension;
+    String timestamp = "_" + DateUtils.getOffsetDateTimeOfTenant().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+
+    int reportMaximumFileName = maxLength - folder.length() - timestamp.length() - extensionWithDot.length() - 1;
+    if (reportMaximumFileName < 0) {
+        throw new IllegalArgumentException("The folder name is too long");
+    }
+    String normalizedFileName = reportName.trim().replaceAll("[^a-zA-Z0-9!\\-_.'()$]", "_");
+    if (reportParams != null) {
+        normalizedFileName += "(" + reportParams.entrySet().stream()
+                .map(e -> extractReportParameterKey(e.getKey()) + "_" + e.getValue())
+                .collect(Collectors.joining(";")) + ")";
+    }
+    return normalizedFileName.substring(0, Math.min(normalizedFileName.length(), reportMaximumFileName))
+           + timestamp + extensionWithDot;
+}
+```
+
+So a CSV export of `"Active Clients By Office"` with `R_officeId=1` against the tenant time `2024-09-12T08:00:00Z` becomes:
+
+```
+Active_Clients_By_Office(officeId_1)_20240912080000.csv
+```
+
+Rules in summary:
+
+- **Allowed file-name characters:** `a-zA-Z0-9!-_.'()$`. Everything else (including spaces) becomes `_`.
+- **Report parameter encoding:** `(<key>_<value>;<key>_<value>;…)`. Keys are stripped of `${...}` wrapping via `extractReportParameterKey`.
+- **Timestamp:** tenant local time formatted `yyyyMMddHHmmss`.
+- **Length cap:** total file name (including folder, timestamp, extension and one separator) cannot exceed `maxLength`. The report name is truncated before the timestamp is appended.
+
+For S3, the folder name goes through `normalizeFolderName(...)`:
+
+```java
+public static String normalizeFolderName(String folderName) {
+    if (StringUtils.isBlank(folderName)) return "";
+    String normalised = folderName.trim()
+        .replaceAll("[^a-zA-Z0-9!\\-_.'()$/]", "_")  // replace special chars (keep '/')
+        .replaceAll("/+", "/")                        // collapse adjacent '/'
+        .replaceAll("^[./]+", "");                    // strip leading . or /
+    return normalised.endsWith("/")
+        ? normalised.substring(0, normalised.length() - 1)
+        : normalised;
+}
+```
+
+So `"./reports/2024//"` normalises to `"reports/2024"` and the final S3 key becomes `reports/2024/Active_Clients_By_Office(officeId_1)_20240912080000.csv`.
+
+## Resolved `Content-Disposition`
+
+| Target | `Content-Disposition` |
+|---|---|
+| `JSON` / `PRETTY_JSON` | (none — body inline) |
+| `CSV` | `attachment;filename=<file>` |
+| `PDF` | `attachment; filename="<absolute file path>"` |
+| `S3` | (none — 204 No Content) |
+
+Note the PDF service emits the **absolute filesystem path** as the filename hint, which is a quirk of the current implementation — browsers will use the last path component as the proposed download name, so the user still gets the intended `<reportName>.pdf`.
+
+## Worked example — exporting a report to CSV
+
+```http
+GET /v1/runreports/Active%20Clients%20By%20Office?R_officeId=1&exportCSV=true HTTP/1.1
+Accept: text/csv
+```
+
+Response:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/csv
+Content-Disposition: attachment;filename=Active_Clients_By_Office(officeId_1)_20240912080000.csv
+
+office,active_clients
+Head Office,1234
+Branch A,567
+```
+
+## Worked example — exporting to S3
+
+```http
+GET /v1/runreports/Active%20Clients%20By%20Office?R_officeId=1&exportS3=true
+```
+
+Response:
+
+```
+HTTP/1.1 204 No Content
+```
+
+The CSV is uploaded to:
+
+```
+s3://<configured-bucket>/<reportExportS3FolderName>/Active_Clients_By_Office(officeId_1)_20240912080000.csv
+```
+
+## Wiring
+
+`DatatableReportingProcessService` injects the full bean list:
+
+```java
+public DatatableReportingProcessService(List<DatatableReportExportService> exportServices, SqlValidator sqlValidator) {
+    super(sqlValidator);
+    this.exportServices = exportServices;
+}
+
+private Optional<DatatableReportExportService> findReportExportService(DatatableExportTargetParameter target) {
+    return exportServices.stream().filter(service -> service.supports(target)).findFirst();
+}
+```
+
+`DataQueriesAutoConfiguration` registers `Json`, `Csv`, `Pdf` services unconditionally and `S3DatatableReportExportServiceImpl` only when an `S3Client` bean is present.
+
+## Errors
+
+| Exception | Trigger |
+|---|---|
+| `GeneralPlatformDomainRuleException` | Requested export target has no matching service registered (`error.msg.report.export.mode.unavailable`) — surfaces when `exportS3=true` is requested without S3 wiring |
+| `IllegalStateException("Error while exporting to S3", e)` | I/O failure while writing the CSV bytes to S3 |
+| `IllegalArgumentException("Invalid report name format")` | PDF export with a report name containing characters outside `^[a-zA-Z0-9_.-]+$` |
+| `IllegalArgumentException("Path traversal attempt detected")` | Computed PDF path escapes the configured root folder |
+| `IllegalArgumentException("The folder name is too long")` | S3 export where `folderName + timestamp + extension` doesn't leave any room for the report name |
+| `DataAccessException` | Underlying JDBC error during CSV / PDF / S3 rendering (typically a bad parameter producing SQL syntax error) |
+
+## Related references
+
+- The execution endpoint that selects the export target: [Run reports](/dataqueries/run-reports).
+- The `Report` aggregate: [Reports](/dataqueries/reports).
+- The S3 external-service rows configuring the bucket: [Email configuration](/campaigns/email-configuration#sms-s3-and-notification-on-the-same-resource).
+- The plug-in surface for `ReportingProcessService`: [Report provider](/report/report-provider).
+- The scheduled wrapper that emails CSV / XLS / PDF outputs daily: [Report mailing job](/report/report-mailing-job).
+- The SQL injection prevention primitives used during execution: [SQL injection prevention](/security/sql-injection-prevention).
+- The REST view of every reporting endpoint: [Reports and data APIs](/api/reports-and-data-apis).

@@ -1,0 +1,271 @@
+---
+title: "Email Configuration — SMTP Properties and JavaMail Sender"
+sidebarTitle: "Email Configuration"
+description: "Apache Fineract email config: ExternalServicesProperties SMTP rows, SMTPCredentialsData, EmailConfiguration entity and the JavaMail attachment send path."
+---
+
+Apache Fineract sends every campaign email — including the daily report-mailing job — through one process-wide configuration: the rows persisted under the **`SMTP_Email_Account`** external service. Operators expose them via `/v1/externalservice/{servicename}` (`ExternalServicesConfigurationApiResource`), and the campaigns subsystem reads them into an `SMTPCredentialsData` value before instantiating a fresh `JavaMailSenderImpl` for each send. A parallel `/v1/email/configuration` resource exists for the legacy `scheduled_email_configuration` table consumed by older bundled UI, but at runtime the campaign and report-mailing pipelines all consume the external-services properties.
+
+This page documents both paths. For the campaign aggregate that drives the sends see [Email campaigns](/campaigns/email-campaigns); for the dispatch tasklet see [Campaign jobs](/campaigns/campaign-jobs).
+
+## Property model — `ExternalServicesProperties`
+
+External-service properties are simple key/value rows in `c_external_service_properties`. The schema is the same for S3, SMTP and the message gateway — `service_name` plus `name`/`value` pairs:
+
+```
+c_external_service_properties
+├── id          BIGINT PK
+├── name        VARCHAR (property key, e.g. "host")
+├── value       VARCHAR (property value, e.g. "smtp.gmail.com")
+└── service_name VARCHAR (the external service this row belongs to)
+```
+
+The JPA entity is `ExternalServicesProperties` (`fineract-provider/.../configuration/domain/ExternalServicesProperties.java`); the supported keys for SMTP are enumerated in `ExternalServicesConstants`:
+
+```java
+// fineract-provider/.../configuration/service/ExternalServicesConstants.java
+public static final String SMTP_SERVICE_NAME = "SMTP_Email_Account";
+public static final String SMTP_USERNAME     = "username";
+public static final String SMTP_PASSWORD     = "password";
+public static final String SMTP_HOST         = "host";
+public static final String SMTP_PORT         = "port";
+public static final String SMTP_USE_TLS      = "useTLS";
+public static final String SMTP_FROM_EMAIL   = "fromEmail";
+public static final String SMTP_FROM_NAME    = "fromName";
+```
+
+| Property | Required | Type | Notes |
+|---|---|---|---|
+| `username` | yes | string | SMTP auth user (also used as fallback `fromEmail`/`fromName`) |
+| `password` | yes | string | Plaintext credential; masked on read via `MaskedValueSerializer` |
+| `host` | yes | string | SMTP server hostname (e.g. `smtp.gmail.com`) |
+| `port` | yes | string (numeric) | Parsed with `Integer.parseInt` — must be a valid integer |
+| `useTLS` | no | string `true`/`false` | Switches the STARTTLS path; see Java mail properties below |
+| `fromEmail` | no | string | If unset, `SMTPCredentialsData.getFromEmail()` falls back to `username` |
+| `fromName` | no | string | If unset, falls back to `username` |
+
+`ExternalServicesPropertiesData.value` is serialised with `@JsonSerialize(using = MaskedValueSerializer.class)`, so `GET /v1/externalservice/SMTP_Email_Account` returns the password as a masked string. The write path stores the value unmasked.
+
+## REST surface — `ExternalServicesConfigurationApiResource`
+
+`@Path("/v1/externalservice")`:
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/v1/externalservice/{servicename}` | Returns every `(name, value)` pair for the service — values are masked |
+| `PUT` | `/v1/externalservice/{servicename}` | Updates one or more name/value pairs, dispatched as `EXTERNALSERVICE.UPDATE` |
+
+The handler `UpdateExternalServicePropertiesCommandHandler` enforces the value set against `ExternalServicesConstants`:
+
+- For `SMTP_Email_Account`, valid `name` values are restricted to the constants above.
+- For `MESSAGE_GATEWAY`, the SMS-gateway path uses a parallel constant set (`SMS_HOST`, `SMS_PORT`, `SMS_END_POINT`, `SMS_TENANT_APP_KEY`) — see [SMS gateway](/campaigns/sms-gateway).
+- Unknown properties trigger a validation error, not a silent insert.
+
+### Example update body
+
+```http
+PUT /v1/externalservice/SMTP_Email_Account
+Content-Type: application/json
+
+{
+  "host": "smtp.gmail.com",
+  "port": "587",
+  "username": "mfi-reports@example.org",
+  "password": "<app-password>",
+  "useTLS": "true",
+  "fromEmail": "mfi-reports@example.org",
+  "fromName": "MFI Operations"
+}
+```
+
+Required permission: `UPDATE_EXTERNALSERVICES`. The same permission gates both SMTP and S3 updates.
+
+## Value loading — `SMTPCredentialsData`
+
+`ExternalServicesPropertiesReadPlatformServiceImpl.getSMTPCredentials()` reads the rows for `SMTP_Email_Account`, maps each `(name, value)` into a setter on `SMTPCredentialsData`, and returns the populated record:
+
+```java
+@Data @NoArgsConstructor @Accessors(chain = true)
+public class SMTPCredentialsData {
+    private String username;
+    private String password;
+    private String host;
+    private String port;
+    private boolean useTLS;
+    private String fromEmail;
+    private String fromName;
+
+    public String getFromEmail() { return fromEmail != null ? fromEmail : username; }
+    public String getFromName()  { return fromName  != null ? fromName  : username; }
+}
+```
+
+Both `getFromEmail()` and `getFromName()` fall back to the SMTP user when the dedicated fields are missing — a common shortcut for tenants that send mail "from" their auth user.
+
+## JavaMail send — `EmailMessageJobEmailServiceImpl`
+
+The actual send is a constructor-fresh `JavaMailSenderImpl` per dispatch, with properties materialised from `SMTPCredentialsData`:
+
+```java
+// fineract-provider/.../campaigns/email/service/EmailMessageJobEmailServiceImpl.java
+@Service @RequiredArgsConstructor
+public final class EmailMessageJobEmailServiceImpl implements EmailMessageJobEmailService {
+
+    private final ExternalServicesPropertiesReadPlatformService externalServicesReadPlatformService;
+
+    @Override
+    public void sendEmailWithAttachment(EmailMessageWithAttachmentData m) {
+        final SMTPCredentialsData smtp = this.externalServicesReadPlatformService.getSMTPCredentials();
+        try {
+            JavaMailSenderImpl sender = new JavaMailSenderImpl();
+            sender.setHost(smtp.getHost());
+            sender.setPort(Integer.parseInt(smtp.getPort()));
+            sender.setUsername(smtp.getUsername());
+            sender.setPassword(smtp.getPassword());
+            sender.setJavaMailProperties(getJavaMailProperties(smtp, sender.getJavaMailProperties()));
+
+            MimeMessage mime = sender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(mime, true); // multipart=true
+
+            helper.setFrom(smtp.getFromEmail());
+            helper.setTo(m.getTo());
+            helper.setText(m.getText(), true); // html=true
+            helper.setSubject(m.getSubject());
+            for (File attachment : m.getAttachments()) {
+                if (attachment != null) {
+                    helper.addAttachment(attachment.getName(), attachment);
+                }
+            }
+            sender.send(mime);
+        } catch (MessagingException e) {
+            LOG.error("Could not send email Problem occurred in sendEmailWithAttachment function", e);
+        }
+    }
+}
+```
+
+Several behaviours follow from this:
+
+- **Per-message sender construction.** A fresh `JavaMailSenderImpl` is built for each `EmailMessage` — no long-lived connection pool. This is acceptable for the volumes campaign jobs see (sub-thousand per cycle) and avoids stale-connection problems against cloud SMTP providers, but heavy throughput tenants should consider wiring an external relay rather than scaling the in-process sender.
+- **HTML body by default.** `helper.setText(m.getText(), true)` — the campaign template body is treated as HTML. Placeholders that produce HTML special characters need to be escaped by the template author.
+- **Multipart always on.** Even when no attachment is present, `MimeMessageHelper(mime, true)` is used, which keeps the code path consistent with the report mailing job that always attaches a CSV/XLS/PDF.
+- **Failures are logged, not retried.** A `MessagingException` is logged via SLF4J and the method returns. The calling tasklet (`ExecuteEmailTasklet`) does *not* re-queue the message — operators rely on the `EmailMessage` row staying in `PENDING` if the tasklet has not yet processed it, or `FAILED` once it has tried and failed. There is no automatic backoff in the bundled implementation.
+
+### `getJavaMailProperties` — TLS handling
+
+```java
+private Properties getJavaMailProperties(SMTPCredentialsData smtp, Properties properties) {
+    properties.put("mail.smtp.starttls.enable", "true");
+    properties.put("mail.transport.protocol", "smtp");
+    properties.put("mail.smtp.auth", "true");
+    properties.put("mail.smtp.ssl.trust", smtp.getHost());
+    if (smtp.isUseTLS()) {
+        // Needs to disable startTLS if the port is 465 in order to send the email successfully
+        // when using the smtp.gmail.com as the host
+        if (smtp.getPort().equals("465")) {
+            properties.put("mail.smtp.starttls.enable", "false");
+        }
+    }
+    return properties;
+}
+```
+
+| Property | Value | Effect |
+|---|---|---|
+| `mail.smtp.starttls.enable` | `true` (or `false` for port `465` when `useTLS=true`) | Enables STARTTLS on submission ports; disabled for implicit-TLS port 465 |
+| `mail.transport.protocol` | `smtp` | JavaMail transport |
+| `mail.smtp.auth` | `true` | Always uses SMTP AUTH against the configured username/password |
+| `mail.smtp.ssl.trust` | `smtp.getHost()` | Trusts the configured host's certificate without local truststore wiring |
+
+The `mail.smtp.ssl.trust` shortcut means tenants do not need to import provider certificates into the JVM cacerts — fine for hosted providers like Gmail or Mailgun, but reviewers should be aware the host is trusted blindly. Operators who need full chain validation must use a customised JavaMail wiring outside this class.
+
+## `EmailMessageWithAttachmentData` — the send payload
+
+`EmailMessageJobEmailServiceImpl` accepts a `EmailMessageWithAttachmentData` record (`fineract-provider/.../campaigns/email/data/EmailMessageWithAttachmentData.java`):
+
+```java
+public class EmailMessageWithAttachmentData {
+    private String to;
+    private String text;       // HTML body
+    private String subject;
+    private List<File> attachments;
+}
+```
+
+- For **email campaigns**, the body and subject come from interpolating the campaign template against each row. The attachment list is empty unless the campaign has a `stretchyReport` configured, in which case the stretchy report is run and its CSV/XLS/PDF output is added.
+- For the **report mailing job** the body is the configured email message and the attachment is the rendered stretchy or Pentaho report. See [Report mailing job](/report/report-mailing-job).
+
+## Legacy `EmailConfiguration` entity
+
+A separate table `scheduled_email_configuration` is kept for backwards compatibility with the original campaigns UI. The entity is intentionally minimal:
+
+```java
+@Entity
+@Table(name = "scheduled_email_configuration")
+public class EmailConfiguration extends AbstractPersistableCustom<Long> {
+    @Column(name = "name", nullable = false)  private String name;
+    @Column(name = "value", nullable = false) private String value;
+}
+```
+
+It has its own REST surface at `/v1/email/configuration`:
+
+```java
+// EmailConfigurationApiResource.java
+@Path("/v1/email/configuration")
+public class EmailConfigurationApiResource {
+    @GET public String retrieveAll(@Context UriInfo uriInfo) { ... }
+    @PUT public String updateConfiguration(@Context UriInfo uriInfo, String apiRequestBodyAsJson) { ... }
+}
+```
+
+| Method | Path | Permission | Command |
+|---|---|---|---|
+| `GET` | `/v1/email/configuration` | `READ_EMAIL_CONFIGURATION` | — |
+| `PUT` | `/v1/email/configuration` | `UPDATE_EMAIL_CONFIGURATION` | `EMAIL_CONFIGURATION.UPDATE` |
+
+The `UpdateEmailConfigurationCommandHandler` calls `EmailConfigurationWritePlatformServiceImpl.updateEmailConfiguration(...)`, which validates the payload against `EmailConfigurationValidator` and upserts each `(name, value)` row.
+
+⚠️ **The campaign and report-mailing dispatch paths do NOT read this table.** Only legacy code paths and the UI's "email settings" tab use it. For a working tenant, configure SMTP via `/v1/externalservice/SMTP_Email_Account`.
+
+## SMS, S3 and NOTIFICATION on the same resource
+
+`ExternalServicesConstants` declares matching constant sets for the other supported services:
+
+| Service name | Properties | Consumer |
+|---|---|---|
+| `S3` | `s3_bucket_name`, `s3_access_key`, `s3_secret_key` | `S3DatatableReportExportServiceImpl` (see [Datatable export](/dataqueries/datatable-export)) |
+| `SMTP_Email_Account` | `username`, `password`, `host`, `port`, `useTLS`, `fromEmail`, `fromName` | `EmailMessageJobEmailServiceImpl` |
+| `MESSAGE_GATEWAY` | `host_name`, `port_number`, `end_point`, `tenant_app_key` | `SmsConfigUtils` → SMS gateway tasklets (see [SMS gateway](/campaigns/sms-gateway)) |
+| `NOTIFICATION` | `server_key`, `gcm_end_point`, `fcm_end_point` | Notification (FCM/GCM) integrations |
+
+Operators read/update them through the same `/v1/externalservice/{servicename}` endpoints.
+
+## Verifying SMTP configuration
+
+The platform exposes no first-class "send test mail" endpoint — operators typically validate by:
+
+1. Configuring the SMTP rows via `PUT /v1/externalservice/SMTP_Email_Account`.
+2. Creating a simple `DIRECT` email campaign with a stretchy report returning one row containing the operator's own email (see [Email campaigns](/campaigns/email-campaigns)).
+3. Activating the campaign (`POST /v1/email/campaign/{id}?command=activate`); the body is materialised into `scheduled_email_messages_outbound` with status `PENDING`.
+4. Letting the `EXECUTE_EMAIL` job run (or invoking it manually through the jobs UI). Successful send flips the row to `SENT(200)`; a failure flips it to `FAILED(400)` with the `MessagingException` written to the application log.
+
+For long-running diagnosis, the SLF4J line `EmailMessageJobEmailServiceImpl - Could not send email Problem occurred in sendEmailWithAttachment function` is the canonical failure marker.
+
+## Failure modes
+
+| Failure | Surface | Root cause |
+|---|---|---|
+| `NumberFormatException` from `Integer.parseInt(smtp.getPort())` | Send aborts | `port` saved as non-numeric string |
+| `MessagingException: Could not connect to SMTP host` | Logged; `EmailMessage` flipped to `FAILED` by tasklet | Wrong host/port; firewall; SMTP relay down |
+| `MessagingException: 535 Authentication failed` | Logged; `EmailMessage` flipped to `FAILED` | Wrong username/password; Gmail account without app-password |
+| Empty body received | Send succeeds but recipient gets blank email | Template body contains a `${...}` placeholder for a column the business-rule SQL did not return; placeholder is replaced with empty string |
+| TLS handshake error on port 465 | Logged | `useTLS=false` configured against an implicit-TLS port |
+
+## Related references
+
+- The campaign aggregate whose template body becomes `EmailMessageWithAttachmentData.text`: [Email campaigns](/campaigns/email-campaigns).
+- The Spring Batch tasklets that hand messages to this service: [Campaign jobs](/campaigns/campaign-jobs).
+- The `Report` business-rule SQL whose output drives recipient interpolation: [Reports](/dataqueries/reports), [Run reports](/dataqueries/run-reports).
+- S3 / SMS gateway / Notification properties on the same resource: [SMS gateway](/campaigns/sms-gateway), [Datatable export](/dataqueries/datatable-export).
+- The general REST overview: [Hooks and messaging APIs](/api/hooks-and-messaging-apis).

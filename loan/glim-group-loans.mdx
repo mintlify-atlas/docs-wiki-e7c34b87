@@ -1,0 +1,348 @@
+---
+title: "GLIM Group Loans, Parent-Child Accounts and Bulk Repayment"
+sidebarTitle: "GLIM"
+description: "GroupLoanIndividualMonitoringAccount, GLIMAccountInfoWritePlatformService and bulk repayment / state transitions for Fineract group loans."
+---
+
+**GLIM** — Group Loan Individual Monitoring — is Fineract's model for **group loans that the platform tracks at the individual level**. A `GroupLoanIndividualMonitoringAccount` (GLIM account, table `glim_accounts`) is a parent record under a `Group`; each member of the group has a separate child `Loan` linked to the same parent. Repayments arrive against the parent (`glimrepayment`) and are split across children, while approvals, rejections and disbursements transition the parent and all children in one operation. This page covers the entity model, the `LoansApiResource` `/glimAccount/{glimId}` endpoints, the command handlers under `loanaccount/handler/GLIM*`, the `GLIMAccountInfoWritePlatformService` lifecycle and the difference vs. joint group loans.
+
+Cross references: the standard (non-GLIM) loan lifecycle is at [Loan overview](/loan/overview); REST handlers including GLIM are catalogued in [Loan REST handlers](/loan/loan-rest-handlers); group entity details are in the portfolio docs.
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| Entity | `portfolio/loanaccount/domain/GroupLoanIndividualMonitoringAccount.java` | `fineract-loan` |
+| Repository | `portfolio/loanaccount/domain/GLIMAccountInfoRepository.java` | `fineract-loan` |
+| Data DTO | `portfolio/loanaccount/data/GroupLoanIndividualMonitoringAccountData.java` | `fineract-loan` |
+| Container DTO | `portfolio/loanaccount/data/GLIMContainer.java` | `fineract-loan` |
+| Repayment template | `portfolio/loanaccount/data/GlimRepaymentTemplate.java` | `fineract-loan` |
+| Write service interface | `service/GLIMAccountInfoWritePlatformService.java` | `fineract-loan` |
+| Write service impl | `service/GLIMAccountInfoWritePlatformServiceImpl.java` | `fineract-loan` |
+| Read service | `service/GLIMAccountInfoReadPlatformService.java` (impl in `fineract-provider`) | `fineract-loan` |
+| REST | `LoansApiResource.glimStateTransitions(...)` and `getGlimRepaymentTemplate(...)` | `fineract-provider` |
+| Approve handler | `handler/GLIMLoanApplicationApprovalCommandHandler.java` | `fineract-loan` |
+| Undo approval | `handler/UndoGLIMLoanApplicationApproval.java` | `fineract-loan` |
+| Reject | `handler/GLIMApplicationRejectionCommandHandler.java` | `fineract-loan` |
+| Disburse | `handler/GlimLoanApplicationDisburseCommandHandler.java` | `fineract-loan` |
+| Undo disbursal | `handler/UndoGLIMLoanDisbursalCommandHandler.java` | `fineract-loan` |
+| Bulk repayment | `handler/GLIMBulkRepaymentCommandHandler.java` | `fineract-loan` |
+
+## Entity — `GroupLoanIndividualMonitoringAccount`
+
+```java
+@Entity
+@Table(name = "glim_accounts",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "account_number" }, name = "FK_glim_id") })
+public class GroupLoanIndividualMonitoringAccount extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne
+    @JoinColumn(name = "group_id", nullable = false)
+    private Group group;
+
+    @Column(name = "account_number", nullable = false)
+    private String accountNumber;
+
+    @Column(name = "principal_amount")
+    private BigDecimal principalAmount;
+
+    @Column(name = "child_accounts_count")
+    private Long childAccountsCount;
+
+    @Column(name = "accepting_child")
+    private Boolean isAcceptingChild;
+
+    @OneToMany
+    private Set<Loan> childLoan;
+
+    @Column(name = "loan_status_id", nullable = false)
+    private Integer loanStatus;
+
+    @Column(name = "application_id", nullable = true)
+    private BigDecimal applicationId;
+}
+```
+
+| Column | Purpose |
+| --- | --- |
+| `group_id` | The `Group` this GLIM belongs to (FK to `m_group`) |
+| `account_number` | Parent account number (separate space from individual loan account numbers) |
+| `principal_amount` | Aggregate principal across all children |
+| `child_accounts_count` | Counter, maintained by `incrementChildAccountCount` |
+| `accepting_child` | Whether new child loans can be added to this parent |
+| `loan_status_id` | Mirrors the loan status enum values (`LoanStatus`) |
+| `application_id` | Optional external application reference |
+| `childLoan` (OneToMany) | The individual loans (`m_loan` rows) for each member |
+
+Children are *real* `Loan` rows that participate in every standard loan flow (schedule generation, COB, transactions) — GLIM just adds an extra parent-level layer for orchestration.
+
+## REST surface — on `LoansApiResource`
+
+There is no separate `GLIMApiResource`. Group loan operations are exposed under `/v1/loans/glimAccount/{glimId}`:
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/v1/loans/glimAccount/{glimId}` | `getGlimRepaymentTemplate` — list child loans and their owed amounts |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=approve` | `GLIMLOAN/APPROVE` |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=undoapproval` | `GLIMLOAN/UNDOAPPROVAL` |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=reject` | `GLIMLOAN/REJECT` |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=disburse` | `GLIMLOAN/DISBURSE` |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=undodisbursal` | `GLIMLOAN/UNDODISBURSAL` |
+| `POST` | `/v1/loans/glimAccount/{glimId}?command=glimrepayment` | `GLIMLOAN/REPAYMENT` |
+
+Dispatch:
+
+```java
+@POST @Path("glimAccount/{glimId}")
+public String glimStateTransitions(@PathParam("glimId") final Long glimId,
+        @QueryParam("command") final String commandParam, final String apiRequestBodyAsJson) {
+    final CommandWrapperBuilder builder = new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandWrapper commandRequest = null;
+    if (CommandParameterUtil.is(commandParam, "reject")) {
+        commandRequest = builder.rejectGLIMApplication(glimId).build();
+    } else if (CommandParameterUtil.is(commandParam, "approve")) {
+        commandRequest = builder.approveGLIMLoanApplication(glimId).build();
+    } else if (CommandParameterUtil.is(commandParam, "disburse")) {
+        commandRequest = builder.disburseGlimLoanApplication(glimId).build();
+    } else if (CommandParameterUtil.is(commandParam, "glimrepayment")) {
+        commandRequest = builder.repaymentGlimLoanApplication(glimId).build();
+    } else if (CommandParameterUtil.is(commandParam, "undodisbursal")) {
+        commandRequest = builder.undoGLIMLoanDisbursal(glimId).build();
+    } else if (CommandParameterUtil.is(commandParam, "undoapproval")) {
+        commandRequest = builder.undoGLIMLoanApproval(glimId).build();
+    }
+    if (commandRequest == null) {
+        throw new UnrecognizedQueryParamException("command", commandParam);
+    }
+    CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return this.toApiJsonSerializer.serialize(result);
+}
+```
+
+### Repayment template
+
+```java
+@GET @Path("glimAccount/{glimId}")
+public String getGlimRepaymentTemplate(@PathParam("glimId") final Long glimId, ...) {
+    Collection<GlimRepaymentTemplate> glimRepaymentTemplate =
+            this.glimAccountInfoReadPlatformService.findglimRepaymentTemplate(glimId);
+    ...
+}
+```
+
+Returns one `GlimRepaymentTemplate` per child loan with the suggested split of the next repayment.
+
+## Command handlers
+
+```java
+@Service @RequiredArgsConstructor
+@CommandType(entity = "GLIMLOAN", action = "APPROVE")
+public class GLIMLoanApplicationApprovalCommandHandler implements NewCommandSourceHandler {
+    private final GLIMLoanApprovalWritePlatformService writePlatformService;
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.approveGLIMLoanAppication(command.entityId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GLIMLOAN", action = "UNDOAPPROVAL")
+public class UndoGLIMLoanApplicationApproval implements NewCommandSourceHandler {
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.undoGLIMLoanApplicationApproval(command.entityId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GLIMLOAN", action = "REJECT")
+public class GLIMApplicationRejectionCommandHandler implements NewCommandSourceHandler {
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.rejectGLIMApplicationApproval(command.entityId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GLIMLOAN", action = "DISBURSE")
+public class GlimLoanApplicationDisburseCommandHandler implements NewCommandSourceHandler {
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.disburseGLIMLoan(command.entityId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GLIMLOAN", action = "UNDODISBURSAL")
+public class UndoGLIMLoanDisbursalCommandHandler implements NewCommandSourceHandler {
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.undoGLIMLoanDisbursal(command.entityId(), command);
+    }
+}
+```
+
+```java
+@Service
+@CommandType(entity = "GLIMLOAN", action = "REPAYMENT")
+public class GLIMBulkRepaymentCommandHandler implements NewCommandSourceHandler {
+    @Override @Transactional
+    public CommandProcessingResult processCommand(JsonCommand command) {
+        return writePlatformService.makeGLIMLoanRepayment(command.entityId(), command);
+    }
+}
+```
+
+All six handlers route to `LoanWritePlatformService` (the bulk variant), which internally:
+
+1. Loads the `GroupLoanIndividualMonitoringAccount` by id.
+2. Iterates `childLoan` and applies the equivalent per-loan command (e.g. for `APPROVE`, calls `approveApplication(loan, command)` on each).
+3. Aggregates child results into a single `CommandProcessingResult` keyed off the GLIM id.
+4. Updates `glim_accounts.loan_status_id` to reflect the new state.
+
+## `GLIMAccountInfoWritePlatformService`
+
+```java
+public interface GLIMAccountInfoWritePlatformService {
+
+    void setIsAcceptingChild(GroupLoanIndividualMonitoringAccount glimAccount);
+    void resetIsAcceptingChild(GroupLoanIndividualMonitoringAccount glimAccount);
+    void incrementChildAccountCount(GroupLoanIndividualMonitoringAccount glimAccount);
+
+    GroupLoanIndividualMonitoringAccount createGLIMAccount(String accountNumber, Group group,
+            BigDecimal principalAmount, Long childAccountsCount, Boolean isAcceptingChild,
+            Integer loanStatus, BigDecimal applicationId);
+}
+```
+
+This is the *low-level* CRUD over the parent record. It does not own the loan lifecycle — that is done by `LoanWritePlatformService`. Specifically:
+
+- `createGLIMAccount` is called by the first child loan's application submittal when `groupId` is set and the loan body marks itself as a GLIM application.
+- `incrementChildAccountCount` is invoked by subsequent child loan submissions; the implementation keeps `accepting_child` true while count < expected.
+- `setIsAcceptingChild` / `resetIsAcceptingChild` flip the flag when admins explicitly seal a GLIM to further additions.
+
+## `GLIMAccountInfoReadPlatformService`
+
+```java
+public interface GLIMAccountInfoReadPlatformService {
+
+    Collection<GroupLoanIndividualMonitoringAccountData> findGlimAccountsByGroupId(String groupId);
+    Collection<GroupLoanIndividualMonitoringAccountData> findGlimAccountByGroupId(String groupId);
+    Collection<GLIMContainer> findGlimAccount(Long groupId);
+    Collection<GroupLoanIndividualMonitoringAccountData> findGlimAccountByGroupIdandAccountNo(
+            String groupId, String accountNo);
+    Collection<GLIMContainer> findGlimAccountbyGroupAndAccount(Long groupId, String accountNo);
+    Collection<GroupLoanIndividualMonitoringAccountData> findGlimAccountByParentAccountId(String parentAccountIds);
+    Collection<GroupLoanIndividualMonitoringAccountData> findGlimAccountsByGLIMId(Long glimId);
+    Collection<GlimRepaymentTemplate> findglimRepaymentTemplate(Long glimId);
+}
+```
+
+`GLIMContainer` bundles a `GroupLoanIndividualMonitoringAccountData` with a list of `LoanAccountData` for each child — used by UIs that need to render the whole group loan at once.
+
+## Bulk repayment shape
+
+The `glimrepayment` body:
+
+```json
+{
+  "transactionDate": "01 March 2024",
+  "transactionAmount": 5000.00,
+  "paymentTypeId": 2,
+  "note": "March group repayment",
+  "childLoanRepayments": [
+    { "loanId": 201, "transactionAmount": 1000.00 },
+    { "loanId": 202, "transactionAmount": 2500.00 },
+    { "loanId": 203, "transactionAmount": 1500.00 }
+  ],
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+`transactionAmount` must equal the sum of the per-child amounts; the handler validates and fails the entire bulk repayment if any child raises (so all-or-nothing semantics).
+
+Internally, the bulk-repayment write service:
+
+1. Loads the GLIM and verifies all `loanId`s in `childLoanRepayments` are children of this GLIM.
+2. For each child, calls `LoanAccountDomainService.makeRepayment(child, amount, ...)` inside the same transaction.
+3. Aggregates the resulting `LoanTransaction` ids into the response.
+
+## State machine
+
+GLIM operations mirror the single-loan state machine but apply to every child atomically:
+
+| Status | Children | Parent `loan_status_id` |
+| --- | --- | --- |
+| Submitted | All children Submitted | 100 |
+| Approved | All children Approved | 200 |
+| Disbursed | All children Active | 300 |
+| Rejected | All children Rejected | 500 |
+| Withdrawn | All children Withdrawn | 400 |
+| Closed | All children Closed | 600 / 700 |
+
+If a single child operation fails (e.g. one client is missing an active savings account), the whole bulk command rolls back via JPA's transaction boundary.
+
+## Difference vs. joint group loans
+
+There are two ways to lend to a group in Fineract:
+
+| Concept | "Joint" group loan | GLIM |
+| --- | --- | --- |
+| Model | One `Loan` row attached to a `Group` (no `Client`) | One parent `GroupLoanIndividualMonitoringAccount` + one `Loan` row per member |
+| Schedule | Single schedule shared by all members | Per-member schedule (independent) |
+| Repayment | Single transaction against the group's loan | Bulk repayment split across child loans |
+| Individual tracking | None — only group-level arrears, delinquency, transactions | Each member has their own arrears/delinquency profile |
+| Use case | Lightweight microfinance group lending where individuals are not tracked separately | Reporting / regulatory requirements that need per-member visibility while preserving group accountability |
+| REST entry | Standard `/v1/loans` with `groupId` and no `clientId` | `/v1/loans` for child loans + `/v1/loans/glimAccount/{glimId}` for orchestration |
+
+Pick joint group loan when you only need group-level accounting; pick GLIM when downstream reports and external systems require per-member loan records.
+
+## Permissions
+
+| Operation | Permission |
+| --- | --- |
+| Approve | `APPROVE_GLIMLOAN` |
+| Undo approval | `UNDOAPPROVAL_GLIMLOAN` |
+| Reject | `REJECT_GLIMLOAN` |
+| Disburse | `DISBURSE_GLIMLOAN` |
+| Undo disbursal | `UNDODISBURSAL_GLIMLOAN` |
+| Bulk repayment | `REPAYMENT_GLIMLOAN` |
+
+## Worked example
+
+<Steps>
+<Step title="Create GLIM application">
+Submit the first child loan with `glim=true` and `groupId=42`. The submittal handler creates a `glim_accounts` row via `createGLIMAccount` and links the child loan to it.
+</Step>
+<Step title="Add additional child loans">
+Submit further child loans against the same `glim_accounts.accountNumber`. Each one increments `child_accounts_count` via `incrementChildAccountCount`.
+</Step>
+<Step title="Approve the parent">
+`POST /v1/loans/glimAccount/{glimId}?command=approve` with `{"approvedOnDate": "...", ...}`. Every child is approved atomically; `loan_status_id` moves to 200.
+</Step>
+<Step title="Disburse">
+`POST /v1/loans/glimAccount/{glimId}?command=disburse` with `{"actualDisbursementDate": "..."}`. Every child becomes Active.
+</Step>
+<Step title="Bulk repayment">
+`POST /v1/loans/glimAccount/{glimId}?command=glimrepayment` with the per-child split.
+</Step>
+<Step title="Inspect">
+`GET /v1/loans/glimAccount/{glimId}` returns the `GlimRepaymentTemplate` for the next due cycle.
+</Step>
+</Steps>
+
+## Related pages
+
+- [Loan overview](/loan/overview)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan product API](/loan/loan-product-api)
+- [Loan APIs index](/api/loan-apis)

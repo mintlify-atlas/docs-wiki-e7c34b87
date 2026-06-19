@@ -1,0 +1,381 @@
+---
+title: "BatchApiResource and BatchApiService — Routes and Transactions"
+sidebarTitle: "Resource & Service"
+description: "How Apache Fineract exposes /v1/batches, dispatches the JSON array to BatchApiServiceImpl, and switches between per-request and enclosing-transaction execution modes."
+---
+
+`BatchApiResource` is the JAX-RS facade for the Apache Fineract Batch API. It accepts a JSON array of `BatchRequest` at `/v1/batches`, runs an instance-mode guard, and hands off to `BatchApiService`. `BatchApiServiceImpl` decides whether to wrap the dispatch in a JPA `REPEATABLE_READ` transaction, builds the request forest, and walks each subtree. This page documents the resource path, the two execution modes, the JPA flush semantics, the retry policy, and the error response contract.
+
+## Source layout
+
+| File | Module | Role |
+| --- | --- | --- |
+| `batch/api/BatchApiResource.java` | `fineract-core` | JAX-RS `@Path("/v1/batches")`, instance-mode guard. |
+| `batch/api/BatchApiResourceSwagger.java` | `fineract-core` | Swagger DTOs for the documented examples. |
+| `batch/service/BatchApiService.java` | `fineract-core` | Service interface — two methods, one per transaction mode. |
+| `batch/service/BatchApiServiceImpl.java` | `fineract-core` | The actual dispatcher. ~500 lines. |
+| `batch/service/BatchExecutionException.java` | `fineract-core` | Wraps the underlying exception with the failing `BatchRequest` for the catch in `callInTransaction`. |
+| `batch/serialization/BatchRequestJsonHelper.java` | `fineract-core` | Gson `TypeToken<List<BatchRequest>>` deserializer. |
+
+## The resource
+
+```java
+// fineract-core/src/main/java/org/apache/fineract/batch/api/BatchApiResource.java
+@Path("/v1/batches")
+@Component
+@Tag(name = "Batch API", description = "...")
+@RequiredArgsConstructor
+public class BatchApiResource {
+
+    private final PlatformSecurityContext context;
+    private final BatchApiService service;
+    private final FineractProperties fineractProperties;
+
+    @POST
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public List<BatchResponse> handleBatchRequests(
+            @DefaultValue("false") @QueryParam("enclosingTransaction") final boolean enclosingTransaction,
+            List<BatchRequest> requestList,
+            @Context UriInfo uriInfo) {
+
+        this.context.authenticatedUser();
+        validateRequestMethodsAllowedOnInstanceType(requestList);
+
+        return enclosingTransaction
+            ? service.handleBatchRequestsWithEnclosingTransaction(requestList, uriInfo)
+            : service.handleBatchRequestsWithoutEnclosingTransaction(requestList, uriInfo);
+    }
+}
+```
+
+### Endpoint reference
+
+| Method | Path | Query | Body | Returns |
+| --- | --- | --- | --- | --- |
+| `POST` | `/v1/batches` | `enclosingTransaction` (default `false`) | `List<BatchRequest>` JSON | `List<BatchResponse>` JSON |
+
+Auth and tenancy:
+
+* `context.authenticatedUser()` runs first — the whole batch executes under one identity.
+* The tenant header is honoured by the upstream `TenantAwareBasicAuthenticationFilter` and propagated through `ThreadLocalContextUtil`. Sub-requests do not re-authenticate or re-resolve tenant.
+
+### Instance mode guard
+
+```java
+private void validateRequestMethodsAllowedOnInstanceType(final List<BatchRequest> requestList) {
+    if (fineractProperties.getMode().isReadOnlyMode()) {
+        final Optional<BatchRequest> nonGetRequest = requestList.stream()
+                .filter(batchRequest -> !HttpMethod.GET.equals(batchRequest.getMethod())).findFirst();
+        if (nonGetRequest.isPresent()) {
+            throw new InvalidInstanceTypeMethodException(nonGetRequest.get().getMethod());
+        }
+    }
+}
+```
+
+* The check happens **before** the batch is built into a node forest.
+* If the running instance has read-only mode enabled (`fineract.mode.read-enabled=true`, others false), any non-`GET` aborts the entire batch.
+* The exception is `InvalidInstanceTypeMethodException` from `fineract-security`; the platform's standard exception mapper turns it into a 4xx. See [`/core/instance-mode`](/core/instance-mode).
+
+There is no per-request quota in the resource layer. The caller can theoretically send arbitrarily long batches — see "Sizing and limits" below for the patterns used to constrain this.
+
+## The service interface
+
+```java
+public interface BatchApiService {
+
+    /** enclosingTransaction = false */
+    List<BatchResponse> handleBatchRequestsWithoutEnclosingTransaction(List<BatchRequest> requestList, UriInfo uriInfo);
+
+    /** enclosingTransaction = true */
+    List<BatchResponse> handleBatchRequestsWithEnclosingTransaction(List<BatchRequest> requestList, UriInfo uriInfo);
+}
+```
+
+Two methods, one per query value, both implemented in `BatchApiServiceImpl`.
+
+## The service implementation
+
+```java
+@Service @RequiredArgsConstructor @Slf4j
+public class BatchApiServiceImpl implements BatchApiService {
+
+    private final CommandStrategyProvider strategyProvider;
+    private final ResolutionHelper resolutionHelper;
+    private final ErrorHandler errorHandler;
+    private final List<BatchFilter> batchFilters;
+    private final List<BatchRequestPreprocessor> batchPreprocessors;
+    private final RetryConfigurationAssembler retryConfigurationAssembler;
+
+    private PlatformTransactionManager transactionManager;
+    private EntityManager entityManager;
+}
+```
+
+The bean is wired with everything it needs to filter, preprocess, retry, and roll back. The two entry points share a private dispatcher:
+
+```java
+private List<BatchResponse> handleBatchRequests(final List<BatchRequest> requestList, final UriInfo uriInfo,
+        boolean enclosingTransaction) {
+    BatchRequestContextHolder.setIsEnclosingTransaction(enclosingTransaction);
+    try {
+        return enclosingTransaction
+            ? callInTransaction(Function.identity()::apply, () -> handleRequestNodes(requestList, uriInfo))
+            : handleRequestNodes(requestList, uriInfo);
+    } finally {
+        BatchRequestContextHolder.resetIsEnclosingTransaction();
+    }
+}
+```
+
+A `BatchRequestContextHolder` thread-local carries the `enclosingTransaction` flag deep into the strategy code where it controls JPA flushing semantics.
+
+## Mode 1 — per-request (default)
+
+`handleRequestNodes` builds the forest, then iterates roots:
+
+```java
+private List<BatchResponse> handleRequestNodes(final List<BatchRequest> requestList, final UriInfo uriInfo) {
+    final List<BatchRequestNode> rootNodes;
+    try {
+        rootNodes = this.resolutionHelper.buildNodesTree(requestList);
+    } catch (BatchReferenceInvalidException e) {
+        return List.of(buildOrThrowErrorResponse(e, null));
+    }
+
+    final ArrayList<BatchResponse> responseList = new ArrayList<>(requestList.size());
+    for (BatchRequestNode rootNode : rootNodes) {
+        this.callRequestRecursive(rootNode.getRequest(), rootNode, responseList, uriInfo);
+    }
+    responseList.sort(Comparator.comparing(BatchResponse::getRequestId));
+    return responseList;
+}
+```
+
+Recursion runs each root's subtree depth-first:
+
+```java
+private void callRequestRecursive(BatchRequest request, BatchRequestNode requestNode, List<BatchResponse> responseList,
+        UriInfo uriInfo) {
+    BatchResponse response = executeRequest(request, uriInfo);
+    responseList.add(response);
+    if (response.getStatusCode() != null && response.getStatusCode() == SC_OK) {
+        // run child nodes
+        requestNode.getChildNodes().forEach(childNode -> {
+            BatchRequest childRequest = childNode.getRequest();
+            BatchRequest resolvedChildRequest;
+            try {
+                resolvedChildRequest = this.resolutionHelper.resolveRequest(childRequest, response);
+                callRequestRecursive(resolvedChildRequest, childNode, responseList, uriInfo);
+            } catch (JsonPathException jpex) {
+                responseList.add(buildOrThrowErrorResponse(jpex, childRequest));
+            }
+        });
+    } else {
+        responseList.addAll(parentRequestFailedRecursive(request, requestNode, response, null));
+    }
+}
+```
+
+| Behaviour | Detail |
+| --- | --- |
+| Each root runs independently. | A failure in root A does not stop root B. |
+| If a parent fails, descendants get `409` with body `"Parent request with id N was erroneous!"`. | See `parentRequestFailedRecursive`. |
+| JPA flushes are per-strategy. | Each strategy delegates to a write service that opens its own `@Transactional` boundary. |
+| Final list is sorted by `requestId`. | Stable client-side iteration regardless of dispatch order. |
+
+## Mode 2 — enclosing transaction
+
+When `enclosingTransaction=true`, `callInTransaction` wraps the whole `handleRequestNodes` call in a Spring `TransactionTemplate`:
+
+```java
+private List<BatchResponse> callInTransaction(Consumer<TransactionTemplate> transactionConfigurator,
+        Supplier<List<BatchResponse>> request) {
+
+    Retry retry = retryConfigurationAssembler.getRetryConfigurationForBatchApiWithEnclosingTransaction();
+    List<BatchResponse> responseList = new ArrayList<>();
+    Supplier<List<BatchResponse>> batchSupplier = () -> {
+        responseList.clear();
+        try {
+            TransactionTemplate transactionTemplate = new TransactionTemplate(transactionManager);
+            transactionTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            if (transactionManager instanceof ExtendedJpaTransactionManager extendedJpaTransactionManager) {
+                transactionTemplate.setReadOnly(extendedJpaTransactionManager.isReadOnlyConnection());
+            }
+            transactionConfigurator.accept(transactionTemplate);
+            return transactionTemplate.execute(status -> {
+                BatchRequestContextHolder.setEnclosingTransaction(status);
+                responseList.addAll(request.get());
+                return responseList;
+            });
+        } finally {
+            BatchRequestContextHolder.resetTransaction();
+        }
+    };
+    Supplier<List<BatchResponse>> retryingBatch = Retry.decorateSupplier(retry, batchSupplier);
+    try {
+        return retryingBatch.get();
+    } catch (TransactionException | NonTransientDataAccessException ex) {
+        return buildErrorResponses(ex, responseList);
+    } catch (BatchExecutionException ex) {
+        log.error("Exception during the batch request processing", ex);
+        responseList.add(buildErrorResponse(ex.getCause(), ex.getRequest()));
+        return responseList;
+    }
+}
+```
+
+Key points:
+
+| Property | Value / behaviour |
+| --- | --- |
+| Isolation level | `REPEATABLE_READ` — set explicitly so concurrent writers cannot insert phantom rows mid-batch. |
+| Read-only flag | Propagated from `ExtendedJpaTransactionManager.isReadOnlyConnection()`. A batch of `GET`s against a read replica stays read-only. |
+| Retry policy | `RetryConfigurationAssembler.getRetryConfigurationForBatchApiWithEnclosingTransaction()` returns a Resilience4j `Retry` for retryable JPA exceptions. Up to N attempts (configurable). |
+| Rollback trigger | The first failing request's response carries non-`SC_OK` status; `parentRequestFailedRecursive` does `setRollbackOnly()`. `executeRequest`'s `buildOrThrowErrorResponse` throws a `BatchExecutionException` that escapes the `TransactionTemplate`. |
+| Returned shape on failure | `buildErrorResponses` collapses the response list into a **single** error response describing the first failing one. |
+
+The retry handles the case where the JPA transaction itself bubbles up a `TransactionSystemException` that wraps a `ConcurrencyFailureException` — see the conversion in `buildErrorResponses`:
+
+```java
+if (response != null && response.getStatusCode() == SC_OK && ex instanceof TransactionSystemException tse) {
+    ex = new ConcurrencyFailureException(tse.getMessage(), tse.getCause());
+}
+```
+
+## Executing a single request
+
+`executeRequest` is the unit of work for each leaf:
+
+```java
+private BatchResponse executeRequest(BatchRequest request, UriInfo uriInfo) {
+    final CommandStrategy commandStrategy = this.strategyProvider
+            .getCommandStrategy(CommandContext.resource(request.getRelativeUrl()).method(request.getMethod()).build());
+    log.debug("Batch request: method [{}], relative url [{}]", request.getMethod(), request.getRelativeUrl());
+    Either<RuntimeException, BatchRequest> preprocessorResult = runPreprocessors(request);
+    if (preprocessorResult.isLeft()) {
+        return buildOrThrowErrorResponse(preprocessorResult.getLeft(), request);
+    } else {
+        request = preprocessorResult.get();
+    }
+    try {
+        BatchRequestContextHolder.setRequestAttributes(new HashMap<>(Optional.ofNullable(request.getHeaders())
+                .map(list -> list.stream().collect(Collectors.toMap(Header::getName, Header::getValue)))
+                .orElse(Collections.emptyMap())));
+        if (BatchRequestContextHolder.isEnclosingTransaction()
+                && BatchRequestContextHolder.getEnclosingTransaction().stream().anyMatch(ts -> !ts.isReadOnly())) {
+            entityManager.flush();
+        }
+        BatchCallHandler callHandler = new BatchCallHandler(this.batchFilters, commandStrategy::execute);
+        final BatchResponse rootResponse = callHandler.serviceCall(request, uriInfo);
+        log.debug("Batch response: status code [{}], method [{}], relative url [{}]",
+                rootResponse.getStatusCode(), request.getMethod(), request.getRelativeUrl());
+        return rootResponse;
+    } catch (RuntimeException ex) {
+        return buildOrThrowErrorResponse(ex, request);
+    } finally {
+        BatchRequestContextHolder.resetRequestAttributes();
+    }
+}
+```
+
+Phases:
+
+1. **Strategy lookup** — `CommandStrategyProvider.getCommandStrategy` returns a bean or the catch-all `UnknownCommandStrategy`.
+2. **Preprocessors** — `runPreprocessors(request)` chains every registered `BatchRequestPreprocessor`. They can transform the request or short-circuit it with an exception. Idempotency-key handling lives here in many deployments.
+3. **Header propagation** — request headers are pushed onto `BatchRequestContextHolder.requestAttributes`. Downstream code (e.g. idempotency) reads them with `BatchRequestContextHolder.getRequestAttributes()`.
+4. **JPA flush** — under an enclosing write transaction, every leaf call is preceded by `entityManager.flush()`. This forces JPA to write pending changes so the next strategy sees them via JDBC.
+5. **Filter chain** — `BatchCallHandler` walks `batchFilters` around the eventual `commandStrategy::execute`.
+6. **Cleanup** — `resetRequestAttributes` runs in `finally`.
+
+## Failure model
+
+`buildOrThrowErrorResponse` is the chokepoint:
+
+```java
+private BatchResponse buildOrThrowErrorResponse(RuntimeException ex, BatchRequest request) {
+    BatchResponse response = buildErrorResponse(ex, request);
+    if (response.getStatusCode() != SC_OK && BatchRequestContextHolder.isEnclosingTransaction()) {
+        BatchRequestContextHolder.getTransaction().ifPresent(TransactionExecution::setRollbackOnly);
+        throw new BatchExecutionException(request, ex);
+    }
+    return response;
+}
+```
+
+| Mode | Failure handling |
+| --- | --- |
+| Per-request | `buildErrorResponse` produces a `BatchResponse` with status from `ErrorHandler.handle(ex)` and body from the formatted error message. The response is added to the list; siblings continue. |
+| Enclosing | Same response is built, then `setRollbackOnly()` is flipped on the enclosing transaction and a `BatchExecutionException` is thrown up to `callInTransaction`. The transaction is rolled back; the caller sees one consolidated error. |
+
+`buildErrorResponse(Throwable, BatchRequest)` consults `ErrorHandler` to map the exception to a status code, picks up request headers (so error responses retain whatever idempotency headers were sent), and emits a default body of `"Request with id N was erroneous!"` when the exception did not carry a message.
+
+## Sub-request URL syntax
+
+The strategy provider expects URLs to begin with `v1/…` but also supports unversioned for backward compatibility:
+
+```java
+public CommandStrategy getCommandStrategy(final CommandContext commandContext) {
+    if (isResourceVersioned(commandContext)) {
+        return internalGetCommandStrategy(commandContext);
+    } else {
+        // for backward compatibility, support non-versioned relative paths too
+        CommandContext alteredCommandContext = CommandContext.resource("v1/" + commandContext.getResource())
+                .method(commandContext.getMethod()).build();
+        return internalGetCommandStrategy(alteredCommandContext);
+    }
+}
+```
+
+So both `v1/clients` and `clients` route to `CreateClientCommandStrategy` for `POST`. The canonical form in your batches should be `v1/…` to stay forwards-compatible.
+
+## JPA transactions in per-request mode
+
+When `enclosingTransaction=false`, no outer transaction exists. Each strategy calls into a `*ApiResource` whose write service is annotated `@Transactional` (or `@Transactional(propagation = REQUIRED)`), and that opens a fresh transaction per call. Two consequences:
+
+* Sub-requests see each other's *committed* state, not the in-flight state, between root subtrees.
+* Within a single root subtree (parent → child → grandchild), JPA flush of the parent has already happened by the time the child runs, because the parent's transaction committed before the child started.
+
+`entityManager.flush()` in `executeRequest` is only called when the enclosing transaction is active and not read-only — that's where the parent and child share a single JDBC transaction.
+
+## Body item size limit (planned / convention)
+
+The application property family `fineract.api.body-item-size-limit.*` is used elsewhere in the platform (notably `inline-loan-cob`) to cap how many items a multi-item endpoint accepts. The Batch API today does **not** enforce a hard count limit in code, but follows the same naming convention. If you need to enforce a maximum number of sub-requests per `/v1/batches` call, the conventional flag name is `fineract.api.body-item-size-limit.batch-api` and the enforcement point is `BatchApiResource.handleBatchRequests` before `validateRequestMethodsAllowedOnInstanceType`.
+
+Operational guidance:
+
+| Setting | Effect |
+| --- | --- |
+| (no limit) | Default. Validate inputs at the load balancer / API gateway layer. |
+| `fineract.api.body-item-size-limit.batch-api=200` (custom) | Reject `> 200` sub-requests with a 4xx before dispatch. Recommended for noisy clients. |
+
+## What flows back to the caller
+
+A successful batch returns `200 OK` with a JSON array of `BatchResponse`. Each element has the underlying API resource's `statusCode`, response `body` (already a JSON string), and the request `headers` merged in.
+
+A batch that failed under `enclosingTransaction=true` returns `200 OK` (HTTP status) with a one-element array describing the first failing sub-request:
+
+```json
+[
+  {
+    "requestId": 2,
+    "statusCode": 400,
+    "headers": [{"name":"Idempotency-Key","value":"abc-123"}],
+    "body": "Transaction is being rolled back. First erroneous request: \n{\"requestId\":2, ...}"
+  }
+]
+```
+
+A batch with reference errors (`BatchReferenceInvalidException` raised by `ResolutionHelper.buildNodesTree`) returns a one-element array carrying the reference error itself — see [`resolution-helper`](/batch-api/resolution-helper).
+
+## Cross references
+
+| Topic | Page |
+| --- | --- |
+| The 48 shipped `*CommandStrategy` beans | [`/batch-api/command-strategies`](/batch-api/command-strategies) |
+| The forest builder + JSONPath substitution | [`/batch-api/resolution-helper`](/batch-api/resolution-helper) |
+| The bigger picture, mermaid, and module map | [`/batch-api/overview`](/batch-api/overview) |
+| Filters, preprocessors, idempotency hooks | [`/core/batch-api-internals`](/core/batch-api-internals) |
+| Read/write/batch instance modes | [`/core/instance-mode`](/core/instance-mode) |
+| `TenantAwareBasicAuthenticationFilter`, `PlatformSecurityContext` | [`/core/security-services`](/core/security-services) |

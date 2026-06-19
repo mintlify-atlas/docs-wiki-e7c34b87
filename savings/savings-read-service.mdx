@@ -1,0 +1,472 @@
+---
+title: "Savings Read Service Reference - Apache Fineract Wiki"
+sidebarTitle: "Read Service"
+description: "SavingsAccountReadPlatformServiceImpl: every retrieveOne, retrieveAll, transaction query and the JDBC mappers behind them in Apache Fineract."
+---
+
+`SavingsAccountReadPlatformServiceImpl` is the JDBC-backed read-side of Apache Fineract's savings module. It powers `GET /v1/savingsaccounts*`, `GET /v1/savingsaccounts/{id}/transactions/{txnId}` and the `template?clientId=…` form-bootstrap endpoint, plus the bulk projections consumed by the [COB savings business steps](/cob/savings-cob-business-steps) and the Spring Batch interest poster. The class lives at `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsAccountReadPlatformServiceImpl.java` (1418 lines) and implements the interface in `fineract-savings`. This page documents each public method, the private `RowMapper` classes, the SQL schema strings they emit, and the pagination contract.
+
+## Wiring
+
+`SavingsAccountReadPlatformServiceImpl` is a plain class (no `@Component`); it is registered by `SavingsConfiguration` so the spring context picks up a single instance:
+
+```java
+public SavingsAccountReadPlatformServiceImpl(final PlatformSecurityContext context,
+        final JdbcTemplate jdbcTemplate, final SavingsAccountAssembler savingAccountAssembler,
+        PaginationHelper paginationHelper, ColumnValidator columnValidator,
+        DatabaseSpecificSQLGenerator sqlGenerator,
+        SavingsAccountRepositoryWrapper savingsAccountRepositoryWrapper) {
+    this.context = context;
+    this.jdbcTemplate = jdbcTemplate;
+    this.sqlGenerator = sqlGenerator;
+    this.savingsAccountRepositoryWrapper = savingsAccountRepositoryWrapper;
+    this.transactionTemplateMapper = new SavingsAccountTransactionTemplateMapper();
+    this.transactionsMapper = new SavingsAccountTransactionsMapper();
+    this.savingsAccountTransactionsForBatchMapper = new SavingsAccountTransactionsForBatchMapper();
+    this.savingAccountMapper = new SavingAccountMapper();
+    this.columnValidator = columnValidator;
+    this.paginationHelper = paginationHelper;
+    this.savingAccountMapperForInterestPosting = new SavingAccountMapperForInterestPosting();
+    this.savingAccountAssembler = savingAccountAssembler;
+}
+```
+
+Notable collaborators:
+
+| Field | Role |
+|-------|------|
+| `JdbcTemplate jdbcTemplate` | Multi-tenant routing data source (see [datasource tenant routing](/core/datasource-tenant-routing)). |
+| `DatabaseSpecificSQLGenerator sqlGenerator` | Emits `calcFoundRows()`, `limit()` and `groupConcat()` correctly per dialect (MySQL vs PostgreSQL). |
+| `PaginationHelper paginationHelper` | Wraps the rowmapper into a `Page<T>` with total-row count. |
+| `ColumnValidator columnValidator` | Prevents SQL injection in `orderBy` / `sortOrder`. |
+| `SavingsAccountAssembler savingAccountAssembler` | Used internally to rehydrate a `SavingsAccount` when an action needs the entity (e.g. interest pre-calc). |
+| `SavingsAccountRepositoryWrapper savingsAccountRepositoryWrapper` | Provides `findIdByExternalId` and `findAccrualData`. |
+
+## Public methods
+
+### `retrieveOne(Long accountId)`
+
+The single-row lookup that backs `GET /v1/savingsaccounts/{accountId}`:
+
+```java
+@Override
+public SavingsAccountData retrieveOne(final Long accountId) {
+    try {
+        final String sql = "select " + this.savingAccountMapper.schema() + " where sa.id = ?";
+        return this.jdbcTemplate.queryForObject(sql, this.savingAccountMapper,
+            new Object[] { accountId }); // NOSONAR
+    } catch (final EmptyResultDataAccessException e) {
+        throw new SavingsAccountNotFoundException(accountId, e);
+    }
+}
+```
+
+Returns a fully-formed `SavingsAccountData` minus transactions and charges; the API resource adds those via `populateTemplateAndAssociations` when `associations=transactions,charges` (or `all`) is on the query string.
+
+### `retrieveAll(SearchParameters)`
+
+Paginated list. Builds the SQL against the office hierarchy filter so users only see accounts in their office sub-tree:
+
+```java
+@Override
+public Page<SavingsAccountData> retrieveAll(final SearchParameters searchParameters) {
+    final AppUser currentUser = this.context.authenticatedUser();
+    final String hierarchy = currentUser.getOffice().getHierarchy();
+    final String hierarchySearchString = hierarchy + "%";
+
+    final StringBuilder sqlBuilder = new StringBuilder(200);
+    sqlBuilder.append("select " + sqlGenerator.calcFoundRows() + " ");
+    sqlBuilder.append(this.savingAccountMapper.schema());
+
+    sqlBuilder.append(" join m_office o on o.id = c.office_id");
+    sqlBuilder.append(" where o.hierarchy like ?");
+
+    final Object[] objectArray = new Object[3];
+    objectArray[0] = hierarchySearchString;
+    int arrayPos = 1;
+    if (searchParameters != null) {
+        if (StringUtils.isNotBlank(searchParameters.getStatus())) {
+            sqlBuilder.append(" and sa.status_enum = ?");
+            objectArray[arrayPos++] = Integer.parseInt(searchParameters.getStatus());
+        }
+        if (StringUtils.isNotBlank(searchParameters.getExternalId())) {
+            sqlBuilder.append(" and sa.external_id = ?");
+            objectArray[arrayPos++] = searchParameters.getExternalId();
+        }
+        if (searchParameters.getOfficeId() != null) {
+            sqlBuilder.append(" and c.office_id = ?");
+            objectArray[arrayPos++] = searchParameters.getOfficeId();
+        }
+        if (searchParameters.hasOrderBy()) {
+            sqlBuilder.append(" order by ").append(searchParameters.getOrderBy());
+            this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getOrderBy());
+            if (searchParameters.hasSortOrder()) {
+                sqlBuilder.append(' ').append(searchParameters.getSortOrder());
+                this.columnValidator.validateSqlInjection(sqlBuilder.toString(), searchParameters.getSortOrder());
+            }
+        }
+        if (searchParameters.hasLimit()) {
+            sqlBuilder.append(" ");
+            sqlBuilder.append(searchParameters.hasOffset()
+                ? sqlGenerator.limit(searchParameters.getLimit(), searchParameters.getOffset())
+                : sqlGenerator.limit(searchParameters.getLimit()));
+        }
+    }
+    final Object[] finalObjectArray = Arrays.copyOf(objectArray, arrayPos);
+    return this.paginationHelper.fetchPage(this.jdbcTemplate, sqlBuilder.toString(),
+        finalObjectArray, this.savingAccountMapper);
+}
+```
+
+The supported filters as exposed by `SavingsAccountsApiResource.retrieveAll`:
+
+| Query param | Mapped field on `SearchParameters` | SQL effect |
+|-------------|-----------------------------------|------------|
+| `externalId` | `externalId` | `and sa.external_id = ?` |
+| `offset` | `offset` | input to `limit(?, ?)` |
+| `limit` | `limit` | input to `limit(?)` |
+| `orderBy` | `orderBy` | appended after column validation |
+| `sortOrder` | `sortOrder` | appended after column validation |
+
+`status` and `officeId` are accepted by the underlying `retrieveAll` even though the public endpoint omits them — they are reused by internal services. Hierarchy filter is enforced unconditionally.
+
+### `retrieveAllForLookup(Long clientId)`
+
+Lighter projection (id, account number, product short name) for dropdowns. Uses `SavingAccountMapperForLookup`.
+
+### `retrieveForLookup(Long clientId, Boolean overdraft)`
+
+Same as above but with an extra `and sa.allow_overdraft = ?` filter — used by the loan reschedule UI to pick a linked overdraft account.
+
+### `retrieveTemplate(...)` — delegated to `SavingsAccountTemplateReadPlatformServiceImpl`
+
+`SavingsAccountReadPlatformServiceImpl` does **not** own the template endpoint. The `GET /template?clientId=…&productId=…` resource hits `SavingsAccountTemplateReadPlatformServiceImpl.retrieveTemplate(clientId, groupId, productId, staffInSelectedOfficeOnly)` which assembles client, group, product, charge and currency options from independent SQL projections and returns a `SavingsAccountData.template` builder. Reference here because it is the other half of the "read service" pair.
+
+### `retrieveAllTransactions(Long savingsId, DepositAccountType depositAccountType)`
+
+Driver for the `?associations=transactions` flag and `GET /v1/savingsaccounts/{id}/transactions`:
+
+```java
+@Override
+public Collection<SavingsAccountTransactionData> retrieveAllTransactions(final Long savingsId,
+        DepositAccountType depositAccountType) {
+    // #audit backward compatibility
+    final String sql = "select " + this.transactionsMapper.schema()
+            + " where sa.id = ? and sa.deposit_type_enum = ? order by tr.transaction_date DESC,"
+            + " tr." + CREATED_DATE_DB_FIELD
+            + " DESC, tr.created_date DESC, tr.id DESC";
+    return this.jdbcTemplate.query(sql, this.transactionsMapper,
+        new Object[] { savingsId, depositAccountType.getValue() }); // NOSONAR
+}
+```
+
+Always sorts DESC by `(transaction_date, created_date, id)` so the latest event is at the top of the returned collection. The deposit-account filter prevents an FD/RD listing leaking into a plain savings call.
+
+### `retrieveSavingsTransaction(Long savingsId, Long transactionId, DepositAccountType)`
+
+```java
+@Override
+public SavingsAccountTransactionData retrieveSavingsTransaction(final Long savingsId,
+        final Long transactionId, DepositAccountType depositAccountType) {
+    final String sql = "select " + this.transactionsMapper.schema()
+        + " where sa.id = ? and sa.deposit_type_enum = ? and tr.id= ?";
+    return this.jdbcTemplate.queryForObject(sql, this.transactionsMapper, // NOSONAR
+            new Object[] { savingsId, depositAccountType.getValue(), transactionId });
+}
+```
+
+The deposit-type filter on this overload prevents an operator from probing FD transaction ids via the plain savings URL.
+
+### `retrieveAllTransactionData(List<String> refNo) throws DataAccessException`
+
+Batch lookup by `ref_no`. Used by the interoperation layer to make request-id-based idempotency cheap. Builds an `IN (?, ?, ...)` clause sized to the input.
+
+### `retrieveAllSavingsDataForInterestPosting(boolean backdatedTxnsAllowedTill, int pageSize, Integer status, Long maxSavingsId)`
+
+Heavy projection that drives the [bulk interest-poster](/cob/savings-cob-business-steps). Pulls one row per `(savings_account, transaction)` pair into `SavingsAccountData` with embedded `transactions`, so `SavingsSchedularInterestPoster` can post interest for thousands of accounts without re-fetching.
+
+```java
+String sql = "select " + this.savingAccountMapperForInterestPosting.schema()
+    + "join (select a.id from m_savings_account a where a.id > ? and a.status_enum = ? limit ?) b on b.id = sa.id ";
+if (backdatedTxnsAllowedTill) {
+    sql += "where (CASE WHEN sa.interest_posted_till_date is not null "
+         + "THEN tr.transaction_date >= sa.interest_posted_till_date "
+         + "ELSE tr.transaction_date >= sa.activatedon_date END) ";
+}
+sql += " and (sa.interest_posted_till_date is null or sa.interest_posted_till_date <= ? ) ";
+sql += " order by sa.id, tr.transaction_date, tr." + CREATED_DATE_DB_FIELD
+     + ", tr.created_date, tr.id";
+```
+
+The seek-pagination idiom (`sa.id > ?` plus `limit pageSize`) is what keeps the COB step's memory usage bounded; the page driver feeds the new `maxSavingsId` back in on the next call.
+
+### `retrieveAccountIdByExternalId(ExternalId externalId)`
+
+```java
+@Override
+public Long retrieveAccountIdByExternalId(final ExternalId externalId) {
+    return savingsAccountRepositoryWrapper.findIdByExternalId(externalId);
+}
+```
+
+Backing for the `/v1/savingsaccounts/external-id/{externalId}` family of resource paths. Returns `null` if not found; the API resource then throws `SavingsAccountNotFoundException`.
+
+### `retrievePeriodicAccrualData(LocalDate tillDate, SavingsAccount savings)`
+
+Returns `SavingsAccrualData` rows for accounts whose product accounting rule is `ACCRUAL_PERIODIC`. Consumed by the `addaccrualtransactionforsavings` job:
+
+```java
+@Override
+public List<SavingsAccrualData> retrievePeriodicAccrualData(LocalDate tillDate, SavingsAccount savings) {
+    Long savingsId = (savings != null) ? savings.getId() : null;
+    Integer status = SavingsAccountStatusType.ACTIVE.getValue();
+    Integer accountingRule = AccountingRuleType.ACCRUAL_PERIODIC.getValue();
+    return this.savingsAccountRepositoryWrapper.findAccrualData(tillDate, savingsId, status, accountingRule);
+}
+```
+
+### `retrieveDepositTransactionTemplate(Long savingsId, DepositAccountType)`
+
+Lightweight default-DTO for the new-transaction form. Returns just the currency, account number and the business date:
+
+```java
+public SavingsAccountTransactionData mapRow(final ResultSet rs, ...) throws SQLException {
+    final Long savingsId = rs.getLong("id");
+    final String accountNo = rs.getString("accountNo");
+    ...
+    return SavingsAccountTransactionData.template(savingsId, accountNo,
+        DateUtils.getBusinessLocalDate(), currency);
+}
+```
+
+`SavingsAccountTransactionsApiResource.retrieveTemplate` then merges in the `paymentTypeOptions` collection.
+
+## Mappers and schemas
+
+There are six private `RowMapper` / `ResultSetExtractor` classes inside the file, each owning a long `schema()` string.
+
+### `SavingAccountMapper`
+
+The big one — backs `retrieveOne`, `retrieveAll` and `retrieveForLookup` (full projection). Columns produced (truncated for readability):
+
+```
+sa.id as id, sa.account_no as accountNo, sa.external_id as externalId,
+sa.deposit_type_enum as depositType,
+c.id as clientId, c.display_name as clientName,
+g.id as groupId, g.display_name as groupName,
+sp.id as productId, sp.name as productName,
+s.id as fieldOfficerId, s.display_name as fieldOfficerName,
+sa.status_enum as statusEnum,
+sa.sub_status_enum as subStatusEnum,
+sa.reason_for_block as reasonForBlock,
+sa.submittedon_date as submittedOnDate,
+sbu.username as submittedByUsername, sbu.firstname/lastname,
+...
+sa.currency_code, sa.currency_digits, sa.currency_multiplesof,
+curr.name, curr.internationalized_name_code, curr.display_symbol,
+sa.nominal_annual_interest_rate as nominalAnnualInterestRate,
+sa.interest_compounding_period_enum, sa.interest_posting_period_enum,
+sa.interest_calculation_type_enum, sa.interest_calculation_days_in_year_type_enum,
+sa.min_required_opening_balance, sa.lockin_period_frequency, sa.lockin_period_frequency_enum,
+sa.allow_overdraft, sa.overdraft_limit,
+sa.nominal_annual_interest_rate_overdraft, sa.min_overdraft_for_interest_calculation,
+sa.total_deposits_derived, sa.total_withdrawals_derived,
+sa.total_withdrawal_fees_derived, sa.total_annual_fees_derived,
+sa.total_interest_earned_derived, sa.total_interest_posted_derived,
+sa.total_overdraft_interest_derived,
+sa.account_balance_derived as accountBalance,
+sa.total_fees_charge_derived, sa.total_penalty_charge_derived,
+sa.min_balance_for_interest_calculation, sa.min_required_balance,
+sa.enforce_min_required_balance, sa.max_allowed_lien_limit, sa.is_lien_allowed,
+sa.on_hold_funds_derived as onHoldFunds,
+sa.withhold_tax, sa.total_withhold_tax_derived,
+sa.last_interest_calculation_date, sa.interest_posted_till_date,
+sa.total_savings_amount_on_hold as onHoldAmount,
+sa.withdrawal_fee_for_transfer as withdrawalFeeForTransfers,
+tg.id as taxGroupId, tg.name as taxGroupName,
+(select COALESCE(max(sat.transaction_date),sa.activatedon_date)
+ from m_savings_account_transaction sat
+ where sat.is_reversed = false and sat.is_reversal = false
+ and sat.transaction_type_enum in (1,2)
+ and sat.savings_account_id = sa.id) as lastActiveTransactionDate,
+sp.is_dormancy_tracking_active, sp.days_to_inactive,
+sp.days_to_dormancy, sp.days_to_escheat
+from m_savings_account sa
+join m_savings_product sp ON sa.product_id = sp.id
+join m_currency curr on curr.code = sa.currency_code
+left join m_client c ON c.id = sa.client_id
+left join m_group g ON g.id = sa.group_id
+left join m_staff s ON s.id = sa.field_officer_id
+left join m_appuser sbu on sbu.id = sa.submittedon_userid
+left join m_appuser rbu on rbu.id = sa.rejectedon_userid
+left join m_appuser wbu on wbu.id = sa.withdrawnon_userid
+left join m_appuser abu on abu.id = sa.approvedon_userid
+left join m_appuser avbu on avbu.id = sa.activatedon_userid
+left join m_appuser cbu on cbu.id = sa.closedon_userid
+left join m_tax_group tg on tg.id = sa.tax_group_id
+```
+
+The `lastActiveTransactionDate` correlated sub-select is the **dormancy clock** — it picks the most recent non-reversed DEPOSIT (`type = 1`) or WITHDRAWAL (`type = 2`) and falls back to the activation date. The mapper then computes `daysToInactive` / `daysToDormancy` / `daysToEscheat` against the product's `days_to_*` thresholds:
+
+```java
+LocalDate currentDate = DateUtils.getBusinessLocalDate();
+if (isDormancyTrackingActive && statusEnum.equals(SavingsAccountStatusType.ACTIVE.getValue())) {
+    if (subStatusEnum < SavingsAccountSubStatusEnum.ESCHEAT.getValue()) {
+        daysToEscheat = DateUtils.getExactDifferenceInDays(currentDate,
+            lastActiveTransactionDate.plusDays(numDaysToEscheat));
+    }
+    if (subStatusEnum < SavingsAccountSubStatusEnum.DORMANT.getValue()) {
+        daysToDormancy = DateUtils.getExactDifferenceInDays(currentDate,
+            lastActiveTransactionDate.plusDays(numDaysToDormancy));
+    }
+    if (subStatusEnum < SavingsAccountSubStatusEnum.INACTIVE.getValue()) {
+        daysToInactive = DateUtils.getExactDifferenceInDays(currentDate,
+            lastActiveTransactionDate.plusDays(numDaysToInactive));
+    }
+}
+```
+
+The negative result means the threshold has been crossed; the COB step `UpdateSavingsDormancyStatus` (see [COB savings steps](/cob/savings-cob-business-steps)) uses the same shape to flip `sub_status_enum`.
+
+### `SavingsAccountTransactionsMapper`
+
+Driver for `retrieveAllTransactions`, `retrieveSavingsTransaction` and the `?associations=transactions` query path. The schema is split into static `buildSelect()` and `buildFrom()` so subclasses can reuse the FROM clause:
+
+```java
+protected static String buildSelect() {
+    return "tr.id as transactionId, tr.transaction_type_enum as transactionType, "
+         + "tr.transaction_date as transactionDate, tr.amount as transactionAmount, "
+         + "tr.release_id_of_hold_amount as releaseTransactionId, tr.reason_for_block as reasonForBlock, "
+         + "tr.submitted_on_date as submittedOnDate, au.username as submittedByUsername, "
+         + "nt.note as transactionNote, "
+         + "tr.running_balance_derived as runningBalance, tr.is_reversed as reversed, "
+         + "tr.is_reversal as isReversal, tr.original_transaction_id as originalTransactionId, "
+         + "tr.is_lien_transaction as lienTransaction, "
+         + "fromtran.id as fromTransferId, fromtran.is_reversed as fromTransferReversed, "
+         + "fromtran.transaction_date as fromTransferDate, fromtran.amount as fromTransferAmount, "
+         + "fromtran.description as fromTransferDescription, "
+         + "totran.id as toTransferId, totran.is_reversed as toTransferReversed, "
+         + "totran.transaction_date as toTransferDate, totran.amount as toTransferAmount, "
+         + "totran.description as toTransferDescription, sa.id as savingsId, sa.account_no as accountNo, "
+         + "pd.payment_type_id as paymentType, pd.account_number as accountNumber, "
+         + "pd.check_number as checkNumber, pd.receipt_number as receiptNumber, "
+         + "pd.bank_number as bankNumber, pd.routing_code as routingCode, "
+         + "sa.currency_code as currencyCode, sa.currency_digits as currencyDigits, "
+         + "sa.currency_multiplesof as inMultiplesOf, "
+         + "curr.name as currencyName, curr.internationalized_name_code as currencyNameCode, "
+         + "curr.display_symbol as currencyDisplaySymbol, pt.value as paymentTypeName, "
+         + "tr.is_manual as postInterestAsOn ";
+}
+
+protected static String buildFrom() {
+    return " FROM m_savings_account_transaction tr "
+         + "join m_savings_account sa on tr.savings_account_id = sa.id "
+         + "join m_currency curr on curr.code = sa.currency_code "
+         + "left join m_account_transfer_transaction fromtran "
+         + "  on fromtran.from_savings_transaction_id = tr.id "
+         + "left join m_account_transfer_transaction totran "
+         + "  on totran.to_savings_transaction_id = tr.id "
+         + "left join m_payment_detail pd on tr.payment_detail_id = pd.id "
+         + "left join m_payment_type pt on pd.payment_type_id = pt.id "
+         + "left join m_appuser au on au.id= tr." + CREATED_BY_DB_FIELD + " "
+         + "left join m_note nt ON nt.savings_account_transaction_id=tr.id ";
+}
+```
+
+Why two transfer joins? Because every cross-account transfer keeps a single `m_account_transfer_transaction` row — when the savings account is the *source*, it joins to `fromtran`; when it is the *destination*, to `totran`. Both columns are nullable so the row maps cleanly into `SavingsAccountTransactionData.transfer`.
+
+The reversal pair is also surfaced: `is_reversal` and `original_transaction_id` are exposed as `isReversal` and `originalTransactionId`. The `nt.note` join surfaces an operator note attached to the transaction so callers don't have to make a second hop.
+
+### `SavingsAccountTransactionTemplateMapper`
+
+Just enough to seed the "make a new transaction" form. Selects `id`, `account_no`, currency block and `min_required_opening_balance`. Used by `retrieveDepositTransactionTemplate`.
+
+### `SavingsAccountTransactionsForBatchMapper`
+
+Tiny — two columns (`transactionId`, `refNo`) — used by `retrieveAllTransactionData` to answer "do any of these external ref-nos already exist?" without dragging the wider projection.
+
+### `SavingAccountMapperForLookup`
+
+Three columns (`id`, `account_no`, product short name) for dropdowns.
+
+### `SavingAccountMapperForInterestPosting`
+
+Implements `ResultSetExtractor<List<SavingsAccountData>>` (note: not `RowMapper`) because one logical `SavingsAccountData` spans many rows (one per transaction). The extractor collapses contiguous `sa.id` rows into a single DTO with an embedded transaction list. Used by the bulk interest-posting Spring Batch step.
+
+## SQL patterns to remember
+
+<AccordionGroup>
+  <Accordion title="Office hierarchy filter">
+    ```sql
+    join m_office o on o.id = c.office_id
+    where o.hierarchy like ?
+    ```
+    The current user's office hierarchy plus `%` is passed as the first parameter. Every list endpoint applies this so a branch user cannot see accounts in sibling branches.
+  </Accordion>
+  <Accordion title="Seek-pagination for COB">
+    ```sql
+    select sa.id from m_savings_account sa
+    where sa.id > ? and sa.status_enum = ? order by sa.id limit ?
+    ```
+    Used by `retrieveAllSavingsDataForInterestPosting` and `retrieveActiveSavingsIds`. Cheap; constant memory per page.
+  </Accordion>
+  <Accordion title="Dormancy clock subquery">
+    ```sql
+    (select COALESCE(max(sat.transaction_date), sa.activatedon_date)
+     from m_savings_account_transaction sat
+     where sat.is_reversed = false and sat.is_reversal = false
+       and sat.transaction_type_enum in (1, 2)
+       and sat.savings_account_id = sa.id) as lastActiveTransactionDate
+    ```
+    `1` is DEPOSIT, `2` is WITHDRAWAL — the only types that count as "activity" for dormancy. Reversed and reversal rows are excluded so an undone deposit does not reset the clock.
+  </Accordion>
+  <Accordion title="Transaction ordering">
+    ```sql
+    order by tr.transaction_date DESC, tr.<CREATED_DATE_DB_FIELD> DESC, tr.created_date DESC, tr.id DESC
+    ```
+    Mirrors the entity's `@OrderBy("dateOf, createdDate, id")` but in descending order for the API. `CREATED_DATE_DB_FIELD` is whichever audit column the project's `AuditableFieldsConstants` resolves to.
+  </Accordion>
+  <Accordion title="Deposit-type guard on transaction lookups">
+    ```sql
+    where sa.id = ? and sa.deposit_type_enum = ? and tr.id = ?
+    ```
+    Prevents the savings transaction endpoints from returning FD or RD rows when the operator hits the wrong base URL.
+  </Accordion>
+</AccordionGroup>
+
+## Pagination contract
+
+The platform's pagination is built on `PaginationHelper.fetchPage`. It expects a SELECT with the `sqlGenerator.calcFoundRows()` token, runs the query and then issues the dialect-specific `SELECT FOUND_ROWS()` (MySQL) or `COUNT(*) OVER ()` (PostgreSQL) lookup to populate `Page.totalFilteredRecords`. The handler returns:
+
+```json
+{
+  "totalFilteredRecords": 1234,
+  "pageItems": [ { ... }, { ... }, ... ]
+}
+```
+
+This is what callers of `GET /v1/savingsaccounts?offset=0&limit=50` receive.
+
+## Method matrix
+
+| Method | Used by | Mapper | Returns |
+|--------|---------|--------|---------|
+| `retrieveOne(accountId)` | `GET /v1/savingsaccounts/{id}` | `SavingAccountMapper` | `SavingsAccountData` |
+| `retrieveAll(searchParameters)` | `GET /v1/savingsaccounts?offset=…` | `SavingAccountMapper` + `PaginationHelper` | `Page<SavingsAccountData>` |
+| `retrieveAllForLookup(clientId)` | dropdowns | `SavingAccountMapperForLookup` | `Collection<SavingsAccountData>` |
+| `retrieveForLookup(clientId, overdraft)` | overdraft dropdowns | `SavingAccountMapperForLookup` | `Collection<SavingsAccountData>` |
+| `retrieveAllTransactions(id, depositType)` | `?associations=transactions` & charges API | `SavingsAccountTransactionsMapper` | `Collection<SavingsAccountTransactionData>` |
+| `retrieveSavingsTransaction(id, txnId, depositType)` | `GET /transactions/{txnId}` | `SavingsAccountTransactionsMapper` | `SavingsAccountTransactionData` |
+| `retrieveDepositTransactionTemplate(id, depositType)` | `GET /transactions/template` | `SavingsAccountTransactionTemplateMapper` | `SavingsAccountTransactionData` |
+| `retrieveAllTransactionData(refNos)` | interop idempotency | `SavingsAccountTransactionsForBatchMapper` | `List<SavingsAccountTransactionData>` |
+| `retrieveAllSavingsDataForInterestPosting(...)` | COB interest-posting batch | `SavingAccountMapperForInterestPosting` | `List<SavingsAccountData>` |
+| `retrieveAccountIdByExternalId(externalId)` | `external-id/{externalId}` routes | wrapper repository | `Long` |
+| `retrievePeriodicAccrualData(tillDate, account)` | `addaccrualtransactionforsavings` job | wrapper repository | `List<SavingsAccrualData>` |
+
+## Cross-links
+
+- [Accounts API](/savings/savings-accounts-api) — every read endpoint and which method it hits.
+- [Transactions API](/savings/savings-transactions-api) — the search variant uses `SavingsAccountTransactionSearchService` instead of this class.
+- [Write service](/savings/savings-write-service) — produces the rows this class projects.
+- [Account domain](/savings/savings-account-domain) — column-level reference for everything the SQL selects.
+- [COB savings business steps](/cob/savings-cob-business-steps) — consumer of `retrieveAllSavingsDataForInterestPosting` and `retrievePeriodicAccrualData`.

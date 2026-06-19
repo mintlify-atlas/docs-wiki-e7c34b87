@@ -1,0 +1,374 @@
+---
+title: "Delinquency Buckets, Ranges, Tags and Pause Actions"
+sidebarTitle: "Delinquency"
+description: "DelinquencyBucket, DelinquencyRange, LoanDelinquencyTagHistory and delinquency pause/resume actions powering Fineract's classification job and SetLoanDelinquencyTagsBusinessStep."
+---
+
+Fineract's delinquency subsystem classifies loans into buckets based on days overdue, raises (and lifts) tag history on each loan when the bucket changes, and supports operational *delinquency actions* (pause, resume) that temporarily exclude a loan from the classification job. All of this lives in `fineract-loan/src/main/java/org/apache/fineract/portfolio/delinquency/` (helpers, services, validators, handlers, mappers) and `fineract-core/.../portfolio/delinquency/domain` (the buckets/ranges domain). The classification job ships as a Spring Batch step that is invoked from the COB step [`SetLoanDelinquencyTagsBusinessStep`](/cob/loan-cob-business-steps) (enum-styled name `LOAN_DELINQUENCY_CLASSIFICATION`).
+
+Cross references: products attach a bucket via `LoanProduct.delinquencyBucket` ([Loan product API](/loan/loan-product-api)); the COB step is documented at [Loan COB steps](/cob/loan-cob-business-steps); the standalone Spring Batch job is in [Loan jobs](/loan/loan-jobs); REST endpoints for actions live on `LoansApiResource` and are catalogued in [Loan REST handlers](/loan/loan-rest-handlers).
+
+## File map
+
+| Concern | File | Module |
+| --- | --- | --- |
+| `DelinquencyBucket` entity | `portfolio/delinquency/domain/DelinquencyBucket.java` | `fineract-core` |
+| `DelinquencyRange` entity | `portfolio/delinquency/domain/DelinquencyRange.java` | `fineract-core` |
+| Range repo | `portfolio/delinquency/domain/DelinquencyRangeRepository.java` | `fineract-loan` |
+| Bucket repo | `portfolio/delinquency/domain/DelinquencyBucketRepository.java` | `fineract-loan` |
+| Bucket-Range mapping | `portfolio/delinquency/domain/DelinquencyBucketMappings.java` | `fineract-loan` |
+| Tag history | `portfolio/delinquency/domain/LoanDelinquencyTagHistory.java` | `fineract-loan` |
+| Installment tag | `portfolio/delinquency/domain/LoanInstallmentDelinquencyTag.java` | `fineract-loan` |
+| Delinquency action enum | `portfolio/delinquency/domain/DelinquencyAction.java` | `fineract-loan` |
+| Loan delinquency action | `portfolio/delinquency/domain/LoanDelinquencyAction.java` | `fineract-loan` |
+| REST | `portfolio/delinquency/api/DelinquencyApiResource.java` | `fineract-loan` |
+| Action REST | `portfolio/loanaccount/api/LoansApiResource.java` `delinquency-actions` paths | `fineract-provider` |
+| Read service | `portfolio/delinquency/service/DelinquencyReadPlatformService(Impl)` | `fineract-loan` |
+| Write service | `portfolio/delinquency/service/DelinquencyWritePlatformService(Impl)` | `fineract-loan` |
+| Loan domain service | `portfolio/delinquency/service/LoanDelinquencyDomainService(Impl)` | `fineract-loan` |
+| Pause helper | `portfolio/delinquency/helper/DelinquencyEffectivePauseHelper(Impl)` | `fineract-loan` |
+| Installment aggregator | `portfolio/delinquency/helper/InstallmentDelinquencyAggregator` | `fineract-loan` |
+| Validators | `portfolio/delinquency/validator/DelinquencyBucketParseAndValidator`, `DelinquencyRangeParseAndValidator`, `DelinquencyActionParseAndValidator` | `fineract-loan` |
+| Mappers | `portfolio/delinquency/mapper/*` | `fineract-loan` |
+| COB step | `cob/loan/SetLoanDelinquencyTagsBusinessStep.java` | `fineract-provider` |
+| Batch job | `portfolio/loanaccount/jobs/setloandelinquencytags/{SetLoanDelinquencyTagsConfig, Tasklet}` | `fineract-loan` |
+
+## Domain model
+
+### `DelinquencyRange`
+
+```java
+public class DelinquencyRange extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Column(name = "classification", nullable = false)
+    private String classification;
+    @Column(name = "min_age_days", nullable = false)
+    private Integer minimumAgeDays;
+    @Column(name = "max_age_days", nullable = true)
+    private Integer maximumAgeDays;
+    ...
+}
+```
+
+A range is a labelled overdue window — e.g. `30-60_DAYS` with `minimumAgeDays=30`, `maximumAgeDays=60`. A null `maximumAgeDays` means "and above".
+
+### `DelinquencyBucket`
+
+```java
+public class DelinquencyBucket extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+    @Column(name = "name", nullable = false)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "bucket_type")
+    private DelinquencyBucketType bucketType;
+}
+```
+
+Buckets are ordered collections of ranges expressed through `DelinquencyBucketMappings`:
+
+```java
+public class DelinquencyBucketMappings {
+    private DelinquencyBucket bucket;
+    private DelinquencyRange range;
+}
+```
+
+A `LoanProduct` references a single bucket; an installment-or-loan landing in range *X* of bucket *B* gets tagged with *X*.
+
+### `LoanDelinquencyTagHistory`
+
+```java
+public class LoanDelinquencyTagHistory extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+    @ManyToOne
+    @JoinColumn(name = "delinquency_range_id")
+    private DelinquencyRange delinquencyRange;
+
+    @ManyToOne
+    @JoinColumn(name = "loan_id")
+    private Loan loan;
+
+    @Column(name = "addedon_date", nullable = false)
+    private LocalDate addedOnDate;
+
+    @Column(name = "liftedon_date", nullable = true)
+    private LocalDate liftedOnDate;
+
+    @Version
+    private Long version;
+}
+```
+
+Every change in the loan's classification produces a new row: `liftedOnDate` is null while the tag is current and populated when the loan moves to a different range or recovers.
+
+### `LoanInstallmentDelinquencyTag`
+
+When `LoanProduct.enableInstallmentLevelDelinquency = true`, classification is computed per-installment rather than for the loan as a whole. Each per-installment tag stores `loan_id`, `installment_id`, `delinquency_range_id`, `first_overdue_date`.
+
+### `DelinquencyAction` and `LoanDelinquencyAction`
+
+```java
+public enum DelinquencyAction { PAUSE, RESUME }
+
+public class LoanDelinquencyAction extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+    @ManyToOne @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+    @Enumerated(EnumType.STRING) @Column(name = "action", nullable = false)
+    private DelinquencyAction action;
+    @Column(name = "start_date", nullable = false)
+    private LocalDate startDate;
+    @Column(name = "end_date")
+    private LocalDate endDate; // null for RESUME and for open-ended PAUSE
+}
+```
+
+A `PAUSE` action with a `[start, end]` interval prevents the classification job from advancing the bucket for that loan during the interval. A `RESUME` shortens an active pause.
+
+## REST surface
+
+### `DelinquencyApiResource` — buckets & ranges admin
+
+```java
+@Path("/v1/delinquency")
+@Component
+public class DelinquencyApiResource {
+    public static final String DELINQUENCY_BUCKET = "DELINQUENCY_BUCKET";
+```
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/delinquency/ranges` | List ranges |
+| `GET` | `/delinquency/ranges/{id}` | Retrieve range |
+| `POST` | `/delinquency/ranges` | Create range → `DELINQUENCY_RANGE` `CREATE` |
+| `PUT` | `/delinquency/ranges/{id}` | Update range → `DELINQUENCY_RANGE` `UPDATE` |
+| `DELETE` | `/delinquency/ranges/{id}` | Delete range → `DELINQUENCY_RANGE` `DELETE` |
+| `GET` | `/delinquency/buckets/template` | Dropdown options |
+| `GET` | `/delinquency/buckets` | List buckets |
+| `GET` | `/delinquency/buckets/{id}` | Retrieve bucket |
+| `POST` | `/delinquency/buckets` | Create bucket → `DELINQUENCY_BUCKET` `CREATE` |
+| `PUT` | `/delinquency/buckets/{id}` | Update bucket → `DELINQUENCY_BUCKET` `UPDATE` |
+| `DELETE` | `/delinquency/buckets/{id}` | Delete bucket → `DELINQUENCY_BUCKET` `DELETE` |
+
+Range creation snippet:
+
+```java
+@POST
+@Path("ranges")
+public CommandProcessingResult createDelinquencyRange(final DelinquencyRangeRequest delinquencyRangeRequest) {
+    securityContext.authenticatedUser().validateHasCreatePermission(DELINQUENCY_BUCKET);
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createDelinquencyRange()
+            .withJson(jsonSerializer.serialize(delinquencyRangeRequest)).build();
+    return commandWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+Handlers are in `portfolio/delinquency/handler/`:
+
+| Handler | Entity / Action | Service call |
+| --- | --- | --- |
+| `CreateDelinquencyRangeCommandHandler` | `DELINQUENCY_RANGE` / `CREATE` | `DelinquencyWritePlatformService.createDelinquencyRange` |
+| `UpdateDelinquencyRangeCommandHandler` | `DELINQUENCY_RANGE` / `UPDATE` | `updateDelinquencyRange` |
+| `DeleteDelinquencyRangeCommandHandler` | `DELINQUENCY_RANGE` / `DELETE` | `deleteDelinquencyRange` |
+| `CreateDelinquencyBucketCommandHandler` | `DELINQUENCY_BUCKET` / `CREATE` | `createDelinquencyBucket` |
+| `UpdateDelinquencyBucketCommandHandler` | `DELINQUENCY_BUCKET` / `UPDATE` | `updateDelinquencyBucket` |
+| `DeleteDelinquencyBucketCommandHandler` | `DELINQUENCY_BUCKET` / `DELETE` | `deleteDelinquencyBucket` |
+| `UpdateLoanDelinquencyBucketCommandHandler` | `LOAN_DELINQUENCY_BUCKET` / `UPDATE` | `updateLoanDelinquencyBucket` |
+| `CreateDelinquencyActionCommandHandler` | `DELINQUENCY_ACTION` / `CREATE` | `DelinquencyWritePlatformService.createDelinquencyAction` |
+
+### Loan-level delinquency actions
+
+Exposed on `LoansApiResource`:
+
+| Method | Path |
+| --- | --- |
+| `GET` | `/v1/loans/{loanId}/delinquency-actions` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/delinquency-actions` |
+| `POST` | `/v1/loans/{loanId}/delinquency-actions` |
+| `POST` | `/v1/loans/external-id/{loanExternalId}/delinquency-actions` |
+| `GET` | `/v1/loans/{loanId}/delinquencytags` |
+
+Create snippet:
+
+```java
+@POST
+@Path("{loanId}/delinquency-actions")
+public String createLoanDelinquencyAction(@PathParam("loanId") final Long loanId,
+        @Context final UriInfo uriInfo, final String apiRequestBodyAsJson) {
+    return createLoanDelinquencyAction(loanId, ExternalId.empty(), apiRequestBodyAsJson);
+}
+```
+
+Request body:
+
+```json
+{ "action": "PAUSE", "startDate": "01 February 2024", "endDate": "01 March 2024",
+  "dateFormat": "dd MMMM yyyy", "locale": "en" }
+```
+
+The body is parsed by `DelinquencyActionParseAndValidator`, which enforces:
+
+| Rule | Source |
+| --- | --- |
+| `action` must be `PAUSE` or `RESUME` | `DelinquencyAction` enum |
+| `startDate` mandatory; `endDate` mandatory for `PAUSE` | validator |
+| `startDate <= endDate` for `PAUSE` | validator |
+| Overlapping PAUSE forbidden | validator + repo lookup |
+| `RESUME` may only target an active `PAUSE` | validator |
+
+## Read service — `DelinquencyReadPlatformService`
+
+Key methods (interface):
+
+```java
+Collection<DelinquencyRangeData> retrieveAllDelinquencyRanges();
+DelinquencyRangeData retrieveDelinquencyRange(Long delinquencyRangeId);
+Collection<DelinquencyBucketData> retrieveAllDelinquencyBuckets();
+DelinquencyBucketData retrieveDelinquencyBucket(Long delinquencyBucketId);
+CollectionData retrieveLoanDelinquencyData(Long loanId);
+Collection<LoanDelinquencyActionData> retrieveLoanDelinquencyActions(Long loanId);
+DelinquencyMinimumPaymentPeriodAndRuleData retrieveLoanDelinquencyMinimumPayment(Long loanId);
+```
+
+`CollectionData` returns the live computed view (days past due, overdue principal/interest/fees, next due, etc) for a loan — used by the loan summary UI.
+
+## Write service — `DelinquencyWritePlatformService`
+
+```java
+public interface DelinquencyWritePlatformService {
+    CommandProcessingResult createDelinquencyRange(JsonCommand command);
+    CommandProcessingResult updateDelinquencyRange(Long delinquencyRangeId, JsonCommand command);
+    CommandProcessingResult deleteDelinquencyRange(Long delinquencyRangeId);
+    CommandProcessingResult createDelinquencyBucket(JsonCommand command);
+    CommandProcessingResult updateDelinquencyBucket(Long delinquencyBucketId, JsonCommand command);
+    CommandProcessingResult deleteDelinquencyBucket(Long delinquencyBucketId);
+    CommandProcessingResult applyDelinquencyTagToLoan(Long loanId, JsonCommand command);
+    CommandProcessingResult createDelinquencyAction(Long loanId, JsonCommand command);
+
+    // Internal — invoked from COB / batch
+    LoanScheduleDelinquencyData calculateDelinquencyData(LoanScheduleDelinquencyData data,
+            List<LoanDelinquencyActionData> effectivePauses);
+    void applyDelinquencyTagToLoan(LoanScheduleDelinquencyData data, List<LoanDelinquencyActionData> effective);
+    void removeDelinquencyTagToLoan(Loan loan);
+    void cleanLoanDelinquencyTags(Loan loan);
+}
+```
+
+The internal calls are the ones invoked by the COB step / batch job.
+
+## `LoanDelinquencyDomainService` — pure compute
+
+```java
+public interface LoanDelinquencyDomainService {
+    CollectionData getOverdueCollectionData(Loan loan);
+    CollectionData getOverdueCollectionData(Loan loan,
+            List<LoanDelinquencyActionData> effectivePauses);
+    Map<Long, CollectionData> getOverdueCollectionData(Loan loan,
+            List<LoanDelinquencyActionData> effectivePauses,
+            boolean computeInstallmentLevelDelinquency);
+    LoanDelinquencyData getLoanDelinquencyData(Loan loan,
+            List<LoanDelinquencyActionData> effectivePauses);
+}
+```
+
+It walks the schedule, subtracts effective pauses, and emits `CollectionData` (overdue amounts) and `LoanDelinquencyData` (per-installment bucket assignments). It is *side-effect free*, which is what allows `SetLoanDelinquencyTagsBusinessStep` to call it inside the per-loan COB transaction.
+
+## `DelinquencyEffectivePauseHelper`
+
+```java
+public interface DelinquencyEffectivePauseHelper {
+    List<LoanDelinquencyActionData> calculateEffectiveDelinquencyList(
+            List<LoanDelinquencyAction> loanDelinquencyActions);
+    Long getPausedDaysBeforeDate(List<LoanDelinquencyActionData> savedDelinquencyList, LocalDate date);
+}
+```
+
+`calculateEffectiveDelinquencyList` collapses overlapping/abutting PAUSE rows, applies RESUME truncation, and returns a normalised list of `[start, end]` intervals. `getPausedDaysBeforeDate` returns how many days within a horizon are paused — used by the schedule generator to compute *adjusted* days-past-due.
+
+```java
+// Pseudo from helper:
+// PAUSE(2024-01-10, 2024-02-10) + RESUME(2024-01-20)
+//   -> effective = [(2024-01-10, 2024-01-20)]
+// PAUSE(2024-01-10, 2024-02-10) + PAUSE(2024-02-05, 2024-02-25)
+//   -> merged into single [(2024-01-10, 2024-02-25)]
+```
+
+## `InstallmentDelinquencyAggregator`
+
+Used only when `enableInstallmentLevelDelinquency = true`. For each overdue installment it computes the days past due (net of effective pauses) and maps to a range in the bucket; if the installment moves between ranges, the helper:
+
+1. Closes the previous `LoanInstallmentDelinquencyTag` (sets `lifted_on_date`).
+2. Opens a new tag with the new range.
+3. Drives the *loan-level* tag to the **worst** range across installments.
+
+## COB step + batch job
+
+The `SetLoanDelinquencyTagsBusinessStep` (in `fineract-provider/.../cob/loan/`) runs once per loan inside the daily Loan COB chain and:
+
+1. Loads effective pauses via `DelinquencyEffectivePauseHelper`.
+2. Calls `LoanDelinquencyDomainService.getLoanDelinquencyData(loan, effective)`.
+3. Calls `DelinquencyWritePlatformService.applyDelinquencyTagToLoan(data, effective)` — which inserts/lifts `LoanDelinquencyTagHistory` rows.
+
+The standalone job `LOAN_DELINQUENCY_CLASSIFICATION` is the legacy/scheduled alternative wired by `SetLoanDelinquencyTagsConfig` ([Loan jobs](/loan/loan-jobs)):
+
+```java
+@Bean
+public Job setLoanDelinquencyTagsJob() {
+    return new JobBuilder(JobName.LOAN_DELINQUENCY_CLASSIFICATION.name(), jobRepository)
+            .start(setLoanDelinquencyTagsStep())
+            .incrementer(new RunIdIncrementer()).build();
+}
+```
+
+<Note>
+On a fully COB-driven deployment, the standalone job is left disabled — classification happens inside COB. The job remains as a backstop and for compatibility with non-COB installations.
+</Note>
+
+## Validators
+
+| Validator | Purpose |
+| --- | --- |
+| `DelinquencyRangeParseAndValidator` | `classification` non-blank; `minimumAgeDays >= 1`; `maximumAgeDays == null` or `> minimumAgeDays` |
+| `DelinquencyBucketParseAndValidator` | `name` non-blank; `ranges` non-empty; ranges within a bucket must be **non-overlapping** and **contiguous** when sorted by `minimumAgeDays` |
+| `DelinquencyActionParameters` constants | request parameter names |
+| `DelinquencyActionParseAndValidator` | enum, dates, overlap (see above) |
+
+## Mappers
+
+| Mapper | Maps to |
+| --- | --- |
+| `DelinquencyBucketMapper` | `DelinquencyBucket` → `DelinquencyBucketData` |
+| `DelinquencyRangeMapper` | `DelinquencyRange` → `DelinquencyRangeData` |
+| `DelinquencyResponseMapper` | API resource wrappers (`DelinquencyRangeResponse`, `DelinquencyBucketResponse`, `DelinquencyBucketTemplateResponse`) |
+| `LoanDelinquencyTagMapper` | `LoanDelinquencyTagHistory` → REST DTO |
+| `DelinquencyMinimumPaymentPeriodAndRuleMapper` | minimum-payment-period / rule data |
+
+## Worked example — bucket lifecycle
+
+1. Create three ranges:
+   ```bash
+   POST /v1/delinquency/ranges {"classification":"OVERDUE_1_30","minimumAgeDays":1,"maximumAgeDays":30}
+   POST /v1/delinquency/ranges {"classification":"OVERDUE_31_60","minimumAgeDays":31,"maximumAgeDays":60}
+   POST /v1/delinquency/ranges {"classification":"OVERDUE_61_PLUS","minimumAgeDays":61}
+   ```
+2. Create a bucket pointing at them:
+   ```bash
+   POST /v1/delinquency/buckets {"name":"Standard","ranges":[1,2,3]}
+   ```
+3. Attach the bucket to a loan product (`POST /loanproducts {... "delinquencyBucketId": 7}`).
+4. As loans on this product age, the COB step inserts rows in `m_loan_delinquency_tag_history`. After an installment passes 31 days unpaid, the existing `OVERDUE_1_30` row gets `lifted_on_date` set and a new `OVERDUE_31_60` row is opened.
+5. Operator pauses the loan for the holiday period:
+   ```bash
+   POST /v1/loans/{loanId}/delinquency-actions
+   { "action": "PAUSE", "startDate": "20 December 2024", "endDate": "05 January 2025",
+     "dateFormat": "dd MMMM yyyy", "locale": "en" }
+   ```
+   Subsequent COB runs will skip those days when measuring days-past-due.
+
+## Related pages
+
+- [Loan COB business steps](/cob/loan-cob-business-steps)
+- [Loan product API](/loan/loan-product-api)
+- [Loan jobs](/loan/loan-jobs)
+- [Interest pauses](/loan/interest-pauses)
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan APIs index](/api/loan-apis)

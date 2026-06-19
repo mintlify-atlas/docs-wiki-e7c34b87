@@ -1,0 +1,465 @@
+---
+title: "LoanTransaction, Transaction Types, Reversal Mechanics"
+sidebarTitle: "Loan Transactions"
+description: "Apache Fineract loan money movements: LoanTransaction entity, 43-value LoanTransactionType enum, schedule mappings, paid-by trail, reversal rules."
+---
+
+Every money movement on a loan in Apache Fineract — disbursement, repayment, waiver, write-off, recovery, chargeback, accrual posting, charge-off, capitalized-income amortization, buy-down-fee — is a `LoanTransaction` row in `m_loan_transaction`. The entity lives in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/domain/LoanTransaction.java`. This page documents the field model, every value of `LoanTransactionType`, the mapping tables that link a transaction to the installments it touched, and the reversal contract.
+
+The companion entities are `LoanRepaymentScheduleInstallment` (see [Repayment schedule domain](/loan/loan-repayment-schedule-domain)), `LoanCharge` (see [Loan charges](/loan/loan-charges)), and the transaction processors that allocate the amounts (see [Transaction processors](/loan/transaction-processors)).
+
+## Entity overview
+
+```java
+@Getter
+@Entity
+@Table(name = "m_loan_transaction",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "external_id" }, name = "external_id_UNIQUE") })
+public class LoanTransaction extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Version private Long version;
+
+    @ManyToOne(optional = false) @JoinColumn(name = "loan_id",   nullable = false) private Loan   loan;
+    @ManyToOne                   @JoinColumn(name = "office_id", nullable = false) private Office office;
+    @ManyToOne(optional = true)  @JoinColumn(name = "payment_detail_id") private PaymentDetail paymentDetail;
+
+    @Column(name = "transaction_type_enum", nullable = false) private LoanTransactionType typeOf;
+    @Column(name = "transaction_date",       nullable = false) private LocalDate dateOf;
+    @Getter @Column(name = "submitted_on_date", nullable = false) private LocalDate submittedOnDate;
+
+    @Column(name = "amount",                          scale = 6, precision = 19, nullable = false) private BigDecimal amount;
+    @Column(name = "principal_portion_derived",       scale = 6, precision = 19) private BigDecimal principalPortion;
+    @Column(name = "interest_portion_derived",        scale = 6, precision = 19) private BigDecimal interestPortion;
+    @Column(name = "fee_charges_portion_derived",     scale = 6, precision = 19) private BigDecimal feeChargesPortion;
+    @Column(name = "penalty_charges_portion_derived", scale = 6, precision = 19) private BigDecimal penaltyChargesPortion;
+    @Column(name = "overpayment_portion_derived",     scale = 6, precision = 19) private BigDecimal overPaymentPortion;
+    @Column(name = "unrecognized_income_portion",     scale = 6, precision = 19) private BigDecimal unrecognizedIncomePortion;
+
+    @Column(name = "is_reversed",     nullable = false) private boolean reversed;
+    @Column(name = "external_id",     length = 100, unique = true) private ExternalId externalId;
+    @Column(name = "reversal_external_id", length = 100, unique = true) private ExternalId reversalExternalId;
+    @Column(name = "reversed_on_date")     private LocalDate reversedOnDate;
+
+    @Column(name = "outstanding_loan_balance_derived", scale = 6, precision = 19) private BigDecimal outstandingLoanBalance;
+    @Column(name = "manually_adjusted_or_reversed",    nullable = false) private boolean manuallyAdjustedOrReversed;
+    @Column(name = "charge_refund_charge_type", length = 1) private String chargeRefundChargeType;
+```
+
+| Field | Meaning |
+| --- | --- |
+| `loan`, `office` | Owning loan and the office through which the transaction was posted |
+| `paymentDetail` | Optional FK to `m_payment_detail` (cheque #, account #, routing code, receipt #, bank #) |
+| `typeOf` | The discriminator — see [LoanTransactionType](#loantransactiontype-the-43-values) |
+| `dateOf` | Business effective date (could be back-dated) |
+| `submittedOnDate` | When the row was created (set to `DateUtils.getBusinessLocalDate()` in the constructor) |
+| `amount` | Gross monetary amount |
+| `principalPortion` etc. | The five derived portions — `principal + interest + fees + penalty + overpayment + unrecognizedIncome = amount` for repayments. Filled by the processor during `processLatestTransaction` |
+| `reversed` | True after `reverse()` is called; the row is kept for audit |
+| `reversedOnDate`, `reversalExternalId` | When and under what ID it was reversed |
+| `outstandingLoanBalance` | Snapshot of `Loan.summary.totalPrincipalOutstanding` after this transaction |
+| `manuallyAdjustedOrReversed` | True when a user explicitly reversed it (vs replay-driven reversal) |
+| `chargeRefundChargeType` | One-letter discriminator (`F` fee / `P` penalty) for `CHARGE_REFUND` |
+
+### Owned collections
+
+```java
+@Setter @OneToMany(cascade = CascadeType.ALL, mappedBy = "loanTransaction",
+                   orphanRemoval = true, fetch = FetchType.LAZY)
+private Set<LoanChargePaidBy> loanChargesPaid = new HashSet<>();
+
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY,
+           mappedBy = "loanTransaction")
+private Set<LoanCollateralManagement> loanCollateralManagementSet = new HashSet<>();
+
+@Getter @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY,
+                   mappedBy = "loanTransaction")
+private Set<LoanTransactionToRepaymentScheduleMapping> loanTransactionToRepaymentScheduleMappings = new HashSet<>();
+
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY,
+           mappedBy = "fromTransaction")
+private Set<LoanTransactionRelation> loanTransactionRelations = new HashSet<>();
+
+@Setter @OneToOne(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY,
+                  mappedBy = "loanTransaction")
+private LoanReAgeParameter loanReAgeParameter;
+
+@Setter @OneToOne(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY,
+                  mappedBy = "loanTransaction")
+private LoanReAmortizationParameter loanReAmortizationParameter;
+
+@Setter @ManyToOne(fetch = FetchType.LAZY) @JoinColumn(name = "classification_cv_id")
+private CodeValue classification;
+```
+
+## LoanTransactionType: the 43 values
+
+```java
+public enum LoanTransactionType {
+    INVALID(0, ...),
+    DISBURSEMENT(1, ...),
+    REPAYMENT(2, ...),
+    CONTRA(3, ...),
+    WAIVE_INTEREST(4, ...),
+    REPAYMENT_AT_DISBURSEMENT(5, ...),
+    WRITEOFF(6, ...),
+    MARKED_FOR_RESCHEDULING(7, ...),
+    RECOVERY_REPAYMENT(8, ...),
+    WAIVE_CHARGES(9, ...),
+    ACCRUAL(10, ...),
+    // 11 deliberately unused
+    INITIATE_TRANSFER(12, ...),
+    APPROVE_TRANSFER(13, ...),
+    WITHDRAW_TRANSFER(14, ...),
+    REJECT_TRANSFER(15, ...),
+    REFUND(16, ...),
+    CHARGE_PAYMENT(17, ...),
+    REFUND_FOR_ACTIVE_LOAN(18, ...),
+    INCOME_POSTING(19, ...),
+    CREDIT_BALANCE_REFUND(20, ...),
+    MERCHANT_ISSUED_REFUND(21, ...),
+    PAYOUT_REFUND(22, ...),
+    GOODWILL_CREDIT(23, ...),
+    CHARGE_REFUND(24, ...),
+    CHARGEBACK(25, ...),
+    CHARGE_ADJUSTMENT(26, ...),
+    CHARGE_OFF(27, ...),
+    DOWN_PAYMENT(28, ...),
+    REAGE(29, ...),
+    REAMORTIZE(30, ...),
+    INTEREST_PAYMENT_WAIVER(31, ...),
+    ACCRUAL_ACTIVITY(32, ...),
+    INTEREST_REFUND(33, ...),
+    ACCRUAL_ADJUSTMENT(34, ...),
+    CAPITALIZED_INCOME(35, ...),
+    CAPITALIZED_INCOME_AMORTIZATION(36, ...),
+    CAPITALIZED_INCOME_ADJUSTMENT(37, ...),
+    CONTRACT_TERMINATION(38, ...),
+    CAPITALIZED_INCOME_AMORTIZATION_ADJUSTMENT(39, ...),
+    BUY_DOWN_FEE(40, ...),
+    BUY_DOWN_FEE_ADJUSTMENT(41, ...),
+    BUY_DOWN_FEE_AMORTIZATION(42, ...),
+    BUY_DOWN_FEE_AMORTIZATION_ADJUSTMENT(43, ...);
+}
+```
+
+`LoanTransactionType.fromInt(Integer)` and `getCode()` round-trip the values. The persisted column is the `int`; the JPA converter is `LoanTransactionTypeConverter`.
+
+### Grouped semantics
+
+#### Movement of principal out
+
+| Type | Trigger | Portion populated |
+| --- | --- | --- |
+| `DISBURSEMENT` (1) | `?command=disburse` or `disburseToSavings` | `principalPortion = amount` (negative net effect — increases outstanding) |
+| `REPAYMENT_AT_DISBURSEMENT` (5) | Auto-deducted at disbursement for disbursement-time charges | Fee/penalty portions |
+| `DOWN_PAYMENT` (28) | When `enableAutoRepaymentForDownPayment = true` on the product | Same shape as a repayment |
+
+#### Movement of money in
+
+| Type | Trigger | Portion populated |
+| --- | --- | --- |
+| `REPAYMENT` (2) | `?command=repayment` | All four portions split by processor |
+| `MERCHANT_ISSUED_REFUND` (21) | `?command=merchantIssuedRefund` | Same as repayment; classified separately for reporting |
+| `PAYOUT_REFUND` (22) | `?command=payoutRefund` | Same as repayment |
+| `GOODWILL_CREDIT` (23) | `?command=goodwillCredit` | Same as repayment |
+| `RECOVERY_REPAYMENT` (8) | `?command=recoverypayment` on a written-off loan | Goes to `Loan.totalRecovered` |
+| `INTEREST_PAYMENT_WAIVER` (31) | `?command=interestPaymentWaiver` | Interest portion |
+| `REFUND` (16), `REFUND_FOR_ACTIVE_LOAN` (18) | `?command=refundByCash` / `refundbytransfer` | Money out |
+| `CREDIT_BALANCE_REFUND` (20) | `?command=creditBalanceRefund` on overpaid loan | Reverses `OVERPAID` status |
+| `INTEREST_REFUND` (33) | Automatic on early settlement (when product opts in) or `?command=interest-refund` | Reduces `Loan.summary.totalInterestRepaid` |
+
+#### Income loss recognition
+
+| Type | Trigger | Effect |
+| --- | --- | --- |
+| `WAIVE_INTEREST` (4) | `?command=waiveinterest` | Interest portion only; updates `LoanSummary.totalInterestWaived` |
+| `WAIVE_CHARGES` (9) | `?command=waive` on a charge | Fee or penalty portion |
+| `WRITEOFF` (6) | `?command=writeoff` | Sets status `CLOSED_WRITTEN_OFF`, fills principal/interest/fee/penalty written-off portions |
+| `CHARGE_OFF` (27) | `?command=charge-off` | Flips `Loan.chargedOff`; doesn't move money but drives an accounting reclass |
+
+#### Charge-related
+
+| Type | Trigger |
+| --- | --- |
+| `CHARGE_PAYMENT` (17) | `?command=pay` on a charge endpoint |
+| `CHARGE_REFUND` (24) | `?command=chargeRefund` on transactions endpoint |
+| `CHARGEBACK` (25) | `POST /loans/{id}/transactions/{txnId}?command=chargeback` |
+| `CHARGE_ADJUSTMENT` (26) | `?command=adjustment` on a charge endpoint |
+
+#### Accrual
+
+| Type | Trigger | Origin |
+| --- | --- | --- |
+| `ACCRUAL` (10) | Periodic accrual posting | `AddPeriodicAccrualEntriesBusinessStep` |
+| `ACCRUAL_ACTIVITY` (32) | New-style activity row | `AccrualActivityPostingBusinessStep` |
+| `ACCRUAL_ADJUSTMENT` (34) | Re-accrual after reversal | `LoanAccrualsProcessingService` |
+
+#### Transfers
+
+`INITIATE_TRANSFER` (12), `APPROVE_TRANSFER` (13), `WITHDRAW_TRANSFER` (14), `REJECT_TRANSFER` (15) — the two-phase office-to-office loan transfer. Status goes `ACTIVE → TRANSFER_IN_PROGRESS → TRANSFER_ON_HOLD → ACTIVE` (or back).
+
+#### Progressive-loan specific
+
+`CAPITALIZED_INCOME` (35), `CAPITALIZED_INCOME_AMORTIZATION` (36), `CAPITALIZED_INCOME_ADJUSTMENT` (37), `CAPITALIZED_INCOME_AMORTIZATION_ADJUSTMENT` (39), `BUY_DOWN_FEE` (40), `BUY_DOWN_FEE_ADJUSTMENT` (41), `BUY_DOWN_FEE_AMORTIZATION` (42), `BUY_DOWN_FEE_AMORTIZATION_ADJUSTMENT` (43) — see [Progressive loan overview](/progressive-loan/overview).
+
+#### Re-aging and re-amortization
+
+`REAGE` (29), `REAMORTIZE` (30) — link to `LoanReAgeParameter` and `LoanReAmortizationParameter` respectively. Both are progressive-loan workflows that change the schedule structure without monetary movement.
+
+#### Contract termination and others
+
+`CONTRACT_TERMINATION` (38) — `?command=contractTermination`, sets `loanSubStatus = CONTRACT_TERMINATION`.
+`INCOME_POSTING` (19) — used when interest recalculation posts a recognised-income entry between installments.
+`MARKED_FOR_RESCHEDULING` (7), `CONTRA` (3) — internal markers used by older code paths.
+
+## Static factories
+
+The entity exposes a static factory per `LoanTransactionType`. The constructor itself is package-visible. Examples:
+
+```java
+public static LoanTransaction disbursement(Loan loan, Money amount, PaymentDetail paymentDetail,
+        LocalDate disbursementDate, ExternalId externalId, Money loanTotalOverpaid) {
+    LoanTransaction disbursement = new LoanTransaction(null, loan.getOffice(),
+            LoanTransactionType.DISBURSEMENT, paymentDetail, amount.getAmount(), disbursementDate, externalId);
+    if (LoanScheduleType.PROGRESSIVE.equals(loan.getLoanProductRelatedDetail().getLoanScheduleType())) {
+        Money overPaymentPortion = amount.isGreaterThan(loanTotalOverpaid) ? loanTotalOverpaid : amount;
+        disbursement.setOverPayments(overPaymentPortion);
+    }
+    return disbursement;
+}
+
+public static LoanTransaction repayment(Office office, Money amount, PaymentDetail paymentDetail,
+        LocalDate paymentDate, ExternalId externalId) {
+    return new LoanTransaction(null, office, LoanTransactionType.REPAYMENT, paymentDetail,
+            amount.getAmount(), paymentDate, externalId);
+}
+
+public static LoanTransaction chargeback(Loan loan, Money amount, PaymentDetail paymentDetail,
+        LocalDate paymentDate, ExternalId externalId) {
+    LoanTransaction loanTransaction = new LoanTransaction(loan, loan.getOffice(),
+            LoanTransactionType.CHARGEBACK, paymentDetail, amount.getAmount(), paymentDate, externalId);
+    loanTransaction.principalPortion = amount.getAmount();
+    return loanTransaction;
+}
+
+public static LoanTransaction chargeOff(Loan loan, LocalDate chargeOffDate, ExternalId externalId) { … }
+public static LoanTransaction writeoff(Loan loan, Office office, LocalDate writeOffDate, ExternalId externalId) { … }
+public static LoanTransaction waiveLoanCharge(Loan loan, Office office, Money waived, LocalDate waiveDate, …) { … }
+public static LoanTransaction waiver(Office office, Loan loan, Money amount, LocalDate waiveDate,
+        Money waived, Money unrecognizedPortion, ExternalId externalId) { … }
+public static LoanTransaction accrueInterest(Office office, Loan loan, Money amount, …) { … }
+public static LoanTransaction accrueLoanCharge(Loan loan, Office office, Money amount, LocalDate applyDate, …) { … }
+public static LoanTransaction accrueTransaction(Loan loan, Office office, LocalDate dateOf, BigDecimal amount, …) { … }
+public static LoanTransaction accrualAdjustment(Loan loan, Office office, LocalDate dateOf, BigDecimal amount, …) { … }
+public static LoanTransaction creditBalanceRefund(Loan loan, Office office, Money amount, LocalDate paymentDate, …) { … }
+public static LoanTransaction refundForActiveLoan(Office office, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction recoveryRepayment(Office office, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction downPayment(Office office, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction interestRefund(Loan loan, BigDecimal amount, LocalDate date, ExternalId externalId) { … }
+public static LoanTransaction chargeAdjustment(Loan loan, BigDecimal amount, LocalDate transactionDate, …) { … }
+public static LoanTransaction capitalizedIncome(Loan loan, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction capitalizedIncomeAmortization(Loan loan, Office office, LocalDate dateOf, …) { … }
+public static LoanTransaction capitalizedIncomeAdjustment(Loan loan, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction buyDownFeeAdjustment(Loan loan, Money amount, PaymentDetail paymentDetail, …) { … }
+public static LoanTransaction buyDownFeeAmortization(Loan loan, Office office, LocalDate dateOf, …) { … }
+public static LoanTransaction copyTransactionProperties(LoanTransaction loanTransaction)   // for replay
+public LoanTransaction         copyTransactionPropertiesAndMappings()                       // for replay + mappings
+```
+
+Use the factory; never call `new LoanTransaction(...)` directly from a service.
+
+## LoanTransactionToRepaymentScheduleMapping
+
+The link between a transaction and the installment(s) it touched is the join entity `LoanTransactionToRepaymentScheduleMapping`:
+
+```java
+@Entity @Table(name = "m_loan_transaction_repayment_schedule_mapping") @Getter
+public class LoanTransactionToRepaymentScheduleMapping extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = false, cascade = CascadeType.PERSIST)
+    @JoinColumn(name = "loan_transaction_id",        nullable = false) private LoanTransaction loanTransaction;
+    @ManyToOne(optional = false, cascade = CascadeType.PERSIST)
+    @JoinColumn(name = "loan_repayment_schedule_id", nullable = false) private LoanRepaymentScheduleInstallment installment;
+
+    @Column(name = "principal_portion_derived",      scale = 6, precision = 19) private BigDecimal principalPortion;
+    @Column(name = "interest_portion_derived",       scale = 6, precision = 19) private BigDecimal interestPortion;
+    @Column(name = "fee_charges_portion_derived",    scale = 6, precision = 19) private BigDecimal feeChargesPortion;
+    @Column(name = "penalty_charges_portion_derived",scale = 6, precision = 19) private BigDecimal penaltyChargesPortion;
+    @Column(name = "amount",                          scale = 6, precision = 19) private BigDecimal amount;
+
+    public static LoanTransactionToRepaymentScheduleMapping createFrom(LoanTransaction loanTransaction,
+            LoanRepaymentScheduleInstallment installment, Money principalPortion, Money interestPortion,
+            Money feeChargesPortion, Money penaltyChargesPortion) { … }
+}
+```
+
+A single `REPAYMENT` that covers two installments creates two mapping rows. The processor populates the portions; `defaultToNullIfZero` keeps the row compact.
+
+When a transaction is reversed, **`reverse()` clears its mappings**:
+
+```java
+public void reverse() {
+    this.reversed = true;
+    this.reversedOnDate = DateUtils.getBusinessLocalDate();
+    this.loanTransactionToRepaymentScheduleMappings.clear();
+}
+
+public void reverse(ExternalId reversalExternalId) {
+    this.reverse();
+    this.reversalExternalId = reversalExternalId;
+}
+```
+
+This is intentional: the mappings will be re-created by reverse-replay if the transaction is later replayed.
+
+## LoanTransactionRelation
+
+For chargebacks, charge-adjustments, replays, and explicit adjustments we need a forward/backward link between transactions or between a transaction and a charge. That's `LoanTransactionRelation`:
+
+```java
+@Getter
+@Entity @Table(name = "m_loan_transaction_relation")
+public class LoanTransactionRelation extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "from_loan_transaction_id", nullable = false)
+    private LoanTransaction fromTransaction;
+
+    @Setter @ManyToOne @JoinColumn(name = "to_loan_transaction_id")
+    private LoanTransaction toTransaction;
+
+    @ManyToOne @JoinColumn(name = "to_loan_charge_id")
+    private LoanCharge toCharge;
+
+    @Column(name = "relation_type_enum", nullable = false)
+    private LoanTransactionRelationTypeEnum relationType;
+
+    public static LoanTransactionRelation linkToTransaction(@NotNull LoanTransaction fromTransaction,
+            LoanTransaction toTransaction, LoanTransactionRelationTypeEnum relationType) { … }
+    public static LoanTransactionRelation linkToCharge(@NotNull LoanTransaction fromTransaction,
+            @NotNull LoanCharge loanCharge, LoanTransactionRelationTypeEnum relationType) { … }
+}
+```
+
+```java
+public enum LoanTransactionRelationTypeEnum {
+    INVALID(0, ...),
+    CHARGEBACK(1, "loanTransactionRelationType.chargeback"),
+    CHARGE_ADJUSTMENT(2, "loanTransactionRelationType.chargeAdjustment"),
+    REPLAYED(3, "loanTransactionRelationType.replayed"),
+    RELATED(4, "loanTransactionRelationType.related"),
+    ADJUSTMENT(5, "loanTransactionRelationType.adjustment");
+}
+```
+
+| Relation | When | Meaning |
+| --- | --- | --- |
+| `CHARGEBACK` | `?command=chargeback` on a repayment | The chargeback transaction "from" points "to" the original repayment |
+| `CHARGE_ADJUSTMENT` | `?command=adjustment` on a charge | The adjustment transaction "from" points "to" the original charge |
+| `REPLAYED` | Reverse-replay | The replay transaction "from" points "to" the original (now reversed) one |
+| `ADJUSTMENT` | `?command=adjustTransaction` | Generic transaction replacement |
+| `RELATED` | Misc | E.g. `INTEREST_REFUND` pointing to the early-settlement repayment that triggered it |
+
+## Reversal contract
+
+`reverse()` is the canonical way to undo a transaction:
+
+```java
+public void reverse() {
+    this.reversed = true;
+    this.reversedOnDate = DateUtils.getBusinessLocalDate();
+    this.loanTransactionToRepaymentScheduleMappings.clear();
+}
+public boolean isReversed()      { return this.reversed; }
+public boolean isNotReversed()   { return !isReversed(); }
+public void manuallyAdjustedOrReversed() { this.manuallyAdjustedOrReversed = true; }
+```
+
+Rules:
+
+1. **A reversed transaction is never deleted.** The row stays in `m_loan_transaction` with `is_reversed = true`. This preserves the audit trail and allows accounting to post a counter-entry.
+2. **Mappings are cleared on reverse.** They get re-created during reverse-replay if the transaction is replayed forward.
+3. **`reversedOnDate` is the business date of the reversal**, not the transaction's original `dateOf`.
+4. **`manuallyAdjustedOrReversed` distinguishes user-initiated vs replay-initiated reversal.** Replays during reverse-replay set `reversed = true` only on intermediate state; the user-driven `?command=adjust` sets the flag.
+5. **`reversalExternalId` records the caller-supplied external id** of the reversal, when one was provided.
+
+## Reverse-replay
+
+When a back-dated transaction is added (`dateOf` falls before some existing transactions), the processor performs reverse-replay:
+
+1. Reverse every transaction `T` whose `dateOf > newTxn.dateOf`.
+2. Reset every installment with `resetDerivedComponents` to its scheduled values.
+3. Replay every transaction in order, including the new one. Each replay calls `processor.processLatestTransaction(...)`.
+4. Use `ChangedTransactionDetail` to record before-and-after pairs for downstream accounting.
+
+The detail object is returned to the calling service, which then asks `LoanJournalEntryPoster` to emit counter-entries — see [Accounting processors](/accounting/accounting-processors).
+
+`AbstractLoanRepaymentScheduleTransactionProcessor.reprocessLoanTransactions(...)` is the entry point. See [Transaction processors](/loan/transaction-processors) for the full method signature.
+
+## Helpful predicates on `LoanTransaction`
+
+The entity has 80+ helper predicates. The frequently used ones:
+
+| Predicate | True when |
+| --- | --- |
+| `isDisbursement()` | type == DISBURSEMENT |
+| `isRepayment()`, `isRepaymentLikeType()` | REPAYMENT, MERCHANT_ISSUED_REFUND, PAYOUT_REFUND, GOODWILL_CREDIT, INTEREST_PAYMENT_WAIVER, DOWN_PAYMENT |
+| `isWriteOff()` | WRITEOFF |
+| `isChargeOff()` | CHARGE_OFF |
+| `isWaiver()`, `isInterestWaiver()`, `isChargesWaiver()` | WAIVE_INTEREST / WAIVE_CHARGES |
+| `isAccrual()`, `isAccrualActivity()` | ACCRUAL / ACCRUAL_ACTIVITY |
+| `isRecoveryRepayment()` | RECOVERY_REPAYMENT |
+| `isRefund()`, `isCreditBalanceRefund()`, `isInterestRefund()`, `isMerchantIssuedRefund()`, `isPayoutRefund()`, `isGoodwillCredit()` | per-type |
+| `isChargeback()`, `isChargeAdjustment()`, `isChargePayment()`, `isChargeRefund()` | per-type |
+| `isCapitalizedIncome*()`, `isBuyDownFee*()` | progressive types |
+| `isReAged()`, `isReAmortized()` | progressive types |
+| `isNotReversed()`, `isReversed()` | reversal status |
+| `isManuallyAdjustedOrReversed()` | user-initiated reversal flag |
+| `getOutstandingLoanBalance()` | The snapshot after this transaction |
+
+## Persistence ordering
+
+The collection is annotated `@OrderBy(value = "dateOf, createdDate, id")` on `Loan.loanTransactions`. Reverse-replay relies on this ordering being stable — `createdDate` from `AbstractAuditableWithUTCDateTimeCustom` resolves ties between two transactions with the same `dateOf`, and `id` is the final tiebreaker for two transactions created in the same instant.
+
+## Repositories
+
+```java
+public interface LoanTransactionRepository extends JpaRepository<LoanTransaction, Long> {
+    Optional<LoanTransaction> findById(Long id);
+    List<LoanTransaction> findByLoanIdAndExternalIdIn(Long loanId, Collection<ExternalId> externalIds);
+    …
+}
+
+public interface LoanTransactionRelationRepository extends JpaRepository<LoanTransaction Relation, Long> {
+    Collection<LoanTransactionRelation> findByFromTransaction(LoanTransaction from);
+    …
+}
+```
+
+Most reads go through `LoanReadPlatformServiceImpl.retrieveLoanTransactions(...)` (paged) and `retrieveLoanTransaction(...)` (single). See [Loan read service](/loan/loan-read-service).
+
+## API surface
+
+`LoanTransactionsApiResource` (in `fineract-provider/.../api/`) exposes the entire surface. Every write is dispatched by a `?command=` parameter through `CommandWrapperBuilder`. Full reference: [Loan transactions API](/loan/loan-transactions-api).
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Loan domain model" icon="database" href="/loan/loan-domain-model">
+    `Loan.loanTransactions` collection, `LoanSummary` running balances updated by each transaction.
+  </Card>
+  <Card title="Repayment schedule" icon="calendar-days" href="/loan/loan-repayment-schedule-domain">
+    `LoanRepaymentScheduleInstallment` — where the `loanTransactionToRepaymentScheduleMappings` point.
+  </Card>
+  <Card title="Transaction processors" icon="filter" href="/loan/transaction-processors">
+    How the four monetary portions are calculated for each transaction type.
+  </Card>
+  <Card title="Loan write service" icon="pen-to-square" href="/loan/loan-write-service">
+    Where `LoanTransaction.*` factories are invoked from `LoanWritePlatformServiceJpaRepositoryImpl`.
+  </Card>
+  <Card title="Loan transactions API" icon="globe" href="/loan/loan-transactions-api">
+    Every REST endpoint and its `?command=` switchboard.
+  </Card>
+  <Card title="Accounting processors" icon="book" href="/accounting/accounting-processors">
+    How each `LoanTransactionType` becomes a `JournalEntry`.
+  </Card>
+</CardGroup>

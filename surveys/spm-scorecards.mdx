@@ -1,0 +1,390 @@
+---
+title: "SPM Scorecards and PPI Scoring (Scorecard, LookupTable)"
+sidebarTitle: "SPM Scorecards"
+description: "Fineract Scorecard JPA entity, ScorecardApiResource endpoints, the LookupTable score-band mechanism, and how PPI scores translate into client poverty likelihoods."
+---
+
+The Scorecard module is the typed scoring half of Fineract's SPM stack. Every
+captured answer for a client survey is persisted as a row in
+`m_survey_scorecards` and is later aggregated through `m_survey_lookup_tables`
+to produce a final score band. The REST surface is
+`org.apache.fineract.spm.api.ScorecardApiResource` at
+`/v1/surveys/scorecards`, the read service is
+`ScorecardReadPlatformServiceImpl`, and the lookup helper is
+`LookupTableApiResource` under `/v1/surveys/{surveyId}/lookuptables`. All of
+these live in the `fineract-provider` module.
+
+## Scorecard entity
+
+Source: `spm/domain/Scorecard.java`. Maps to `m_survey_scorecards`.
+
+```java
+@Entity
+@Table(name = "m_survey_scorecards")
+public class Scorecard extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "survey_id")
+    private Survey survey;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "question_id")
+    private Question question;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "response_id")
+    private Response response;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id")
+    private AppUser appUser;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "client_id")
+    private Client client;
+
+    @Column(name = "created_on")
+    @OrderBy("createdOn DESC")
+    private LocalDateTime createdOn;
+
+    @Column(name = "a_value", precision = 4)
+    private Integer value;
+}
+```
+
+A Scorecard row therefore answers: **which client (`client_id`) answered
+which question (`question_id`) of which survey (`survey_id`) with which
+response (`response_id`), captured by which user (`user_id`), at what time
+(`created_on`), with what numeric value (`a_value`).** The `value` is
+denormalised from `Response.value` at capture time so that historic answers
+keep their original score even if the survey definition changes.
+
+### Table schema
+
+| Column | Type | FK | Notes |
+| --- | --- | --- | --- |
+| `id` | `BIGINT` | — | PK |
+| `survey_id` | `BIGINT` | `m_surveys.id` | Required |
+| `question_id` | `BIGINT` | `m_survey_questions.id` | Required |
+| `response_id` | `BIGINT` | `m_survey_responses.id` | Required |
+| `user_id` | `BIGINT` | `m_appuser.id` | Captured by |
+| `client_id` | `BIGINT` | `m_client.id` | Subject |
+| `created_on` | `TIMESTAMP` | — | Capture instant |
+| `a_value` | `INT(4)` | — | Denormalised numeric value |
+
+See [portfolio shared domain](/core/portfolio-shared-domain) for the `Client`
+relationship and [user administration domain](/core/useradministration-domain)
+for the `AppUser` relationship.
+
+## ScorecardApiResource
+
+Source: `spm/api/ScorecardApiResource.java`. Annotated
+`@Path("/v1/surveys/scorecards")`.
+
+```java
+@Path("/v1/surveys/scorecards")
+@Component
+@Tag(name = "Score Card", description = "")
+@RequiredArgsConstructor
+public class ScorecardApiResource {
+
+    private final PlatformSecurityContext securityContext;
+    private final SpmService spmService;
+    private final ScorecardService scorecardService;
+    private final ClientRepositoryWrapper clientRepositoryWrapper;
+    private final ScorecardReadPlatformService scorecardReadPlatformService;
+```
+
+### Endpoint matrix
+
+| Method | Path | Operation | Returns |
+| --- | --- | --- | --- |
+| `GET` | `/v1/surveys/scorecards/{surveyId}` | `findBySurvey` | `List<ScorecardData>` |
+| `POST` | `/v1/surveys/scorecards/{surveyId}` | `createScorecard` | `void` |
+| `GET` | `/v1/surveys/scorecards/{surveyId}/clients/{clientId}` | `findBySurveyAndClient` | `List<ScorecardData>` |
+| `GET` | `/v1/surveys/scorecards/clients/{clientId}` | `findByClient` | `List<ScorecardData>` |
+
+All endpoints require only `authenticatedUser()` (no permission validation
+beyond a successful login). Reads delegate to `ScorecardReadPlatformService`,
+writes delegate to `ScorecardService`.
+
+### Create flow
+
+```java
+public void createScorecard(@PathParam("surveyId") final Long surveyId,
+                            final ScorecardData scorecardData) {
+    final AppUser appUser = this.securityContext.authenticatedUser();
+    final Survey survey = this.spmService.findById(surveyId);
+    final Client client = this.clientRepositoryWrapper
+            .findOneWithNotFoundDetection(scorecardData.getClientId());
+
+    this.scorecardService.createScorecard(
+        ScorecardMapper.map(scorecardData, survey, appUser, client));
+}
+```
+
+`ScorecardMapper.map(...)` builds one `Scorecard` row per `ScorecardValue` in
+the request body, inheriting `appUser` and `client` from the resolved
+references. Mandatory fields per the Swagger description:
+
+```
+clientId, createdOn, questionId, responseId, staffId
+```
+
+## ScorecardData / ScorecardValue DTOs
+
+Source: `spm/data/ScorecardData.java`, `spm/data/ScorecardValue.java`.
+
+```java
+public class ScorecardData {
+    private Long   id;
+    private Long   userId;
+    private String username;
+    private Long   clientId;
+    private Long   surveyId;
+    private String surveyName;
+    private List<ScorecardValue> scorecardValues;
+}
+
+public class ScorecardValue {
+    private Long           questionId;
+    private Long           responseId;
+    private Integer        value;
+    private OffsetDateTime createdOn;
+}
+```
+
+A request to `POST /v1/surveys/scorecards/{surveyId}` therefore looks like:
+
+```json
+{
+  "clientId": 42,
+  "scorecardValues": [
+    { "questionId": 101, "responseId": 1001, "value": 5,
+      "createdOn": "2024-06-12T09:30:00Z" },
+    { "questionId": 102, "responseId": 1010, "value": 2,
+      "createdOn": "2024-06-12T09:30:00Z" }
+  ]
+}
+```
+
+## ScorecardReadPlatformServiceImpl
+
+Source: `spm/service/ScorecardReadPlatformServiceImpl.java`. Uses two
+`RowMapper`s sharing the same `m_survey_scorecards` source.
+
+### Header projection
+
+```java
+String SCORECARD_SCHEMA = """
+    sc.id as id, sc.survey_id as surveyId, s.a_name as surveyName,
+    sc.client_id as clientId,
+    sc.user_id as userId, user.username as username
+    from m_survey_scorecards sc
+    left join m_surveys s ON s.id = sc.survey_id
+    left join m_appuser user ON user.id = sc.user_id """;
+```
+
+### Value projection
+
+```java
+String SCORECARD_VALUE_SCHEMA = """
+    sc.question_id as questionId, sc.response_id as responseId,
+    sc.created_on as createdOn, sc.a_value as value
+    from m_survey_scorecards sc
+    where sc.survey_id = ? and sc.client_id = ? """;
+```
+
+### Aggregation
+
+After running the header query (grouped by `survey_id, client_id, id`), the
+service iterates each `ScorecardData` and calls
+`getScorecardValueBySurveyAndClient(surveyId, clientId)` to attach the value
+list. This means each `(survey, client)` pair appears as exactly one
+`ScorecardData` envelope carrying all of its `ScorecardValue`s.
+
+```java
+@Override
+public Collection<ScorecardData> retrieveScorecardByClient(Long clientId) {
+    this.context.authenticatedUser();
+    ScorecardMapper scm = new ScorecardMapper();
+    String sql = "select " + scm.schema() + " where sc.client_id = ? "
+               + " group by sc.survey_id, sc.client_id, sc.id ";
+    Collection<ScorecardData> scorecardDatas =
+        this.jdbcTemplate.query(sql, scm, new Object[] { clientId });
+    updateScorecardValues(scorecardDatas);
+    return scorecardDatas;
+}
+```
+
+## LookupTable entity
+
+Source: `spm/domain/LookupTable.java`. Maps to `m_survey_lookup_tables`.
+
+```java
+@Entity
+@Table(name = "m_survey_lookup_tables")
+public class LookupTable extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "survey_id")
+    private Survey survey;
+
+    @Column(name = "a_key", length = 32)        private String key;
+    @Column(name = "description", length = 4096) private String description;
+    @Column(name = "value_from", precision = 4)  private Integer valueFrom;
+    @Column(name = "value_to",   precision = 4)  private Integer valueTo;
+    @Column(name = "score",      precision = 5,
+            scale = 2)                            private Double score;
+}
+```
+
+A LookupTable row says: "for survey *X*, when the total scorecard value falls
+between `valueFrom` and `valueTo`, classify it under `key` and assign
+`score` (e.g. a poverty likelihood percentage as `Double`)." Ranges are
+inclusive on both ends and typically partition the score space without gaps.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `BIGINT` | PK |
+| `survey_id` | `BIGINT` | FK to `m_surveys.id` |
+| `a_key` | `VARCHAR(32)` | Bucket name |
+| `description` | `VARCHAR(4096)` | Human description |
+| `value_from` | `INT(4)` | Inclusive lower bound |
+| `value_to` | `INT(4)` | Inclusive upper bound |
+| `score` | `DECIMAL(5,2)` | Output score, 0.00–999.99 |
+
+## LookupTableApiResource
+
+Source: `spm/api/LookupTableApiResource.java`. Annotated
+`@Path("/v1/surveys/{surveyId}/lookuptables")`.
+
+| Method | Path | Operation |
+| --- | --- | --- |
+| `GET` | `/v1/surveys/{surveyId}/lookuptables` | `fetchLookupTables` → `List<LookupTableData>` |
+| `GET` | `/v1/surveys/{surveyId}/lookuptables/{key}` | `findLookupTable` → `LookupTableData` |
+| `POST` | `/v1/surveys/{surveyId}/lookuptables` | `createLookupTable` |
+
+`findLookupTable` throws `LookupTableNotFoundException(key)` when no entries
+match. `createLookupTable` mandates `key, score, validFrom, validTo` per its
+Swagger description.
+
+The Tag declares the resource:
+
+```
+The Apache Fineract SPM API provides the ability to create custom surveys to
+collect social performance measurentment data or any additional questionnaire
+a financial institute want to collect.
+```
+
+(Verbatim from the source; "measurentment" is preserved.)
+
+## PPI scoring formula
+
+Although the typed Scorecard subsystem is independent of the PPI datatable
+model documented in [Survey API](/surveys/survey-api), both subsystems share
+the same conceptual mechanism: **sum of question values → lookup band →
+classification.**
+
+### Typed Scorecard scoring
+
+1. For each captured `Scorecard` row of `(survey_id, client_id)`, take
+   `a_value`.
+2. Sum across questions: `total = Σ value`.
+3. Find the `LookupTable` row where
+   `survey_id = X AND value_from <= total AND value_to >= total`.
+4. Return `(key, score)`.
+
+There is no built-in JPQL for step 3 — operators can either fetch lookup
+table entries via `GET .../lookuptables` and resolve client-side, or write a
+custom SQL report. Sample SQL:
+
+```sql
+WITH totals AS (
+  SELECT sc.client_id, SUM(sc.a_value) AS total
+  FROM m_survey_scorecards sc
+  WHERE sc.survey_id = :surveyId
+  GROUP BY sc.client_id
+)
+SELECT t.client_id, lt.a_key AS bucket, lt.score, t.total
+FROM totals t
+JOIN m_survey_lookup_tables lt
+  ON lt.survey_id   = :surveyId
+ AND lt.value_from <= t.total
+ AND lt.value_to   >= t.total;
+```
+
+### PPI scoring (datatable side)
+
+The PPI flow stores the **already computed** score in the `score` column of
+the PPI datatable when the survey is fulfilled. The
+[Survey API](/surveys/survey-api) `POST /v1/survey/{surveyName}/{apptableId}`
+handler accepts the precomputed score alongside the answer columns. Then
+`ReadSurveyServiceImpl.retrieveClientSurveyScoreOverview` joins the score
+band against `ppi_poverty_line` (see
+[Poverty Line API](/surveys/poverty-line-api)).
+
+| Step | Typed Scorecard | PPI datatable |
+| --- | --- | --- |
+| Score storage | Per response in `m_survey_scorecards.a_value` | Single column `score` on the fulfilment row |
+| Band mapping | `m_survey_lookup_tables` | `ppi_scores` |
+| Output value | `score` (`Double`) | `ppi_poverty_line.poverty_line` (`Double`) |
+| Country/cohort | `Survey.country_code` | `ppi_likelihoods_ppi.ppi_name + enabled` |
+
+## SurveyValidator (mandatory fields)
+
+Source: `spm/domain/SurveyValidator.java`. The validator is invoked by
+`SpmService` before persisting a survey:
+
+```java
+baseDataValidator.reset().parameter(SurveyApiConstants.keyParamName)
+    .value(survey.getKey()).notNull().notBlank()
+    .notExceedingLengthOf(SurveyApiConstants.maxKeyLength);
+// ...
+baseDataValidator.reset().parameter(SurveyApiConstants.questionParamName)
+    .value(questions).notNull();
+validateQuestions(baseDataValidator, questions);
+```
+
+For each question:
+
+- `key` — non-null
+- `text` — non-null
+- `description` — length only, may be null
+- `options` (the response list) — non-empty array of:
+  - `text` — non-null
+  - `value` — non-null, `<= maxOptionsValue`
+
+A `PlatformApiDataValidationException` is thrown if any rule fails.
+
+## Permissions and security
+
+| Endpoint | Check |
+| --- | --- |
+| All `ScorecardApiResource` paths | `securityContext.authenticatedUser()` |
+| All `LookupTableApiResource` paths | `securityContext.authenticatedUser()` |
+
+Unlike the PPI/Likelihood/PovertyLine resources, the typed SPM resources do
+not check for an explicit `READ_*` permission. Authentication itself is the
+authorisation gate.
+
+## End-to-end client journey
+
+1. **Capture answers** — front-end calls
+   `POST /v1/surveys/scorecards/{surveyId}` with a `ScorecardData` containing
+   a `ScorecardValue[]` for each answered question.
+2. **Read scorecards** — `GET /v1/surveys/scorecards/{surveyId}/clients/{clientId}`
+   returns the captured rows aggregated by `(survey, client)`.
+3. **Aggregate to a band** — sum the `value` field of each ScorecardValue
+   and look up the matching `LookupTable` row (or run the SQL shown above).
+4. **Display the result** — report the `(key, score)` pair to the user.
+
+## See also
+
+- [Survey API](/surveys/survey-api) — entity model, PPI datatable flow
+- [Likelihood API](/surveys/likelihood-api) — enable/disable PPI calibrations
+- [Poverty Line API](/surveys/poverty-line-api) — `ppi_poverty_line` joins
+- [SPM overview](/surveys/overview)
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `Client`
+- [User administration domain](/core/useradministration-domain) — `AppUser`
+- [`/api/surveys`](/api/surveys)

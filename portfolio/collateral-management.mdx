@@ -1,0 +1,308 @@
+---
+title: "Collateral Management: Products, Client Pool and Loan Linkage"
+sidebarTitle: "Collateral Management"
+description: "Reference for ClientCollateralManagement, CollateralManagementApiResource, the per-client pool and the loan-side linkage that replaces legacy collateral."
+---
+
+Apache Fineract introduced a richer collateral subsystem under `org.apache.fineract.portfolio.collateralmanagement` to address the rigidity of the legacy per-loan collateral model (see [/portfolio/collateral](/portfolio/collateral)). The new model has three layers:
+
+1. **Collateral product templates** (`m_collateral_management`) — global catalogue of collateral kinds with a base price, currency, quality and unit type.
+2. **Client collateral inventory** (`m_client_collateral_management`) — per-client physical/owned items that draw from a product template and carry a quantity.
+3. **Loan collateral linkage** (`m_loan_collateral_management`) — links a portion of a client's inventory to a specific loan with a `quantity` reserved and a `quantityFreed` running total.
+
+Three JAX-RS resources expose this:
+
+- `CollateralManagementApiResource` at `/v1/collateral-management` — the product/template catalogue.
+- `ClientCollateralManagementApiResource` at `/v1/clients/{clientId}/collaterals` — the per-client inventory.
+- `LoanCollateralManagementApiResource` at `/v1/loan-collateral-management` — loan linkage operations.
+
+This page documents these three resources and the entities/handlers behind them. The loan-application path that actually creates `LoanCollateralManagement` rows is documented in [/loan/loan-collateral-management](/loan/loan-collateral-management).
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `CollateralManagementDomain` (product template) entity | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.domain` |
+| `ClientCollateralManagement` entity | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.domain` |
+| `LoanCollateralManagement` entity | `fineract-loan` | `org.apache.fineract.portfolio.collateralmanagement.domain` |
+| Repositories + `…Wrapper` variants | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.domain` |
+| `CollateralManagementApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.api` |
+| `ClientCollateralManagementApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.api` |
+| `LoanCollateralManagementApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.api` |
+| `Add/Update/Delete ClientCollateralProduct…CommandHandler` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.handler` |
+| `Create/Update/Delete CollateralProductHandler` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.handler` |
+| `DeleteLoanCollateralManagement` handler | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.handler` |
+| `CollateralManagementCommandFromApiJsonDeserializer` | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.serialization` |
+| Read services | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.service` |
+| Exceptions | `fineract-provider` | `org.apache.fineract.portfolio.collateralmanagement.exception` |
+
+## Three-tier entity model
+
+### 1. `CollateralManagementDomain` — product template
+
+A row per catalogue entry: "Gold (Karat 22)", "Land (Square Meter)", "Vehicle". Fields:
+
+- `name`, `quality`, `basePrice`, `unitType`, `pctToBase`.
+- `currency` (embedded `MonetaryCurrency`).
+
+This is the **template** that all client collateral instances must reference; products cannot be deleted while client collateral references them.
+
+### 2. `ClientCollateralManagement` — per-client owned inventory
+
+Each row represents a physical item owned by a client. It references a `Client`, a `CollateralManagementDomain` product and tracks `quantity` (the amount the client owns) plus `total`/`totalCollateral` derived values:
+
+```java
+// fineract-provider/.../portfolio/collateralmanagement/domain/ClientCollateralManagement.java
+@Entity
+@Table(name = "m_client_collateral_management")
+public class ClientCollateralManagement extends AbstractPersistableCustom<Long> {
+    @ManyToOne
+    @JoinColumn(name = "client_id", nullable = false)
+    private Client client;
+
+    @ManyToOne
+    @JoinColumn(name = "collateral_id", nullable = false)
+    private CollateralManagementDomain collaterals;
+
+    @Column(name = "quantity", nullable = false)
+    private BigDecimal quantity;
+
+    @Column(name = "total", nullable = false)
+    private BigDecimal total;
+
+    @Column(name = "total_collateral", nullable = false)
+    private BigDecimal totalCollateral;
+    // ...
+}
+```
+
+When a loan is collateralised, a fraction of `quantity` is reserved by the linked `LoanCollateralManagement` row.
+
+### 3. `LoanCollateralManagement` — loan ↔ client-collateral link
+
+The link sits in `fineract-loan` because it owns a `@ManyToOne` to `Loan`. Each link describes how much of the client's inventory is pledged for a specific loan and how much has been freed back as the loan is repaid.
+
+The bridge supports **partial release**: as a loan is paid down or written off, the loan-collateral row's `quantityFreed` is incremented; the client's `ClientCollateralManagement.quantity` is replenished accordingly. This is the major functional improvement over the legacy `LoanCollateral` model.
+
+## `CollateralManagementApiResource` — product templates
+
+```java
+// fineract-provider/.../portfolio/collateralmanagement/api/CollateralManagementApiResource.java
+@Path("/v1/collateral-management")
+@Component
+@Tag(name = "Collateral Management", description = "Collateral Management is for managing collateral operations")
+@RequiredArgsConstructor
+public class CollateralManagementApiResource {
+
+    private final DefaultToApiJsonSerializer<CollateralManagementData> apiJsonSerializerService;
+    private final DefaultToApiJsonSerializer<CurrencyData> apiJsonSerializerServiceForCurrency;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final PlatformSecurityContext context;
+    private final CollateralManagementReadPlatformService collateralManagementReadPlatformService;
+    private final CurrencyReadPlatformService currencyReadPlatformService;
+```
+
+### Endpoints
+
+| Verb | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/collateral-management` | Create a collateral product template. Body: `CollateralManagementProductRequest`. |
+| `GET`  | `/v1/collateral-management` | List all collateral product templates. |
+| `GET`  | `/v1/collateral-management/{collateralId}` | Get one product template. |
+| `PUT`  | `/v1/collateral-management/{collateralId}` | Update a product template. |
+| `DELETE` | `/v1/collateral-management/{collateralId}` | Delete a product template (only if not referenced by any `ClientCollateralManagement`). |
+| `GET`  | `/v1/collateral-management/currency` | List allowed currencies (used by the template UI). |
+
+The create call:
+
+```java
+@POST
+@Operation(summary = "Create a new collateral")
+public CommandProcessingResult createCollateral(final CollateralManagementProductRequest collateralManagementProductRequest) {
+    final CommandWrapper commandWrapper = new CommandWrapperBuilder().createCollateral()
+            .withJson(apiJsonSerializerService.serialize(collateralManagementProductRequest)).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+Each verb writes through the standard `PortfolioCommandSourceWritePlatformService` pipeline and is auditable.
+
+Validation flows through `CollateralManagementCommandFromApiJsonDeserializer` which enforces that `name`, `quality`, `unitType`, `basePrice` and `pctToBase` are present and well-typed.
+
+## `ClientCollateralManagementApiResource` — per-client inventory
+
+```java
+@Path("/v1/clients/{clientId}/collaterals")
+@Component
+@Tag(name = "Client Collateral Management", description = "Client Collateral Management is for managing collateral operations")
+@RequiredArgsConstructor
+public class ClientCollateralManagementApiResource {
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/clients/{clientId}/collaterals` | List a client's collateral inventory. Optional `?prodId={id}` filters by product. |
+| `GET`  | `/v1/clients/{clientId}/collaterals/{clientCollateralId}` | Get one inventory item. |
+| `GET`  | `/v1/clients/{clientId}/collaterals/template` | Returns `LoanCollateralTemplateData` — used by loan-application UIs to render the available client collateral. |
+| `POST` | `/v1/clients/{clientId}/collaterals` | Add new collateral. Body: `ClientCollateralRequest`. |
+| `PUT`  | `/v1/clients/{clientId}/collaterals/{collateralId}` | Update quantity/value of a client collateral. Body: `UpdateClientCollateralRequest`. |
+| `DELETE` | `/v1/clients/{clientId}/collaterals/{collateralId}` | Remove an inventory item (only if not pledged on an active loan). |
+
+Sample list call:
+
+```java
+@GET
+@Operation(summary = "Get Clients Collateral Products", operationId = "getClientCollateralProducts")
+public List<ClientCollateralManagementData> getClientCollateral(
+        @PathParam("clientId") final Long clientId,
+        @Context final UriInfo uriInfo,
+        @QueryParam("prodId") final Long prodId) {
+    this.context.authenticatedUser()
+            .validateHasReadPermission(CollateralManagementJsonInputParams.CLIENT_COLLATERAL_PRODUCT_READ_PERMISSION.getValue());
+    return this.clientCollateralManagementReadPlatformService.getClientCollaterals(clientId, prodId);
+}
+```
+
+The add call wires through `addClientCollateralProduct(clientId)`:
+
+```java
+@POST
+public CommandProcessingResult addCollateral(@PathParam("clientId") final Long clientId,
+                                             ClientCollateralRequest clientCollateralRequest) {
+    final CommandWrapper commandWrapper = new CommandWrapperBuilder()
+            .addClientCollateralProduct(clientId)
+            .withJson(apiJsonSerializerDataService.serialize(clientCollateralRequest)).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+Handler chain: `AddClientCollateralProductCommandHandler` → write service → `ClientCollateralManagementRepository.saveAndFlush(...)`.
+
+Update flows through `updateClientCollateralProduct(clientId, collateralId)`; delete through `deleteClientCollateralProduct(collateralId, clientId)`.
+
+### `getClientCollateralTemplate`
+
+`getClientCollateralTemplate(clientId)` is the call the loan-application UI uses to render "which of this client's collateral can I pledge?". It returns a list of `LoanCollateralTemplateData` — each item carries the inventory id, product name, current `quantity` available (i.e. `quantity − reserved` across active loans), and the unit currency.
+
+## `LoanCollateralManagementApiResource` — loan-side ops
+
+```java
+@Path("/v1/loan-collateral-management")
+@Component
+@Tag(name = "Loan Collateral Management", description = "Loan Collateral Management is for managing collateral operations")
+@RequiredArgsConstructor
+public class LoanCollateralManagementApiResource {
+
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+    private final LoanCollateralManagementReadPlatformService loanCollateralManagementReadPlatformService;
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/loan-collateral-management/{collateralId}` | Fetch one loan-collateral link. |
+| `DELETE` | `/v1/loan-collateral-management/{id}` | Delete a loan-collateral link. The path also accepts a `{loanId}` (e.g. via parent loan resource) for back-reference. |
+
+The delete handler is `DeleteLoanCollateralManagement`:
+
+```java
+@DELETE
+@Path("{id}")
+public CommandProcessingResult deleteLoanCollateral(@PathParam("loanId") final Long loanId,
+                                                    @PathParam("id") final Long id) {
+    final CommandWrapper commandWrapper = new CommandWrapperBuilder().deleteLoanCollateral(loanId, id).build();
+    return this.commandsSourceWritePlatformService.logCommandSource(commandWrapper);
+}
+```
+
+There are no POST/PUT endpoints here because loan-collateral links are **always** created or modified through the loan-application resource — see [/loan/loan-collateral-management](/loan/loan-collateral-management). This resource is intentionally restricted to inspection and deletion.
+
+## Command handlers
+
+| Command | Class | What it does |
+| --- | --- | --- |
+| `CREATE_COLLATERAL` | `CreateCollateralProductCommandHandler` | Create a product template. |
+| `UPDATE_COLLATERAL` | `UpdateCollateralProductCommandHandler` | Update a product template (refuses if referenced). |
+| `DELETE_COLLATERAL` | `DeleteCollateralProductHandler` | Delete a product template. |
+| `ADD_CLIENT_COLLATERAL` | `AddClientCollateralProductCommandHandler` | Append an inventory item to a client. |
+| `UPDATE_CLIENT_COLLATERAL` | `UpdateClientCollateralProductCommandHandler` | Update quantity/value. |
+| `DELETE_CLIENT_COLLATERAL` | `DeleteClientCollateralProductCommandHandler` | Remove an inventory item. |
+| `DELETE_LOAN_COLLATERAL` | `DeleteLoanCollateralManagement` | Remove a loan-collateral link (and replenish client inventory). |
+
+Each handler is `@CommandType`-annotated and picked up by the command dispatcher.
+
+## Exceptions
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `CollateralNotFoundException` | 404 | Product template id unknown. |
+| `CollateralCannotBeDeletedException` | 403 | Product template still referenced by some client collateral. |
+| `ClientCollateralNotFoundException` | 404 | Client collateral id unknown / not on the client. |
+| `ClientCollateralCannotBeDeletedException` | 403 | Client collateral still pledged to an active loan. |
+| `LoanCollateralManagementNotFoundException` | 404 | Loan-collateral link id unknown. |
+| `LoanCollateralAmountNotSufficientException` | 400 | At loan-creation time, the pledged value is below the configured minimum collateral coverage. |
+
+## Read services
+
+Three read services back the resources:
+
+- `CollateralManagementReadPlatformService` — `getAllCollateralProducts()`, `getCollateralProduct(id)`.
+- `ClientCollateralManagementReadPlatformService` — `getClientCollaterals(clientId, prodId)`, `getClientCollateralManagementData(collateralId)`, `getLoanCollateralTemplate(clientId)`.
+- `LoanCollateralManagementReadPlatformService` — `getLoanCollateralResponseData(collateralId)`, list-by-loan helpers used by the loan read service.
+
+All three are JDBC-backed using `JdbcTemplate` with explicit `RowMapper` implementations.
+
+## Validation and partial release semantics
+
+The most subtle piece is the **partial-release** maths driven by repayment events. The flow at repayment time is:
+
+1. Loan write service posts a repayment.
+2. If `loan.product.collateralPolicy == LOAN_TO_VALUE`, the engine computes the proportion of principal repaid.
+3. It iterates over every `LoanCollateralManagement` row, increments `quantityFreed` by `quantityPledged × proportion`, and adds the equivalent back to the client's `ClientCollateralManagement.quantity` available.
+4. Sequence keeps the totals exact through `MathUtil.add(...)` / `MathUtil.subtract(...)`.
+
+When a loan is written off or fully repaid, `quantityFreed` reaches `quantityPledged` and the link is effectively dormant.
+
+If a client deletion is attempted while any `ClientCollateralManagement` row references the client and is still pledged, `ClientCannotBeDeletedException` (in the `client/exception` package) prevents deletion at the loan level. Conversely, deleting a `ClientCollateralManagement` row while it is pledged raises `ClientCollateralCannotBeDeletedException`.
+
+## Permission strings
+
+Constants are centralised in `CollateralManagementJsonInputParams`:
+
+- `COLLATERAL_PRODUCT_READ_PERMISSION` — read product templates.
+- `CLIENT_COLLATERAL_PRODUCT_READ_PERMISSION` — read client inventories.
+
+The standard `READ_/CREATE_/UPDATE_/DELETE_` permissions are derived from the command names.
+
+## Data model summary
+
+```
+m_collateral_management              (template / product)
+  └──< m_client_collateral_management (client inventory)
+        └──< m_loan_collateral_management (loan link, with quantityFreed)
+                  └─ m_loan
+```
+
+## Migration from legacy
+
+Migrating from the legacy `m_loan_collateral` model:
+
+1. For each `LoanCollateral.type` distinct value, create a `CollateralManagementDomain` row with appropriate `basePrice` and `unitType`.
+2. For each `LoanCollateral`, create a `ClientCollateralManagement` row owned by the loan's client.
+3. Create a `LoanCollateralManagement` row linking the loan to the inventory item with `quantity = 1`.
+4. Switch the loan product's `useClientCollateral` flag to `true`.
+
+The two systems can coexist by loan — there is no enforcement that prevents that.
+
+## Cross-references
+
+- [/portfolio/collateral](/portfolio/collateral) — the legacy per-loan collateral model.
+- [/loan/loan-collateral-management](/loan/loan-collateral-management) — the loan-application path that creates `LoanCollateralManagement` rows and the partial-release machinery.
+- [/loan/loan-application-write-service](/loan/loan-application-write-service) — the entry point that bulk-creates links at loan-submission time.
+- [/portfolio/clients](/portfolio/clients) — clients own their collateral inventory and cannot be deleted while items remain pledged.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder`, audit pipeline.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour for collateral management.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — shared base classes.

@@ -1,0 +1,227 @@
+---
+title: "OAuth2 Tests: Authorization-Code + PKCE Flow Coverage"
+sidebarTitle: "OAuth2 Tests"
+description: "The oauth2-tests subproject activates the OAuth2 security profile in Cargo Tomcat 10x and drives the authorization-code/PKCE flow end-to-end with Selenium headless Chrome."
+---
+
+The `oauth2-tests/` Gradle subproject is Fineract's coverage net for the OAuth2 authorization-server profile. It reuses the same Cargo Tomcat 10x scaffolding as `integration-tests`, but flips `fineract.security.basicauth.enabled=false` / `fineract.security.oauth2.enabled=true` so the running container only accepts OAuth2 access tokens for protected endpoints. The single test class drives the authorization-code/PKCE flow with a headless Chrome via Selenium and verifies that the resulting bearer token works against `/api/v1/userdetails`.
+
+## Module shape
+
+```text
+oauth2-tests/
+├── build.gradle
+├── dependencies.gradle
+└── src/test/java/org/apache/fineract/oauth2tests/
+    └── OAuth2AuthenticationTest.java
+```
+
+There is exactly one test class. It is deliberately small — its job is to assert that the server's OAuth2 wiring is correct, not to re-cover business logic that `integration-tests` already exercises.
+
+## Cargo wiring
+
+The Cargo block in `build.gradle` mirrors `integration-tests`, with three crucial JVM args added to the front of `cargo.start.jvmargs`:
+
+```groovy
+def jvmArgs = '--add-exports=java.naming/com.sun.jndi.ldap=ALL-UNNAMED ' +
+              '--add-opens=java.base/java.lang=ALL-UNNAMED ' +
+              // …other --add-opens flags…
+              '-Dfineract.security.basicauth.enabled=false ' +
+              '-Dfineract.security.oauth2.enabled=true ' +
+              '-Dfineract.security.2fa.enabled=false '
+```
+
+The deployable is identical — `$rootDir/fineract-war/build/libs/fineract-provider.war` mounted at context `fineract-provider`. Lifecycle binding is also identical, but compressed:
+
+```groovy
+cargoRunLocal.dependsOn ':fineract-war:war'
+cargoStartLocal.dependsOn ':fineract-war:war'
+cargoStartLocal.mustRunAfter 'testClasses'
+
+test {
+    dependsOn(cargoStartLocal)
+    finalizedBy cargoStopLocal
+}
+```
+
+(Note the simpler binding: this module does **not** ship a `waitForFineract` Gradle task — readiness is polled inside the test class itself.)
+
+### Extra test dependencies
+
+Beyond the shared scaffolding it pulls in Selenium plus a driver manager:
+
+```groovy
+dependencies {
+    driver 'com.mysql:mysql-connector-j'
+    testImplementation 'org.seleniumhq.selenium:selenium-java:4.21.0'
+    testImplementation 'io.github.bonigarcia:webdrivermanager:6.3.3'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+}
+```
+
+WebDriverManager auto-downloads a matching `chromedriver`; the test launches Chrome headless.
+
+## The OAuth2AuthenticationTest class
+
+The class is self-contained — it does **not** depend on the `Utils` helper from `integration-tests`. Constants:
+
+```java
+public static final String TENANT_PARAM_NAME = "tenantIdentifier";
+public static final String DEFAULT_TENANT    = "default";
+public static final String TENANT_IDENTIFIER = TENANT_PARAM_NAME + '=' + DEFAULT_TENANT;
+private static final String HEALTH_URL = "/fineract-provider/actuator/health";
+```
+
+### Setup
+
+```java
+@BeforeEach
+public void setup() throws InterruptedException {
+    initializeRestAssured();
+    this.requestSpec = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+    awaitSpringBootActuatorHealthyUp();
+
+    this.requestSpec     = new RequestSpecBuilder().setContentType(ContentType.JSON).build();
+    this.requestFormSpec = new RequestSpecBuilder().setContentType(ContentType.URLENC).build();
+    this.responseSpec    = new ResponseSpecBuilder().expectStatusCode(200).build();
+    this.responseSpec401 = new ResponseSpecBuilder().expectStatusCode(401).build();
+}
+
+private static void initializeRestAssured() {
+    RestAssured.baseURI = "https://localhost";
+    RestAssured.port    = 8443;
+    RestAssured.keyStore("src/main/resources/keystore.jks", "openmf");
+    RestAssured.useRelaxedHTTPSValidation();
+}
+```
+
+`requestFormSpec` is the secondary spec used to POST the `application/x-www-form-urlencoded` token-exchange body to `/oauth2/token`.
+
+`awaitSpringBootActuatorHealthyUp()` polls the same `/actuator/health` endpoint with 10 attempts at 3-second intervals and fails the test with a printed response if Tomcat still isn't healthy.
+
+### Smoke-level checks
+
+Three short tests guarantee that the public surface is wired correctly:
+
+| Test | URL | Status |
+| --- | --- | --- |
+| `testActuatorAccess` | `/fineract-provider/actuator/info` | 200 |
+| `testApiDocsAccess` | `/fineract-provider/legacy-docs/apiLive.htm` | 200 |
+| `testAccessWithoutAuthentication` | `/fineract-provider/api/v1/offices/1?tenantIdentifier=default` | 401 |
+
+These confirm that the actuator + legacy docs remain reachable without auth while the v1 API is locked down.
+
+### The full authorization-code/PKCE flow
+
+`testGetOAuth2UserDetails` is the meat. It:
+
+1. Verifies that hitting `/api/v1/offices/1` without a token returns 401.
+2. Calls `loginAndClaimToken(...)` which:
+   - Spins up an in-process `HttpServer` on port 3000 that listens on `/callback`.
+   - Launches headless Chrome, navigates to the authorization URL with PKCE code challenge, fills in the login form, and submits it.
+   - When Chrome is redirected to `http://localhost:3000/callback?code=…`, the in-process server captures the code, exchanges it for an access token by POSTing to `/oauth2/token`, and completes the future with the token.
+3. Re-issues the `/api/v1/userdetails` call with `Authorization: Bearer <token>` and asserts `authenticated == true`.
+
+Key snippets:
+
+```java
+@Test
+public void testGetOAuth2UserDetails() throws IOException, InterruptedException {
+    performServerGet(requestSpec, responseSpec401, "/fineract-provider/api/v1/offices/1?" + TENANT_IDENTIFIER, null);
+
+    String token = loginAndClaimToken(
+        "https://localhost:8443/fineract-provider/oauth2/authorize" +
+            "?response_type=code&client_id=frontend-client" +
+            "&redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback&scope=read&state=xyz" +
+            "&code_challenge=zudG_xkz8WrPPMq2MwmFP-NRvNapCL0OD-xYWRapTsU" +
+            "&code_challenge_method=S256",
+        requestFormSpec);
+
+    RequestSpecification requestSpecWithToken = new RequestSpecBuilder()
+        .setContentType(ContentType.JSON)
+        .addHeader("Authorization", "Bearer " + token)
+        .build();
+
+    Boolean authenticationCheck = performServerGet(requestSpecWithToken, responseSpec,
+        "/fineract-provider/api/v1/userdetails?" + TENANT_IDENTIFIER, "authenticated");
+    assertEquals(authenticationCheck, true);
+}
+```
+
+### Authorization parameters used
+
+| Parameter | Value | Notes |
+| --- | --- | --- |
+| `response_type` | `code` | authorization-code flow |
+| `client_id` | `frontend-client` | the seed-data confidential client |
+| `redirect_uri` | `http://localhost:3000/callback` | served by the in-process `HttpServer` |
+| `scope` | `read` | minimal scope |
+| `state` | `xyz` | static — the test does not verify state echo |
+| `code_challenge` | `zudG_xkz8WrPPMq2MwmFP-NRvNapCL0OD-xYWRapTsU` | hard-coded S256 challenge |
+| `code_challenge_method` | `S256` | SHA-256 |
+| `code_verifier` (at token exchange) | `gyQBFpozcvcosvPt7m9Q1A4SqSf1yJtPIERruioHLjQ` | matches the challenge |
+
+The verifier/challenge pair is hard-coded for reproducibility — the test does not rotate the PKCE secret per run.
+
+### Selenium login
+
+```java
+@NonNull
+private static WebDriver getWebDriver() {
+    ChromeOptions options = new ChromeOptions();
+    options.addArguments("--headless");
+    options.addArguments("--no-sandbox");
+    options.addArguments("--disable-dev-shm-usage");
+    options.addArguments("--ignore-certificate-errors");
+    return new ChromeDriver(options);
+}
+```
+
+The driver fills three fields (`username`, `password`, `tenantId`) using the values `mifos`, `password`, `default` and submits the form by clicking the standard `button[type='submit'], input[type='submit']` selector. The callback handler does the rest:
+
+```java
+private String claimTokenOnCallback(RequestSpecification requestSpec, HttpExchange exchange) {
+    String query = exchange.getRequestURI().getQuery();
+    String code  = /* parsed from query */;
+    Map<String, String> formParams = Map.of(
+        "grant_type",    "authorization_code",
+        "code",          code,
+        "redirect_uri",  "http://localhost:3000/callback",
+        "client_id",     "frontend-client",
+        "code_verifier", "gyQBFpozcvcosvPt7m9Q1A4SqSf1yJtPIERruioHLjQ");
+    return performServerPost(requestSpec, responseSpec, "/fineract-provider/oauth2/token",
+        formParams, "access_token");
+}
+```
+
+The `performServerPost` overload is the URLENC-aware one — it appends `Content-Type: application/x-www-form-urlencoded` and uses `.formParams(formBody)` instead of a JSON body.
+
+## Running locally
+
+```bash
+# Build the WAR
+./gradlew :fineract-war:war
+
+# Run the full OAuth2 suite (Cargo + headless Chrome)
+./gradlew :oauth2-tests:test
+
+# Same against PostgreSQL
+./gradlew :oauth2-tests:test -PdbType=postgresql
+```
+
+Selenium requires a working Chrome/Chromium installation. On Linux CI nodes the typical extra dependencies are `chromium`, `libnss3`, `libgbm1`, `libasound2`. Locally, WebDriverManager will pull a matching driver on first launch.
+
+## Conventions and gotchas
+
+- **Same WAR, different profile.** The suite proves that turning off basic auth and turning on OAuth2 keeps the public surface (actuator, legacy docs) reachable while properly locking the v1 API behind bearer tokens.
+- **Two ports in play.** `8443` for the Cargo Tomcat container, `3000` for the in-process callback `HttpServer`. Both must be free.
+- **The PKCE pair is hard-coded.** Production code must not copy the verifier/challenge from this test — it is deliberately constant to make the assertions deterministic.
+- **No `Utils` class.** Unlike `integration-tests`, `oauth2-tests` ships its own minimal `performServerGet` / `performServerPost`. There is no plan to consolidate them while the broader migration to `FineractClient` is still in flight.
+- **No `waitForFineract` Gradle task.** Readiness is polled inside `@BeforeEach`. A slow startup will manifest as a failed `awaitSpringBootActuatorHealthyUp()` rather than a Gradle-level error.
+
+## Related pages
+
+- [Testing Overview](/testing/overview)
+- [Integration Tests](/testing/integration-tests) — the basic-auth counterpart of this suite.
+- [Two-Factor Tests](/testing/twofactor-tests) — the same Cargo scaffolding flipped for the 2FA profile.
+- [Gradle Multi-Module Build](/build/gradle-multi-module)

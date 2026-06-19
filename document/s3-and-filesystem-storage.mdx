@@ -1,0 +1,440 @@
+---
+title: "Filesystem and S3 Content Store Implementations"
+sidebarTitle: "Filesystem and S3"
+description: "Reference for Apache Fineract FileContentStoreService and S3ContentStoreService — configuration, path handling, permissions, and runtime behaviour."
+---
+
+The Apache Fineract document subsystem ships two implementations of the `ContentStoreService` SPI: `FileContentStoreService` writes bytes to a tenant-namespaced directory on local disk, and `S3ContentStoreService` writes bytes to an Amazon S3 (or S3-compatible) bucket via the AWS v2 SDK. Each is gated by a `@ConditionalOnProperty` so exactly one is active per Fineract instance. This page walks the per-backend configuration knobs, the upload / download / delete code paths, the tenant scoping that filesystem applies, the path-style addressing toggle that makes S3 work against MinIO or DigitalOcean Spaces, and the permission model each backend assumes.
+
+<Info>
+Both implementations consume the same set of pre / post / download / delete policy beans (`DefaultPreUploadContentPolicy`, `DefaultPostUploadContentPolicy`, `DefaultDownloadContentPolicy`, `DefaultDeleteContentPolicy`) and the same `ContentPathSanitizer`. The differences are purely transport — filesystem uses `java.nio.file`, S3 uses `software.amazon.awssdk.services.s3.S3Client`.
+</Info>
+
+## FileContentStoreService
+
+### Wiring
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Service
+@ConditionalOnProperty(name = "fineract.content.filesystem.enabled", havingValue = "true")
+public class FileContentStoreService implements ContentStoreService {
+
+    private final ContentPathSanitizer        pathSanitizer;
+    private final ContentPathRandomizer       pathRandomizer;
+    private final DefaultDownloadContentPolicy downloadContentPolicy;
+    private final DefaultPreUploadContentPolicy preUploadContentPolicy;
+    private final DefaultPostUploadContentPolicy postUploadContentPolicy;
+    private final DefaultDeleteContentPolicy   deleteContentPolicy;
+    private final ContentDetectorManager       contentDetectorManager;
+    private final FineractProperties           properties;
+}
+```
+
+| Collaborator | Role |
+| --- | --- |
+| `ContentPathSanitizer` | `Path.of(path).normalize()` — collapses `..`, redundant slashes. |
+| `ContentPathRandomizer` | Injects a 16-character alphabetic sub-folder per upload to avoid collisions and obscure URL guessing. |
+| `Default*ContentPolicy` | Runs the policy chain before / after every operation. |
+| `ContentDetectorManager` | Fallback MIME detection when the caller's `mimeType` is null. |
+| `FineractProperties` | Reads `properties.getContent().getFilesystem().getRootFolder()`. |
+
+### Configuration
+
+```properties
+fineract.content.filesystem.enabled=${FINERACT_CONTENT_FILESYSTEM_ENABLED:true}
+fineract.content.filesystem.rootFolder=${FINERACT_CONTENT_FILESYSTEM_ROOT_FOLDER:${user.home}/.fineract}
+```
+
+Defaults: enabled, root folder is `${user.home}/.fineract`. In a containerised deployment the root is typically mounted from a persistent volume.
+
+### Tenant scoping
+
+```java
+private Path getRootPath() {
+    return Path.of(properties.getContent().getFilesystem().getRootFolder(),
+            ThreadLocalContextUtil.getTenant().getName().replaceAll(" ", "").trim());
+}
+```
+
+The tenant identifier (from `Fineract-Platform-TenantId` header → `ThreadLocalContextUtil.getTenant()`) is appended to the root. Whitespace is stripped so tenant `My Tenant` becomes the folder `MyTenant`. The resulting on-disk layout for default config is:
+
+```
+~/.fineract/
+└── default/
+    ├── documents/
+    │   ├── clients/
+    │   │   └── 42/
+    │   │       ├── aZxYqLpKjRtNvBmC/passport.pdf
+    │   │       └── QwErTyUiOpAsDfGh/contract.pdf
+    │   └── loans/
+    │       └── 1001/...
+    └── images/
+        └── clients/
+            └── 42/
+                └── 3f5eab6c1e8a4d7b9c0f2e3a4b5c6d7e.jpg
+```
+
+### Upload
+
+```java
+@Override
+public String upload(String path, InputStream is, String mimeType) {
+    requireNonNull(path, "Path missing");
+    requireNonNull(is, "Data missing");
+
+    if (StringUtils.isEmpty(mimeType)) {
+        mimeType = Optional.ofNullable(contentDetectorManager
+                .detect(ContentDetectorContext.builder().fileName(path).build()))
+                .map(ContentDetectorContext::getMimeType)
+                .orElse(APPLICATION_OCTET_STREAM_VALUE);
+    }
+
+    preUploadContentPolicy.check(ContentPolicyContext.builder()
+            .path(path).mimeType(mimeType).build());
+
+    var safePath = pathSanitizer.sanitize(path);
+
+    final var target = Files.exists(getPath(safePath, false))
+            ? getPath(safePath, false)
+            : getPath(safePath, true);
+
+    try (var in = is) {
+        IOUtils.copy(in, new FileOutputStream(target.toString()));
+    } catch (Exception e) {
+        throw new ContentStoreException(e);
+    }
+
+    final var relativePath = getRelativePath(target);
+
+    try {
+        postUploadContentPolicy.check(ContentPolicyContext.builder()
+                .path(path).inputStream(getInputStream(target)).mimeType(mimeType).build());
+    } catch (ContentPolicyException e) {
+        log.warn("Delete file because it didn't comply with the post-upload policy check: {} - {}", target, e.getMessage());
+        delete(relativePath.toString());
+        throw e;
+    }
+
+    return relativePath.toString();
+}
+```
+
+Notable behaviour:
+
+- **First-write randomisation**: if the proposed target does not yet exist on disk, `getPath(..., true)` injects a random sub-folder via `ContentPathRandomizer`. Re-uploading the same path (e.g. an update) hits the existing folder.
+- **Atomicity**: writes use `FileOutputStream` directly — there is no temp-file + rename atomic move. A crash mid-write leaves a partial file.
+- **Auto-rollback on post-upload failure**: if Tika decides the bytes don't match the claimed MIME, the just-written file is deleted before the exception propagates.
+
+### `getPath` randomisation
+
+```java
+private Path getPath(String path, boolean randomize) {
+    Path p;
+    if (randomize) {
+        var tail = Path.of(path);
+        var file = tail.getFileName();
+
+        p = getRootPath().resolve(tail.getParent())
+                         .resolve(pathRandomizer.randomize())
+                         .resolve(file);
+
+        try {
+            if (Files.notExists(p.getParent())) {
+                Files.createDirectories(p.getParent());
+            }
+        } catch (Exception e) {
+            throw new ContentStoreException(e);
+        }
+    } else {
+        p = getRootPath().resolve(path);
+    }
+    return p;
+}
+```
+
+`getRelativePath(...)` then strips the root back off so the value returned to the caller is the storage-relative path that goes into `m_document.location`.
+
+### Download
+
+```java
+@Override
+public InputStream download(String path) {
+    downloadContentPolicy.check(ContentPolicyContext.builder().path(path).build());
+    final var safePath = pathSanitizer.sanitize(path);
+    try {
+        final var target = getPath(safePath, false);
+        return Files.newInputStream(target);
+    } catch (IOException e) {
+        throw new ContentStoreException(e);
+    }
+}
+```
+
+A stream — `Files.newInputStream` — is returned. The caller must close it. JAX-RS's `StreamResponseUtil` does that for the downloads served from `/v1/{entityType}/{entityId}/documents/{documentId}/attachment`.
+
+### Delete
+
+```java
+@Override
+public void delete(String path) {
+    deleteContentPolicy.check(ContentPolicyContext.builder().path(path).build());
+    final var safePath = pathSanitizer.sanitize(path);
+    try {
+        final var target = getPath(safePath, false);
+        final boolean deleted = Files.deleteIfExists(target);
+
+        if (!hasFiles(target.getParent())) {
+            Files.deleteIfExists(target.getParent());
+        }
+
+        if (!deleted) {
+            log.warn("Unable to delete file {}", safePath);
+        }
+    } catch (Exception e) {
+        throw new ContentStoreException(e);
+    }
+}
+```
+
+After deleting the file, the parent directory is removed if it is empty — keeping the per-upload random-name folders from accumulating.
+
+### Required filesystem permissions
+
+The Fineract process user needs:
+
+| Operation | Required mode | Notes |
+| --- | --- | --- |
+| `upload` | `rwx` on the tenant folder and every parent up to `rootFolder` | `Files.createDirectories` needs to traverse and create. |
+| `download` | `r` on the file and `x` on each parent directory | |
+| `delete` | `w` on the file and `w + x` on the parent | Also needs `w + x` on grandparent for empty-folder pruning. |
+
+Typical Docker pattern: mount a volume at `/opt/fineract/.fineract` and run Fineract as a user with full ownership of that path.
+
+### Failure modes
+
+| Symptom | Cause |
+| --- | --- |
+| `ContentStoreException: java.nio.file.AccessDeniedException` | Permission missing on `rootFolder`. |
+| Partial file on disk after JVM crash | No atomic-write strategy — clean up manually if it matters. |
+| `ContentPolicyException: Trying to overwrite a sibling file` | Path contains `..` — `TraversalContentPolicy` matched. |
+| `ContentPolicyException: File name not allowed` | `WhitelistContentPolicy` rejected the regex. |
+| Files surviving a `DELETE` API call | Permission missing on the parent folder. |
+
+## S3ContentStoreService
+
+### Wiring
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Service
+@ConditionalOnProperty(name = "fineract.content.s3.enabled", havingValue = "true")
+public class S3ContentStoreService implements ContentStoreService {
+
+    private final S3Client                     s3Client;
+    private final ContentPathSanitizer         pathSanitizer;
+    private final DefaultDownloadContentPolicy downloadContentPolicy;
+    private final DefaultPreUploadContentPolicy preUploadContentPolicy;
+    private final DefaultPostUploadContentPolicy postUploadContentPolicy;
+    private final DefaultDeleteContentPolicy   deleteContentPolicy;
+    private final ContentDetectorManager       contentDetectorManager;
+    private final FineractProperties           properties;
+}
+```
+
+Note that `ContentPathRandomizer` is **not** injected — S3 keys do not need the random sub-folder; the bucket's object versioning handles overwrites.
+
+### Configuration
+
+```properties
+fineract.content.s3.enabled=${FINERACT_CONTENT_S3_ENABLED:false}
+fineract.content.s3.bucketName=${FINERACT_CONTENT_S3_BUCKET_NAME:}
+fineract.content.s3.accessKey=${FINERACT_CONTENT_S3_ACCESS_KEY:}
+fineract.content.s3.secretKey=${FINERACT_CONTENT_S3_SECRET_KEY:}
+fineract.content.s3.region=${FINERACT_CONTENT_S3_REGION:}
+fineract.content.s3.endpoint=${FINERACT_CONTENT_S3_ENDPOINT:}
+fineract.content.s3.path-style-addressing-enabled=${FINERACT_CONTENT_S3_PATH_STYLE_ADDRESSING_ENABLED:false}
+```
+
+Mapped onto `FineractProperties.FineractContentS3Properties`:
+
+```java
+public static class FineractContentS3Properties {
+    private Boolean enabled;
+    private String  bucketName;
+    private String  accessKey;
+    private String  secretKey;
+    private String  region;
+    private String  endpoint;
+    private Boolean pathStyleAddressingEnabled;
+}
+```
+
+### When to use each setting
+
+| Setting | When to set | Example |
+| --- | --- | --- |
+| `bucketName` | Always when S3 is enabled. | `fineract-prod-documents` |
+| `accessKey` / `secretKey` | When using static credentials. Leave empty to let the AWS SDK pick up `~/.aws/credentials`, an EC2 instance profile, an IRSA role, or environment variables. | `AKIA…` / `…` |
+| `region` | Always. | `eu-west-1` |
+| `endpoint` | Required for non-AWS S3 (MinIO, DigitalOcean Spaces, Wasabi, Cloudflare R2). Leave empty for AWS. | `https://s3.us-east-1.amazonaws.com` or `http://minio:9000` |
+| `pathStyleAddressingEnabled` | `true` for MinIO and other path-style stores. AWS S3 prefers virtual-hosted style. | `true` |
+
+### Upload
+
+```java
+@Override
+public String upload(String path, InputStream is, String mimeType) {
+    requireNonNull(path, "Path missing");
+    requireNonNull(is, "Data missing");
+
+    preUploadContentPolicy.check(ContentPolicyContext.builder().path(path).mimeType(mimeType).build());
+
+    var safePath = pathSanitizer.sanitize(path);
+
+    try {
+        final var p = safePath;
+        s3Client.putObject(
+            builder -> builder.bucket(properties.getContent().getS3().getBucketName()).key(p),
+            RequestBody.fromContentProvider(ContentStreamProvider.fromInputStream(is), mimeType));
+    } catch (Exception e) {
+        throw new ContentStoreException(e);
+    }
+
+    try {
+        postUploadContentPolicy.check(ContentPolicyContext.builder()
+                .path(path).inputStream(download(safePath)).mimeType(mimeType).build());
+    } catch (ContentPolicyException e) {
+        log.warn("Delete file because it didn't comply with the post-upload policy check: {} - {}", safePath, e.getMessage());
+        delete(safePath);
+        throw e;
+    }
+
+    return safePath;
+}
+```
+
+Notable:
+
+- `ContentStreamProvider.fromInputStream(is)` streams without buffering the whole object in heap.
+- The post-upload policy check **re-downloads** the freshly uploaded object to verify Tika's MIME detection (`download(safePath)` is called from within `upload`). This costs one extra round-trip but is robust against client-claimed type mismatches.
+- The returned path **is the input path** — no randomisation. The caller's chosen key is what gets persisted.
+
+### Download
+
+```java
+@Override
+public InputStream download(String path) {
+    downloadContentPolicy.check(ContentPolicyContext.builder().path(path).build());
+    final var safePath = pathSanitizer.sanitize(path);
+    try {
+        return s3Client
+                .getObject(GetObjectRequest.builder()
+                        .bucket(properties.getContent().getS3().getBucketName())
+                        .key(safePath)
+                        .build(),
+                        ResponseTransformer.toBytes())
+                .asInputStream();
+    } catch (Exception e) {
+        throw new ContentStoreException(e);
+    }
+}
+```
+
+<Warning>
+`ResponseTransformer.toBytes()` reads the **entire** object into memory before returning a `ByteArrayInputStream`. Large attachments (10s of MB+) materialise on the JVM heap. For large-file deployments consider switching to a streaming transformer, but be aware that the post-upload re-download path in `upload(...)` also goes through `download(...)` — so any change must keep the bytes resettable for the policy check.
+</Warning>
+
+### Delete
+
+```java
+@Override
+public void delete(String path) {
+    deleteContentPolicy.check(ContentPolicyContext.builder().path(path).build());
+    final var safePath = pathSanitizer.sanitize(path);
+    try {
+        s3Client.deleteObject(builder -> builder
+                .bucket(properties.getContent().getS3().getBucketName())
+                .key(safePath));
+    } catch (Exception e) {
+        throw new ContentStoreException(e);
+    }
+}
+```
+
+A vanilla `DeleteObject`. If versioning is enabled on the bucket only the latest version is deleted (a delete marker is added) — older versions remain accessible to administrators.
+
+### Required IAM permissions
+
+The minimum IAM policy for the configured access key (or assumed role) on the configured bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::fineract-prod-documents/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [ "s3:ListBucket" ],
+      "Resource": "arn:aws:s3:::fineract-prod-documents"
+    }
+  ]
+}
+```
+
+`ListBucket` is not strictly required by the code paths above but is helpful for debugging and for any future iteration / multipart upload logic.
+
+### Bucket configuration recommendations
+
+| Setting | Recommendation | Why |
+| --- | --- | --- |
+| Versioning | **Enabled** | Lets administrators recover from accidental `DELETE` calls. |
+| Server-side encryption (SSE-S3 or SSE-KMS) | Enabled | All KYC / regulatory documents are sensitive. |
+| Public access block | All four toggles ON | Documents must never be world-readable. |
+| Lifecycle | Optional — transition old versions to Glacier | Cost optimisation. |
+| Object lock | Optional | Useful for jurisdictions that mandate immutable storage. |
+
+### Compatible non-AWS stores
+
+| Store | `endpoint` | `pathStyleAddressingEnabled` |
+| --- | --- | --- |
+| AWS S3 | empty (uses regional default) | `false` |
+| MinIO | `http://minio:9000` | `true` |
+| DigitalOcean Spaces | `https://<region>.digitaloceanspaces.com` | `false` |
+| Cloudflare R2 | `https://<accountid>.r2.cloudflarestorage.com` | `true` |
+| Wasabi | `https://s3.<region>.wasabisys.com` | `false` |
+| LocalStack (testing) | `http://localstack:4566` | `true` |
+
+The `S3Client` bean is built elsewhere in the application; the code path above merely consumes the configured properties.
+
+## Filesystem vs S3 — decision matrix
+
+| Concern | Filesystem | S3 |
+| --- | --- | --- |
+| Single-node Docker | ✅ | works |
+| Horizontal scale | ❌ (NFS-only workaround) | ✅ |
+| Backup / DR | manual rsync | bucket replication |
+| Encryption at rest | OS-level (LUKS / EBS) | SSE-S3 / SSE-KMS |
+| Cost | included with VM | per-GB-month + requests |
+| Latency | local disk (sub-ms) | network round-trip |
+| Tenant isolation | per-tenant folder | shared bucket |
+| File-size sweet spot | ≤ 100 MB | ≤ 5 GB single PUT |
+
+## Cross-references
+
+- [Document overview](overview) — module file map.
+- [Content store](content-store) — `ContentStoreService` SPI and selection mechanics.
+- [Detector and policies](detector-and-policies) — the policy chain that both backends invoke.
+- [Document API](document-api) — caller of `upload(...)`.
+- [Images API](images-api) — caller for avatar use cases.
+- [API / Document APIs](/api/document-apis) — published OpenAPI reference.

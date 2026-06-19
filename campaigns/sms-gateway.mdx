@@ -1,0 +1,285 @@
+---
+title: "SMS Gateway — Outbound Delivery Loop and Configuration"
+sidebarTitle: "SMS Gateway"
+description: "Apache Fineract SMS gateway: SmsMessageScheduledJobService, SmsConfigUtils, MessageGatewayConfigurationData and the SEND/GET delivery reconciliation loop."
+---
+
+Apache Fineract ships its outbound SMS through a process-local pipeline that talks HTTP/JSON to an external **message gateway** (typically `fineract-sms-gateway` or a tenant-supplied replacement). Configuration lives in `c_external_service_properties` under the `MESSAGE_GATEWAY` service name; the runtime wiring is provided by `SmsConfigUtils` (URI + headers builder), `MessageGatewayConfigurationData` (typed configuration record), and `SmsMessageScheduledJobService` (synchronous, event-driven dispatch). Scheduled dispatch and delivery-report reconciliation are owned by two Spring Batch tasklets: `SendMessageToSmsGatewayTasklet` and `GetDeliveryReportsFromSmsGatewayTasklet`.
+
+For the campaign-side aggregate and template interpolation see [SMS campaigns](/campaigns/sms-campaigns). For the Spring Batch wiring see [Campaign jobs](/campaigns/campaign-jobs).
+
+## Gateway configuration model
+
+The gateway endpoint is described by the `MESSAGE_GATEWAY` external-service rows in `c_external_service_properties`:
+
+| Constant | Property name | Required | Notes |
+|---|---|---|---|
+| `SMS_HOST` | `host_name` | yes | Gateway hostname (e.g. `sms-gw.internal`) |
+| `SMS_PORT` | `port_number` | yes | Integer port |
+| `SMS_END_POINT` | `end_point` | optional | URL path prefix; `null` or `"/"` means no prefix |
+| `SMS_TENANT_APP_KEY` | `tenant_app_key` | yes | Per-tenant secret used as `Fineract-Tenant-App-Key` header |
+
+These map into a typed Java record at read time:
+
+```java
+// fineract-provider/.../campaigns/sms/data/MessageGatewayConfigurationData.java
+public record MessageGatewayConfigurationData(
+        Long id, String connectionName,
+        String hostName, int portNumber, String endPoint,
+        String userName, String password, boolean sslEnabled,
+        String tenantAppKey) { }
+```
+
+The `userName` / `password` / `sslEnabled` fields exist on the record but are not populated from the `MESSAGE_GATEWAY` external-service rows — they exist for adapter-specific extension. The active fields are `hostName`, `portNumber`, `endPoint`, `tenantAppKey`.
+
+Update via:
+
+```http
+PUT /v1/externalservice/MESSAGE_GATEWAY
+Content-Type: application/json
+
+{
+  "host_name": "sms-gw.internal",
+  "port_number": "9191",
+  "end_point": "/",
+  "tenant_app_key": "<shared-secret>"
+}
+```
+
+Read via `GET /v1/externalservice/MESSAGE_GATEWAY` — `tenant_app_key` is masked in the response by `MaskedValueSerializer`, same as the SMTP password (see [Email configuration](/campaigns/email-configuration)).
+
+## `SmsConfigUtils.getMessageGateWayRequestURI`
+
+Every gateway call is bootstrapped through `SmsConfigUtils.getMessageGateWayRequestURI(apiEndPoint, payloadJson)`:
+
+```java
+// fineract-provider/.../campaigns/helper/SmsConfigUtils.java
+public Map<String, Object> getMessageGateWayRequestURI(final String apiEndPoint, String apiQueueResourceDatas) {
+    Map<String, Object> httpRequestdetails = new HashMap<>();
+    MessageGatewayConfigurationData gw = this.propertiesReadPlatformService.getSMSGateway();
+    final FineractPlatformTenant tenant = ThreadLocalContextUtil.getTenant();
+
+    HttpHeaders headers = new HttpHeaders();
+    headers.setContentType(MediaType.APPLICATION_JSON);
+    headers.add(SmsCampaignConstants.FINERACT_PLATFORM_TENANT_ID, tenant.getTenantIdentifier());
+    headers.add(SmsCampaignConstants.FINERACT_TENANT_APP_KEY,    gw.tenantAppKey());
+
+    StringBuilder pathBuilder;
+    String endPoint = (gw.endPoint() == null || gw.endPoint().equals("/")) ? "" : gw.endPoint();
+    pathBuilder = (gw.endPoint() == null || gw.endPoint().equals("/"))
+            ? new StringBuilder("{apiEndPoint}")
+            : new StringBuilder("{endPoint}/{apiEndPoint}");
+
+    UriBuilder builder = UriBuilder.fromPath(pathBuilder.toString())
+            .host(gw.hostName()).scheme("http").port(gw.portNumber());
+
+    URI uri = (gw.endPoint() == null || gw.endPoint().equals("/"))
+            ? builder.build(apiEndPoint)
+            : builder.build(endPoint, apiEndPoint);
+
+    HttpEntity<?> entity = (apiQueueResourceDatas != null)
+            ? new HttpEntity<>(apiQueueResourceDatas, headers)
+            : new HttpEntity<>(headers);
+
+    httpRequestdetails.put("uri",    uri);
+    httpRequestdetails.put("entity", entity);
+    return httpRequestdetails;
+}
+```
+
+Three things to call out:
+
+- The scheme is **hard-coded to `http`**. TLS termination must be handled in front of the gateway (e.g. a service mesh or reverse proxy); the in-process call never speaks HTTPS even if a TLS port is configured.
+- The tenant id and tenant app key are added as request headers:
+  - `Fineract-Platform-TenantId` — from `ThreadLocalContextUtil.getTenant().getTenantIdentifier()`.
+  - `Fineract-Tenant-App-Key` — from the configured `tenant_app_key`.
+- Endpoint paths are composed from the configured `end_point` plus the per-call `apiEndPoint` (`"sms"` or `"sms/report"`). When `end_point` is empty or `"/"`, the call goes straight to `http://{host}:{port}/{apiEndPoint}`.
+
+If the `MESSAGE_GATEWAY` rows are missing or blank, `propertiesReadPlatformService.getSMSGateway()` throws `GatewayConnectionConfigurationNotFound` (`fineract-provider/.../campaigns/sms/exception/GatewayConnectionConfigurationNotFound.java`).
+
+## `SEND_MESSAGES_TO_SMS_GATEWAY` — `SendMessageToSmsGatewayTasklet`
+
+The scheduled dispatch loop is a Spring Batch tasklet (`fineract-provider/.../campaigns/jobs/sendmessagetosmsgateway/SendMessageToSmsGatewayTasklet.java`). Each run:
+
+1. Reads `SmsMessage` rows in `SmsMessageStatusType.PENDING(100)` in pages of **200** via `SmsMessageRepository.findByStatusType(...)`.
+2. For each pending row:
+   - **Notification rows** (`SmsMessage.isNotification == true`) — flip to `WAITING_FOR_DELIVERY_REPORT(150)` and add to the FCM/GCM batch.
+   - **SMS rows** — build an `SmsMessageApiQueueResourceData` (id + tenant + mobile + message + providerId), flip the row to `WAITING_FOR_DELIVERY_REPORT(150)`, and add to the gateway batch.
+3. Persists the status flip (`smsMessageRepository.saveAll(...)` / `flush()`).
+4. Schedules the gateway batch on the shared `ThreadPoolTaskExecutor`:
+   ```java
+   taskExecutor.execute(new SmsTask(ThreadLocalContextUtil.getTenant(), apiQueueResourceDataCollection));
+   ```
+5. Sends notification rows via `NotificationSenderService.sendNotification(toSendNotificationMessages)`.
+6. Loops to the next page until exhausted.
+
+The `SmsTask.run()` payload calls `connectAndSendToIntermediateServer`:
+
+```java
+private void connectAndSendToIntermediateServer(Collection<SmsMessageApiQueueResourceData> apiQueueResourceDatas) {
+    Map<String, Object> hostConfig = smsConfigUtils.getMessageGateWayRequestURI("sms",
+            SmsMessageApiQueueResourceData.toJsonString(apiQueueResourceDatas));
+    URI uri = (URI) hostConfig.get("uri");
+    HttpEntity<?> entity = (HttpEntity<?>) hostConfig.get("entity");
+    ResponseEntity<String> responseOne = restTemplate.exchange(uri, HttpMethod.POST, entity,
+            new ParameterizedTypeReference<>() {});
+    if (!responseOne.getStatusCode().equals(HttpStatus.ACCEPTED)) {
+        log.debug("{}", responseOne.getStatusCode().value());
+        throw new ConnectionFailureException(SmsCampaignConstants.SMS);
+    }
+}
+```
+
+Behaviour:
+
+- The gateway **must** respond `202 Accepted`. Anything else throws `ConnectionFailureException`, which is caught by the outer tasklet (`catch (Exception e) { throw new ConnectionFailureException(SmsCampaignConstants.SMS, e); }`) and aborts the step. The Spring Batch step ends with status `FAILED`; the next scheduled execution will retry.
+- The rows have already been flipped to `WAITING_FOR_DELIVERY_REPORT` before the HTTP call. If the call throws, the rows stay in `WAITING_FOR_DELIVERY_REPORT` and never go back to `PENDING` automatically — operators must reset them manually if the gateway has actually dropped them. This is a well-known property of the bundled implementation; the model assumes accepted requests are durable in the gateway.
+- The send is dispatched on a separate `ThreadPoolTaskExecutor` thread (`DEFAULT_TASK_EXECUTOR_BEAN_NAME`) and is *fire-and-forget* from the tasklet's perspective: the tasklet returns `RepeatStatus.FINISHED` as soon as it has paged through every batch, not when the HTTP responses come back.
+- `ThreadLocalContextUtil.setTenant(...)` inside `SmsTask.run()` re-establishes the tenant context for the worker thread, since the batch executor pool does not propagate it automatically.
+
+### Request payload — `SmsMessageApiQueueResourceData`
+
+The gateway accepts a JSON array of records:
+
+```java
+public record SmsMessageApiQueueResourceData(
+        Long internalId, String tenantId, String createdOnDate, String sourceAddress,
+        String mobileNumber, String message, Long providerId) { ... }
+```
+
+`internalId` is the Fineract `SmsMessage.id` — the gateway echoes it back in the delivery-report response so Fineract can correlate. `providerId` selects which configured upstream provider (Twilio / Africa's Talking / etc.) the gateway should route through.
+
+## `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` — `GetDeliveryReportsFromSmsGatewayTasklet`
+
+The reconciliation loop polls the gateway for delivery confirmations:
+
+1. Reads ids in `WAITING_FOR_DELIVERY_REPORT(150)` in pages of **200** via `SmsReadPlatformService.retrieveAllWaitingForDeliveryReport(200)`.
+2. Posts the id list to the `sms/report` gateway endpoint:
+   ```java
+   Map<String,Object> hostConfig = smsConfigUtils.getMessageGateWayRequestURI("sms/report",
+       new Gson().toJson(smsMessageInternalIds.getPageItems()));
+   ResponseEntity<Collection<SmsMessageDeliveryReportData>> responseOne =
+       restTemplate.exchange(uri, HttpMethod.POST, entity, new ParameterizedTypeReference<>() {});
+   ```
+3. For each returned `SmsMessageDeliveryReportData`, maps the gateway's delivery code to a `SmsMessageStatusType` value and persists:
+   ```java
+   Integer statusType = switch (deliveryStatus) {
+       case   0 -> SmsMessageStatusType.INVALID.getValue();
+       case 150 -> SmsMessageStatusType.WAITING_FOR_DELIVERY_REPORT.getValue();
+       case 200 -> SmsMessageStatusType.SENT.getValue();
+       case 300 -> SmsMessageStatusType.DELIVERED.getValue();
+       case 400 -> SmsMessageStatusType.FAILED.getValue();
+       default  -> smsMessage.getStatusType();   // leave unchanged
+   };
+   smsMessage.setStatusType(statusType);
+   smsMessage.setExternalId(smsMessageDeliveryReportData.getExternalId());
+   smsMessageRepository.save(smsMessage);
+   ```
+
+Key behaviours:
+
+- **Code `100`** in the gateway response is filtered out earlier (`if (!hasError && deliveryStatus != 100)`) — code 100 means "still pending at the carrier", so Fineract leaves the row in `WAITING_FOR_DELIVERY_REPORT` and re-polls on the next tasklet run.
+- The gateway's external id (e.g. Twilio's message SID) is recorded in `SmsMessage.external_id` for downstream auditing.
+- Any exception during the page is logged via `log.error("Error occurred.", e)` — the tasklet keeps paginating. Unlike the send loop, a single failed page does not abort the whole job.
+
+### Gateway delivery status codes
+
+| Gateway code | Mapped `SmsMessageStatusType` | Meaning |
+|---|---|---|
+| `0` | `INVALID(0)` | Message rejected by gateway / unknown id |
+| `100` | (no change) | Still pending at carrier — re-poll |
+| `150` | `WAITING_FOR_DELIVERY_REPORT(150)` | Reflects original status |
+| `200` | `SENT(200)` | Accepted by carrier |
+| `300` | `DELIVERED(300)` | Confirmed delivered to handset |
+| `400` | `FAILED(400)` | Carrier-side failure |
+| any other | (no change) | Defensive: leave row as-is |
+
+## Triggered (synchronous) dispatch — `SmsMessageScheduledJobService`
+
+For `TRIGGERED` campaigns (`SmsCampaign.triggerType == TRIGGERED`), business events fan out via `SmsCampaignDomainServiceImpl`, which calls `SmsMessageScheduledJobService.sendTriggeredMessages(Map<SmsCampaign, Collection<SmsMessage>>)`. The flow:
+
+```java
+// fineract-provider/.../sms/scheduler/SmsMessageScheduledJobServiceImpl.java
+@Override
+public void sendTriggeredMessages(Map<SmsCampaign, Collection<SmsMessage>> smsDataMap) {
+    if (smsDataMap.isEmpty()) return;
+
+    List<SmsMessage> toSaveMessages = new ArrayList<>();
+    List<SmsMessage> toSendNotificationMessages = new ArrayList<>();
+
+    for (Map.Entry<SmsCampaign, Collection<SmsMessage>> entry : smsDataMap.entrySet()) {
+        for (SmsMessage m : entry.getValue()) {
+            m.setStatusType(SmsMessageStatusType.WAITING_FOR_DELIVERY_REPORT.getValue());
+            (m.isNotification() ? toSendNotificationMessages : toSaveMessages).add(m);
+        }
+    }
+
+    if (!toSaveMessages.isEmpty()) {
+        this.smsMessageRepository.saveAll(toSaveMessages);
+        this.smsMessageRepository.flush();
+
+        for (Map.Entry<SmsCampaign, Collection<SmsMessage>> entry : smsDataMap.entrySet()) {
+            Collection<SmsMessageApiQueueResourceData> apiQueueResourceDatas = new ArrayList<>();
+            for (SmsMessage m : entry.getValue()) {
+                if (!m.isNotification()) {
+                    apiQueueResourceDatas.add(SmsMessageApiQueueResourceData.instance(
+                        m.getId(), null, null, null, m.getMobileNo(), m.getMessage(),
+                        entry.getKey().getProviderId()));
+                }
+            }
+            if (!apiQueueResourceDatas.isEmpty()) {
+                this.taskExecutor.execute(new SmsTask(apiQueueResourceDatas, ThreadLocalContextUtil.getContext()));
+            }
+        }
+    }
+    if (!toSendNotificationMessages.isEmpty()) {
+        this.notificationSenderService.sendNotification(toSendNotificationMessages);
+    }
+}
+```
+
+So triggered campaigns *skip the* `PENDING → SEND_MESSAGES_TO_SMS_GATEWAY` *step entirely* — the message is saved straight in `WAITING_FOR_DELIVERY_REPORT` and dispatched immediately on a worker thread. The same `connectAndSendToIntermediateServer(...)` helper is used for the HTTP call, and the same `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` tasklet later flips the row to a final state.
+
+`sendTriggeredMessage(Collection<SmsMessage>, long providerId)` is a single-collection variant used by lower-level callers that already have a provider id resolved.
+
+## Headers and the gateway contract
+
+Every gateway request carries these headers (`SmsCampaignConstants`):
+
+| Header | Source | Purpose |
+|---|---|---|
+| `Content-Type: application/json` | Always | JSON body |
+| `Fineract-Platform-TenantId` | `ThreadLocalContextUtil.getTenant().getTenantIdentifier()` | Lets the gateway route to per-tenant credentials and storage |
+| `Fineract-Tenant-App-Key` | `MESSAGE_GATEWAY.tenant_app_key` | Shared secret authenticating Fineract to the gateway |
+
+The gateway is expected to:
+
+- Accept `POST /{endPoint}/sms` with `Content-Type: application/json` and a body containing a JSON array of `SmsMessageApiQueueResourceData`. Respond `202 Accepted` on success — any other status causes Fineract to throw `ConnectionFailureException`.
+- Accept `POST /{endPoint}/sms/report` with a JSON array of Fineract internal ids and return a `Collection<SmsMessageDeliveryReportData>` with one entry per id, each carrying `id`, `externalId`, `deliveryStatus` and `hasError`.
+
+The bundled gateway implementation (`fineract-sms-gateway` repo, out of scope here) routes upstream to the configured SMS provider, persists send results, and answers reports out of its own database.
+
+## Operational concerns
+
+- **No retry between Fineract and the gateway.** Network failures during `SEND_MESSAGES_TO_SMS_GATEWAY` abort the step; the rows are stranded in `WAITING_FOR_DELIVERY_REPORT`. Operators can either (a) reset stranded rows to `PENDING` and re-run the job, or (b) re-poll the gateway via `GET_DELIVERY_REPORTS_FROM_SMS_GATEWAY` if the gateway actually received the request.
+- **No idempotency token.** A retried send will produce duplicate gateway-side rows. The gateway is responsible for de-duplicating by Fineract internal id.
+- **No throttling.** The page size is 200 rows per page; pages are processed sequentially on a single worker. High-volume tenants should fan out at the gateway layer rather than tuning this loop.
+- **No HTTPS.** As noted, the scheme is hard-coded `http`. Run the gateway on the same private network as Fineract or front it with a TLS-terminating proxy.
+
+## Errors
+
+| Exception | Origin |
+|---|---|
+| `GatewayConnectionConfigurationNotFound` | `MESSAGE_GATEWAY` rows missing/blank when `SmsConfigUtils.getMessageGateWayRequestURI` is invoked |
+| `ConnectionFailureException` | Gateway returned non-2xx on send; also wraps any send-time `Exception` from the outer tasklet |
+| `SmsRuntimeException` | Wraps unexpected runtime errors during materialisation or dispatch |
+| `RestClientException` (uncaught) | Network-level transport failures from `RestTemplate.exchange(...)` |
+
+## Related references
+
+- The `SmsCampaign` aggregate, trigger types and validator: [SMS campaigns](/campaigns/sms-campaigns).
+- The Spring Batch wiring (`SendMessageToSmsGatewayConfig`, `GetDeliveryReportsFromSmsGatewayConfig`): [Campaign jobs](/campaigns/campaign-jobs).
+- The external services REST surface (where `MESSAGE_GATEWAY` rows live): [Email configuration](/campaigns/email-configuration#sms-s3-and-notification-on-the-same-resource).
+- The `SmsMessage` outbound entity and status enum: [SMS campaigns](/campaigns/sms-campaigns#outbound--smsmessage).
+- The scheduler runtime and how steps are registered: [Jobs overview](/jobs/overview).
+- The REST surface in one place: [Hooks and messaging APIs](/api/hooks-and-messaging-apis).

@@ -1,0 +1,311 @@
+---
+title: "Loan Mappers, Validators and JSON Serialization Helpers"
+sidebarTitle: "Mappers & Serialization"
+description: "Loan MapStruct mappers, JSON validators (Loan/LoanCharge/Refund/DownPayment), VariableLoanScheduleFromApiJsonValidator and DefaultToApiJsonSerializer usage in Fineract."
+---
+
+Apache Fineract's loan write paths share a uniform serialization contract: JSON in → `JsonCommand` → validator → domain mutation → projected DTO via MapStruct → `DefaultToApiJsonSerializer`. This page catalogues every mapper under `fineract-loan/portfolio/loanaccount/mapper/`, the validators / `AbstractFromApiJsonDeserializer`-style helpers under `serialization/`, and how `DefaultToApiJsonSerializer` is wired into the REST resources.
+
+Cross references: REST handler routing is at [Loan REST handlers](/loan/loan-rest-handlers); product input validation is in [Loan product API](/loan/loan-product-api); the lower-level validation framework is at [Validation](/validation/overview).
+
+## File map — `mapper/`
+
+| Mapper | Source → Target | Notes |
+| --- | --- | --- |
+| `LoanMapper` | `(ScheduleGeneratorDTO, Loan) → LoanScheduleModel` and `Loan → List<DisbursementData>` | Plain `@Component`; not MapStruct — drives schedule regeneration |
+| `LoanTransactionMapper` | `LoanTransaction → LoanTransactionData` | MapStruct interface; uses `LoanTransactionRelationMapper`, `LoanChargePaidByMapper`, `CurrencyMapper` |
+| `LoanTransactionRelationMapper` | `LoanTransactionRelation → LoanTransactionRelationData` | MapStruct |
+| `LoanChargePaidByMapper` | `LoanChargePaidBy → LoanChargePaidByData` | MapStruct |
+| `LoanChargeMapper` | `(LoanCharge, MonetaryCurrency) → LoanChargeCommand` | MapStruct; reverses for the *command* (write) path |
+| `LoanCollateralManagementMapper` | `LoanCollateralManagement → LoanCollateralManagementData` | MapStruct |
+| `LoanTermVariationsMapper` | `LoanTermVariations → LoanTermVariationsData` | MapStruct |
+
+All MapStruct mappers use `@Mapper(config = MapstructMapperConfig.class)` — the central config in `fineract-core` sets `componentModel = "spring"`, unmapped-targets reporting policy, and Jakarta validation settings. MapStruct generates the implementation at build time and Spring picks it up as a `@Component`.
+
+## `LoanMapper` — schedule regeneration
+
+```java
+@Component
+@RequiredArgsConstructor
+public class LoanMapper {
+
+    private final LoanTermVariationsMapper loanTermVariationsMapper;
+
+    public LoanScheduleModel regenerateScheduleModel(final ScheduleGeneratorDTO scheduleGeneratorDTO, final Loan loan) {
+        final MathContext mc = MoneyHelper.getMathContext();
+        final InterestMethod interestMethod = loan.getLoanProductRelatedDetail().getInterestMethod();
+        final LoanScheduleGenerator generator = scheduleGeneratorDTO.getLoanScheduleFactory()
+                .create(loan.getLoanProductRelatedDetail().getLoanScheduleType(), interestMethod);
+        final LoanApplicationTerms terms = loan.constructLoanApplicationTerms(scheduleGeneratorDTO);
+        final List<DisbursementData> disbursements = getDisbursementData(loan);
+        final Set<LoanCharge> charges = loan.getActiveCharges();
+        return generator.generate(mc, terms, charges, scheduleGeneratorDTO.getHolidayDetailDTO());
+    }
+```
+
+Used by:
+
+- `LoanScheduleWritePlatformService` on `addVariations` / `deleteVariations`.
+- `LoanRescheduleRequestWritePlatformService.approve`.
+- `InterestPauseWritePlatformServiceImpl.create/update/delete`.
+- `LoanReAgingService` / `LoanReAmortizationService` previews.
+
+`getDisbursementData(Loan)` walks `LoanDisbursementDetails` and emits a list of `(disbursementDate, principal, netDisbursalAmount, expectedDisbursementDate)` tuples that feed the schedule generator.
+
+## `LoanTransactionMapper`
+
+Heavily annotated MapStruct interface — the snippet below shows the explicit field mappings (most are `@Mapping(target = ..., ignore = true)` for fields populated separately by the REST resource):
+
+```java
+@Mapper(config = MapstructMapperConfig.class,
+        uses = { LoanTransactionRelationMapper.class, LoanChargePaidByMapper.class, CurrencyMapper.class })
+public interface LoanTransactionMapper {
+
+    @Mapping(target = "date", source = "dateOf")
+    @Mapping(target = "loanChargePaidByList", source = "loanChargesPaid")
+    @Mapping(target = "manuallyReversed", source = "manuallyAdjustedOrReversed")
+    @Mapping(target = "transactionRelations", source = "loanTransactionRelations")
+    @Mapping(target = "officeId", source = "office.id")
+    @Mapping(target = "officeName", source = "office.name")
+    @Mapping(target = "loanId", source = "loan.id")
+    @Mapping(target = "externalLoanId", source = "loan.externalId")
+    @Mapping(target = "netDisbursalAmount", source = "loan.netDisbursalAmount")
+    @Mapping(target = "transactionType",
+        expression = "java(loanTransaction.getTypeOf().name())")
+    @Mapping(target = "type",
+        expression = "java(org.apache.fineract.portfolio.loanproduct.service.LoanEnumerations.transactionType(loanTransaction.getTypeOf()))")
+    @Mapping(target = "paymentDetailData",
+        expression = "java(loanTransaction.getPaymentDetail() != null ? loanTransaction.getPaymentDetail().toData() : null)")
+    @Mapping(target = "currency", source = "loan.currency")
+    @Mapping(target = "classification",
+        expression = "java(loanTransaction.getClassification() != null ? loanTransaction.getClassification().toData() : null)")
+    LoanTransactionData mapLoanTransaction(LoanTransaction loanTransaction);
+}
+```
+
+The many `ignore = true` targets reflect the fact that `LoanTransactionData` is also reused as a *template* DTO for transaction creation responses (where fields like `paymentTypeOptions` are populated separately by the REST resource).
+
+## `LoanChargeMapper`
+
+Reverses the usual direction — mapping the persisted `LoanCharge` back to a `LoanChargeCommand` used to re-execute domain operations (notably on retry / replay paths):
+
+```java
+@Mapper(config = MapstructMapperConfig.class)
+public interface LoanChargeMapper {
+    @Mapping(target = "id", source = "loanCharge.id")
+    @Mapping(target = "chargeId", source = "loanCharge.charge.id")
+    @Mapping(target = "amount", expression = "java(loanCharge.getAmount(currency).getAmount())")
+    @Mapping(target = "chargeTimeType", source = "loanCharge.chargeTimeType.value")
+    @Mapping(target = "chargeCalculationType", source = "loanCharge.chargeCalculation.value")
+    @Mapping(target = "dueDate", source = "loanCharge.dueDate")
+    LoanChargeCommand map(LoanCharge loanCharge, MonetaryCurrency currency);
+
+    default Set<LoanChargeCommand> map(Set<LoanCharge> loanCharge, MonetaryCurrency currency) {
+        return loanCharge.stream().map(lc -> map(lc, currency)).collect(Collectors.toSet());
+    }
+}
+```
+
+## `LoanCollateralManagementMapper`
+
+```java
+@Mapper(config = MapstructMapperConfig.class)
+public interface LoanCollateralManagementMapper {
+    @Mapping(target = "id", source = "id")
+    @Mapping(target = "clientCollateralId", source = "clientCollateralManagement.id")
+    @Mapping(target = "quantity", source = "quantity")
+    @Mapping(target = "total", ignore = true)
+    @Mapping(target = "totalCollateral", ignore = true)
+    LoanCollateralManagementData map(LoanCollateralManagement loanCollateralManagement);
+
+    Set<LoanCollateralManagementData> map(Set<LoanCollateralManagement> loanCollateralManagements);
+}
+```
+
+`total` and `totalCollateral` are derived per-loan and filled by `LoanCollateralManagementReadPlatformServiceImpl` after the mapper runs — see [Collateral management](/loan/loan-collateral-management).
+
+## `LoanAccountDataMapper` (provider — external events)
+
+Lives in `fineract-provider/.../infrastructure/event/external/service/serialization/mapper/loan/LoanAccountDataMapper.java`. Serializes a `LoanAccountData` view into the **external event** envelope used when streaming loan changes to Kafka / outbox. The mapper drops UI-only fields and emits a stable JSON schema versioned by event type — see the events documentation.
+
+## `LoanAccountSummaryDataMapper`
+
+Surfaces the lightweight "summary" view used by client-list and group-list pages (no schedule, no transactions). Maps a small subset of `Loan` to `LoanAccountSummaryData`.
+
+## Serialization / validators — `serialization/`
+
+The classes under `fineract-loan/portfolio/loanaccount/serialization/` are not pure (de)serializers in the Gson sense — they extend `AbstractFromApiJsonDeserializer` (or implement `DataValidator` directly) and combine **JSON parsing** with **validation**. Each one defines a fixed `Set<String> supportedParameters` and rejects unknown fields up front.
+
+| Class | Drives | Where invoked |
+| --- | --- | --- |
+| `LoanUpdateCommandFromApiJsonDeserializer` | Builds `LoanUpdateCommand` for officer assignment / unassignment | `BulkUpdateLoanOfficer*`, `UpdateLoanOfficer*` |
+| `LoanApplicationTransitionValidator` | `withdraw` / `reject` state transitions | `Loan*ApplicationCommandHandler`s |
+| `LoanApprovedAmountValidator` (interface) | Approved-amount editability | `LoanApprovedAmountModificationCommandHandler` |
+| `LoanChargeApiJsonValidator` | Loan charge JSON shape | `AddLoanCharge`, `UpdateLoanCharge` handlers |
+| `LoanChargeValidator` | Loan charge business rules | `LoanChargeWritePlatformServiceImpl` |
+| `LoanDownPaymentTransactionValidator` | Down-payment-specific rules | `LoanDownPaymentCommandHandler` |
+| `LoanRefundValidator` | Refund / chargeback transactions | `LoanRefundByCash*`, `LoanChargeRefund*`, `LoanRepaymentChargeback*` |
+| `LoanTransactionValidator` | Generic repayment-like transaction rules | All repayment / adjustment paths |
+| `VariableLoanScheduleFromApiJsonValidator` | `exceptions[]`, dates, gaps | `LoanSchedule*Variation*CommandHandler` |
+
+### `LoanUpdateCommandFromApiJsonDeserializer`
+
+```java
+@Component
+public final class LoanUpdateCommandFromApiJsonDeserializer
+        extends AbstractFromApiJsonDeserializer<LoanUpdateCommand> {
+
+    public static final String UNASSIGNED_DATE = "unassignedDate";
+    public static final String ASSIGNMENT_DATE = "assignmentDate";
+    public static final String FROM_LOAN_OFFICER_ID = "fromLoanOfficerId";
+    public static final String TO_LOAN_OFFICER_ID = "toLoanOfficerId";
+    public static final String LOANS = "loans";
+    ...
+    private static final Set<String> SUPPORTED_PARAMS = new HashSet<>(Arrays.asList(
+        ASSIGNMENT_DATE, UNASSIGNED_DATE, FROM_LOAN_OFFICER_ID, TO_LOAN_OFFICER_ID,
+        LOANS, "locale", "dateFormat"));
+
+    private final FromJsonHelper fromApiJsonHelper;
+
+    @Override
+    public LoanUpdateCommand commandFromApiJson(final String json) {
+        if (StringUtils.isBlank(json)) { throw new InvalidJsonException(); }
+        final Type typeOfMap = new TypeToken<Map<String, Object>>() {}.getType();
+        this.fromApiJsonHelper.checkForUnsupportedParameters(typeOfMap, json, SUPPORTED_PARAMS);
+        final JsonElement element = this.fromApiJsonHelper.parse(json);
+        final LocalDate assignmentDate =
+            this.fromApiJsonHelper.extractLocalDateNamed(ASSIGNMENT_DATE, element);
+        ...
+        return new LoanUpdateCommand(fromLoanOfficerId, toLoanOfficerId, assignmentDate,
+            unassignedDate, loans);
+    }
+}
+```
+
+`AbstractFromApiJsonDeserializer` is the base class for all such helpers — it provides `commandFromApiJson(String)` style entry points and `checkForUnsupportedParameters(typeOfMap, json, supported)` to reject typos.
+
+### `VariableLoanScheduleFromApiJsonValidator`
+
+Two methods: `validateSchedule(String json)` and `validateSchedulesForApply(String json, Loan loan)`. Body shape:
+
+```json
+{
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy",
+  "exceptions": [
+    { "dueDate": "...", "modifiedDueDate": "...", "installmentAmount": ... },
+    ...
+  ]
+}
+```
+
+Rules:
+
+| Rule | Source |
+| --- | --- |
+| `exceptions` array non-empty | validator |
+| Per item: `dueDate` mandatory | validator |
+| Per item: `modifiedDueDate` > `dueDate` if present | validator |
+| Per item: at most one of `installmentAmount`, `principalAmount` | validator |
+| `dueDate` must match an installment due date | apply-time only |
+| `modifiedDueDate` must respect product `minimum_gap` / `maximum_gap` | apply-time only |
+| Loan product must allow variable installments | apply-time only |
+
+## `DefaultToApiJsonSerializer` usage pattern
+
+All loan REST resources hold a `DefaultToApiJsonSerializer<T>` typed to their primary response shape. Two usage modes:
+
+```java
+// 1. Echo a CommandProcessingResult after a write
+return this.toApiJsonSerializer.serialize(commandProcessingResult);
+
+// 2. Serialize a read DTO with field-projection support
+final ApiRequestJsonSerializationSettings settings =
+    apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+return this.toApiJsonSerializer.serialize(settings, loanScheduleData, RESPONSE_DATA_PARAMETERS);
+```
+
+The `ApiRequestJsonSerializationSettings` is built from `?fields=`, `?pretty=`, `?template=` query parameters. The third argument is the *allowlist* of parameter names — anything not in this set is stripped from the JSON unless the client explicitly requested it via `?fields=`.
+
+Example from `LoanScheduleApiResource`:
+
+```java
+private final DefaultToApiJsonSerializer<LoanScheduleData> toApiJsonSerializer;
+...
+final LoanScheduleData loanSchedule = this.calculationPlatformService
+        .generateLoanScheduleForVariableInstallmentRequest(loanId, apiRequestBodyAsJson);
+final ApiRequestJsonSerializationSettings settings =
+        this.apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+return this.toApiJsonSerializer.serialize(settings, loanSchedule, new HashSet<>());
+```
+
+Example from `LoanProductsApiResource`:
+
+```java
+private final DefaultToApiJsonSerializer<LoanProductData> toApiJsonSerializer;
+...
+return this.toApiJsonSerializer.serialize(settings, productData, LOAN_PRODUCT_DATA_PARAMETERS);
+```
+
+The allowlist sets are static `HashSet<String>` fields named like `LOAN_PRODUCT_DATA_PARAMETERS`, `LOAN_DATA_PARAMETERS`, `LOAN_TRANSACTION_DATA_PARAMETERS`, hand-maintained alongside the DTO classes.
+
+## Resource-level mapper injection examples
+
+```java
+@Path("/v1/loans")
+public class LoansApiResource {
+    private final DefaultToApiJsonSerializer<LoanAccountData> toApiJsonSerializer;
+    private final DefaultToApiJsonSerializer<LoanScheduleData> loanScheduleToApiJsonSerializer;
+    private final DefaultToApiJsonSerializer<LoanApprovalData> loanApprovalDataJsonSerializer;
+    ...
+}
+```
+
+Each `DefaultToApiJsonSerializer<T>` is a Spring bean (qualified by generic type), so different DTOs serialise consistently.
+
+## End-to-end flow: write + serialize response
+
+<Steps>
+<Step title="REST resource receives JSON">
+`LoanInterestPauseApiResource.createInterestPause(loanId, request)` accepts a Jackson-deserialised `InterestPauseRequestDto`.
+</Step>
+<Step title="Validator / deserializer">
+`InterestPauseWritePlatformServiceImpl` validates business rules; date parsing uses `JsonCommand.extractLocalDateNamed` (via Gson `FromJsonHelper`).
+</Step>
+<Step title="Domain mutation">
+`Loan` is loaded, term variation persisted, schedule regenerated via `LoanMapper.regenerateScheduleModel`.
+</Step>
+<Step title="Build response">
+A `CommandProcessingResultBuilder` produces a `CommandProcessingResult`.
+</Step>
+<Step title="Serialize">
+The resource returns `toApiJsonSerializer.serialize(result)`, which Gson-serialises the result with field stripping per query string.
+</Step>
+</Steps>
+
+## Provider-module validators (referenced)
+
+`fineract-provider/.../loanaccount/serialization/` adds:
+
+| Class | Role |
+| --- | --- |
+| `LoanApplicationValidator` | Full create / modify loan application validation — over 2 000 LOC of cross-field rules |
+| `LoanDisbursementValidator` | Disbursement command parameters |
+| `LoanForeclosureValidator` | Foreclosure dates and amounts |
+| `LoanOfficerValidator` | Officer assignment lifecycle |
+| `LoanScheduleValidator` | Standalone schedule rebuild validation |
+| `ExpectedDisbursementDateValidatorImpl` | Multi-tranche tranches dates monotonicity |
+| `LoanForeclosureValidator` | Foreclosure rules |
+| `LoanTransactionValidatorImpl` | Implementation of the loan-module `LoanTransactionValidator` interface |
+| `LoanApprovedAmountValidatorImpl` | Approved-amount mutability rules |
+
+These are not in `fineract-loan` because they depend on `fineract-provider` services (holiday, audit, business-event publishing), but they participate in the same validation pattern.
+
+## Related pages
+
+- [Loan REST handlers](/loan/loan-rest-handlers)
+- [Loan overview](/loan/overview)
+- [Schedule API](/loan/loan-schedule-api)
+- [Reschedule loans](/loan/reschedule-loans)
+- [Loan product API](/loan/loan-product-api)
+- [Validation framework](/validation/overview)

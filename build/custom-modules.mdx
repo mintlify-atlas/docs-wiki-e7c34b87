@@ -1,0 +1,407 @@
+---
+title: "Custom Modules: settings.gradle Loader and ACME Examples"
+sidebarTitle: "Custom Modules"
+description: "How Fineract auto-discovers customer modules under custom/<company>/<category>/<module>, how Spring Boot starter modules wire them in, and the ACME loan/note/event reference modules."
+---
+
+Apache Fineract supports out-of-tree customer modules without forking the codebase. Any Gradle project placed under `custom/<company>/<category>/<module>/` is automatically discovered by `settings.gradle`, automatically pulled into the custom Docker image by `custom/docker/build.gradle`, and (when its Spring Boot starter declares the right auto-configuration) hot-swaps the corresponding upstream service via `@ConditionalOnProperty`. The repository ships three reference modules under `custom/acme/` — `acme/loan`, `acme/note`, and `acme/event` — that demonstrate every variation of the pattern. This page documents the loader, the directory convention, and the recipe for adding a new module.
+
+## The directory contract
+
+```
+custom/
+├── docker/                              # The Jib project that bundles every custom module
+│   └── build.gradle                     # Hard-coded; not a customer module itself
+└── <company>/                           # e.g. acme — the customer namespace
+    └── <category>/                      # e.g. loan, note, event — the upstream domain
+        └── <module>/                    # e.g. processor, cob, job, service, starter
+            ├── build.gradle             # Required: description, group, archivesName, apply from: 'dependencies.gradle'
+            ├── dependencies.gradle      # Optional: module-specific deps
+            └── src/main/java/...        # Spring components, JPA entities, JAX-RS resources
+```
+
+Three folder names are **reserved** and excluded from discovery:
+
+| Reserved name | Why excluded                                                              |
+|---------------|---------------------------------------------------------------------------|
+| `build`       | Gradle output directory at any nesting level                              |
+| `docker`      | Holds the `custom/docker` Jib project (only valid as a top-level child)   |
+
+Anything else under `custom/` is fair game.
+
+## The discovery loop in `settings.gradle`
+
+```groovy
+// NOTE: dynamically load custom modules with pattern "custom -> company -> category -> module"
+file("${rootDir}/custom").eachDir { companyDir ->
+    if ('build' != companyDir.name && 'docker' != companyDir.name) {
+        file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+            if ('build' != categoryDir.name) {
+                file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                    if ('build' != moduleDir.name) {
+                        include ":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+A three-level `eachDir` walk produces `include` statements at the three-segment colon-separated path Gradle expects. The reference tree:
+
+```
+custom/acme/event/externalevent/
+custom/acme/event/starter/
+custom/acme/loan/cob/
+custom/acme/loan/job/
+custom/acme/loan/processor/
+custom/acme/loan/starter/
+custom/acme/note/service/
+custom/acme/note/starter/
+```
+
+…produces these Gradle subproject paths:
+
+```
+:custom:acme:event:externalevent
+:custom:acme:event:starter
+:custom:acme:loan:cob
+:custom:acme:loan:job
+:custom:acme:loan:processor
+:custom:acme:loan:starter
+:custom:acme:note:service
+:custom:acme:note:starter
+```
+
+Verify by running:
+
+```bash
+./gradlew :custom:acme:loan:starter:dependencies --configuration runtimeClasspath
+```
+
+The same walk is repeated in `custom/docker/build.gradle`'s `jib.dependencies` block to add each discovered module as an `implementation project(":custom:...")` dependency in the custom Docker image. That second walk is the reason a new module is one rename away from being in the published image — see [Dockerfile & Jib](/build/dockerfile-and-jib).
+
+## A minimal module `build.gradle`
+
+From `custom/acme/note/starter/build.gradle`:
+
+```groovy
+description = 'ACME Fineract Note Starter'
+
+group = 'com.acme.fineract'
+
+base {
+    archivesName = 'acme-fineract-note-starter'
+}
+
+apply from: 'dependencies.gradle'
+```
+
+Three things only:
+
+| Setting          | Purpose                                                                                              |
+|------------------|------------------------------------------------------------------------------------------------------|
+| `description`    | Human-readable label; surfaces in `./gradlew projects`.                                              |
+| `group`          | Maven coordinates group — independent of `org.apache.fineract`, so the artifact can be published separately. |
+| `base.archivesName` | The JAR base name; shows up as `acme-fineract-note-starter-<version>.jar` in `build/libs/`.       |
+| `apply from: 'dependencies.gradle'` | Pulls in the module's `dependencies { … }` block from a sibling file. Encouraged because the root `build.gradle` applies the same standard plugins (Java, Spotless, License, ErrorProne, JaCoCo) to every subproject — module-level scripts stay short. |
+
+The root `build.gradle` already applies (via `subprojects { … }`):
+
+- `java`
+- `eclipse`
+- `idea`
+- `org.springframework.boot` autoconfig-only mode (no `bootJar`)
+- license header check
+- Spotless formatter
+- ErrorProne
+- JaCoCo
+- the Fineract dependency BOM from `buildSrc/.../org.apache.fineract.dependencies.gradle`
+
+That means a `build.gradle` for a custom module **does not need to apply Java, configure Spotless, or pick versions** — everything is inherited.
+
+## Module categories
+
+The ACME tree demonstrates the three flavors of custom module the platform expects:
+
+| Category    | Examples                                              | Pattern                                                                                                                                                  |
+|-------------|-------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **starter** | `acme/note/starter`, `acme/loan/starter`, `acme/event/starter` | Tiny module containing one `@AutoConfiguration` class plus `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`. Activates the rest. |
+| **service / processor / cob / job / externalevent** | `acme/note/service`, `acme/loan/cob`, `acme/loan/job`, `acme/event/externalevent` | The actual implementation — `@Component`s, `@Service`s, `LoanCOBBusinessStep`s, Spring Batch tasklets. Each class is `@ConditionalOnProperty`-gated. |
+
+The split lets you:
+
+- Build a single composite image with `customer A`'s starter enabled and `customer B`'s starter disabled — same JARs on the classpath, different runtime behavior.
+- Run unit tests in the implementation modules without booting Spring.
+
+## The auto-configuration recipe
+
+From `custom/acme/note/starter/src/main/java/com/acme/fineract/portfolio/note/starter/AcmeNoteAutoConfiguration.java`:
+
+```java
+package com.acme.fineract.portfolio.note.starter;
+
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.ComponentScan;
+
+@AutoConfiguration
+@ComponentScan("com.acme.fineract.portfolio.note")
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteAutoConfiguration {}
+```
+
+And the required registration file at `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`:
+
+```
+com.acme.fineract.portfolio.note.starter.AcmeNoteAutoConfiguration
+```
+
+(Spring Boot 3 replaced the legacy `META-INF/spring.factories` with this imports file.)
+
+The two annotations behave as follows:
+
+| Annotation                                              | Effect                                                                                                          |
+|---------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `@AutoConfiguration`                                    | Registered as a Spring Boot auto-config bean; processed late, after user `@Configuration` and after dependent auto-configs. |
+| `@ComponentScan("com.acme.fineract.portfolio.note")`    | Scans the service module's package. The starter module **does not** depend on the service module at compile time — it only references it as a string at scan time. |
+| `@ConditionalOnProperty("acme.note.enabled")`           | Off by default. Only when `acme.note.enabled=true` is set (env, properties, command line) do the components get registered.|
+
+The implementation services use the **same** property:
+
+```java
+// custom/acme/note/service/src/main/java/com/acme/fineract/portfolio/note/service/AcmeNoteReadPlatformService.java
+@Service
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteReadPlatformService implements NoteReadPlatformService, InitializingBean { … }
+
+@Service
+@ConditionalOnProperty("acme.note.enabled")
+public class AcmeNoteWritePlatformService implements NoteWritePlatformService, InitializingBean { … }
+```
+
+Belt-and-suspenders: even if the auto-config gets activated by accident, the individual beans still check the property.
+
+## Replacing an upstream service
+
+The `AcmeNoteReadPlatformService` and `AcmeNoteWritePlatformService` both `implements` the upstream interfaces (`NoteReadPlatformService`, `NoteWritePlatformService`). The upstream implementations in `fineract-provider` are themselves `@Service` beans, so by default two implementations of the same interface would be on the classpath and Spring would fail with `NoUniqueBeanDefinitionException`.
+
+The escape hatch is also `@ConditionalOnProperty`: the upstream beans are annotated to **disable themselves when the customer module is on**. For services that pre-date this pattern, the customer module also has to use `@Primary` to win the autowire arbitration.
+
+Inspect the actual contract on a per-service basis before assuming bean replacement "just works." The ACME modules show both styles.
+
+## A LoanCOBBusinessStep custom module
+
+From `custom/acme/loan/cob/src/main/java/com/acme/fineract/loan/cob/AcmeNoopBusinessStep.java`:
+
+```java
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AcmeNoopBusinessStep implements LoanCOBBusinessStep, InitializingBean {
+
+    private static final String ENUM_STYLED_NAME = "ACME_LOAN_NOOP";
+    private static final String HUMAN_READABLE_NAME = "ACME Loan Noop";
+
+    // NOTE: just to demonstrate that dependency injection is working
+    private final LoanAccountDomainService loanAccountDomainService;
+
+    // … execute(Loan), getEnumStyledName(), getHumanReadableName() …
+}
+```
+
+Three observations:
+
+1. **No `@ConditionalOnProperty`** on this class — instead, the starter (`AcmeLoanAutoConfiguration` at `custom/acme/loan/starter/...`) controls activation through `@ComponentScan` + `@ConditionalOnProperty`. Removing the starter or flipping the flag removes every `@Component` in the implementation modules from the context.
+2. **`implements LoanCOBBusinessStep`** — the same SPI that ships with `fineract-cob`. Once the bean is registered, the COB business-step assembler picks it up automatically and offers it to operators via the `BusinessStepConfigurationApi`, enabling the operator to insert `ACME_LOAN_NOOP` into the Loan COB pipeline in the desired position.
+3. **`getEnumStyledName()` / `getHumanReadableName()`** — required for the configuration UI / API. The enum-styled name is what gets persisted in `m_batch_business_step_mapping`; the human-readable name is for display.
+
+See [Loan COB](/cob/loan-cob-overview) for how custom steps slot into the COB pipeline.
+
+## Building, running, testing a single module
+
+```bash
+# Compile the module in isolation
+./gradlew :custom:acme:note:service:compileJava
+
+# Run its unit tests
+./gradlew :custom:acme:note:starter:test
+
+# See exactly what's on its classpath
+./gradlew :custom:acme:loan:cob:dependencies --configuration runtimeClasspath
+```
+
+The starter modules under `custom/acme/*/starter/` ship Cucumber-based integration tests (e.g. `AcmeNoteServiceStepDefinitions`, `AcmeBusinessStepDefinitions`) that boot a minimal Spring context with `acme.note.enabled=true` (or the corresponding flag) and assert wiring.
+
+## Custom modules in the published image
+
+Two paths:
+
+### 1. The custom Docker image
+
+The `custom/docker/build.gradle` Jib block re-walks the `custom/` tree and includes each discovered module as `implementation project(":custom:...")`. See [Dockerfile & Jib](/build/dockerfile-and-jib) for the full block. Result:
+
+```bash
+./gradlew :custom:docker:jibDockerBuild
+docker images | grep fineract-custom
+# fineract-custom   latest    <id>   <time>   <size>
+```
+
+The resulting image has every custom module's classes in `/app/classes/`, but none of them are active until you pass `--env ACME_NOTE_ENABLED=true` (etc.) at container start. This is intentional: build once, deploy with different flags per environment.
+
+### 2. The standard image + `/app/plugins`
+
+If you prefer not to rebuild the image for each module change, build the custom module as a standalone JAR and bind-mount it into `/app/plugins/`:
+
+```bash
+./gradlew :custom:acme:note:service:jar :custom:acme:note:starter:jar
+docker run --rm \
+  -v $PWD/custom/acme/note/service/build/libs/acme-fineract-note-service-1.13.0-SNAPSHOT.jar:/app/plugins/acme-fineract-note-service.jar:ro \
+  -v $PWD/custom/acme/note/starter/build/libs/acme-fineract-note-starter-1.13.0-SNAPSHOT.jar:/app/plugins/acme-fineract-note-starter.jar:ro \
+  -e ACME_NOTE_ENABLED=true \
+  fineract:latest
+```
+
+The `extraClasspath = ['/app/plugins/*']` in the upstream `jib.container` block makes the JARs visible without any image rebuild. Auto-config files are still respected because Spring Boot reads `META-INF/spring/...imports` from any JAR on the classpath.
+
+## Recipe: adding a new custom module
+
+Concrete example — adding a `widget` category under a new `mybank` company to override the upstream charge calculator:
+
+```bash
+mkdir -p custom/mybank/charge/calculator/src/main/java/com/mybank/fineract/charge/calculator
+mkdir -p custom/mybank/charge/starter/src/main/java/com/mybank/fineract/charge/starter
+mkdir -p custom/mybank/charge/starter/src/main/resources/META-INF/spring
+```
+
+### 1. Implementation module
+
+`custom/mybank/charge/calculator/build.gradle`:
+
+```groovy
+description = 'MyBank Custom Charge Calculator'
+group = 'com.mybank.fineract'
+base { archivesName = 'mybank-fineract-charge-calculator' }
+apply from: 'dependencies.gradle'
+```
+
+`custom/mybank/charge/calculator/dependencies.gradle`:
+
+```groovy
+dependencies {
+    implementation project(':fineract-core')
+    implementation project(':fineract-charge')
+    implementation 'org.springframework:spring-context'
+    implementation 'org.springframework.boot:spring-boot'
+}
+```
+
+`custom/mybank/charge/calculator/src/main/java/com/mybank/fineract/charge/calculator/MyBankChargeCalculator.java`:
+
+```java
+package com.mybank.fineract.charge.calculator;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Primary;
+import org.springframework.stereotype.Component;
+
+@Component
+@Primary                              // win autowire arbitration over upstream calculator
+@ConditionalOnProperty("mybank.charge.enabled")
+public class MyBankChargeCalculator implements ChargeCalculator {
+    @Override
+    public Money calculate(Charge charge, Loan loan) {
+        // custom rounding / FX / regulatory rules
+        return …;
+    }
+}
+```
+
+### 2. Starter module
+
+`custom/mybank/charge/starter/build.gradle`:
+
+```groovy
+description = 'MyBank Custom Charge Starter'
+group = 'com.mybank.fineract'
+base { archivesName = 'mybank-fineract-charge-starter' }
+apply from: 'dependencies.gradle'
+```
+
+`custom/mybank/charge/starter/dependencies.gradle`:
+
+```groovy
+dependencies {
+    runtimeOnly project(':custom:mybank:charge:calculator')
+    implementation 'org.springframework.boot:spring-boot-autoconfigure'
+}
+```
+
+`custom/mybank/charge/starter/src/main/java/com/mybank/fineract/charge/starter/MyBankChargeAutoConfiguration.java`:
+
+```java
+package com.mybank.fineract.charge.starter;
+
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.ComponentScan;
+
+@AutoConfiguration
+@ComponentScan("com.mybank.fineract.charge")
+@ConditionalOnProperty("mybank.charge.enabled")
+public class MyBankChargeAutoConfiguration {}
+```
+
+`custom/mybank/charge/starter/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`:
+
+```
+com.mybank.fineract.charge.starter.MyBankChargeAutoConfiguration
+```
+
+### 3. Verify discovery
+
+```bash
+./gradlew projects | grep mybank
+# → :custom:mybank:charge:calculator
+# → :custom:mybank:charge:starter
+```
+
+If they don't show up, you either named a folder `build` or nested too deep. Check the depth: exactly **company / category / module** under `custom/`.
+
+### 4. Build the custom image
+
+```bash
+./gradlew :custom:docker:jibDockerBuild
+```
+
+The Jib `dependencies { … }` walk picks them up automatically — no edit to `custom/docker/build.gradle` needed.
+
+### 5. Run with the flag on
+
+```bash
+docker run --rm -p 8443:8443 \
+  -e MYBANK_CHARGE_ENABLED=true \
+  -e FINERACT_DEFAULT_TENANTDB_* \
+  fineract-custom:latest
+```
+
+(or set `mybank.charge.enabled=true` in `application.properties` of an embedded test.)
+
+## Common pitfalls
+
+| Symptom                                                                      | Cause                                                                                                                          | Fix                                                                                                            |
+|------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `Project :custom:foo:bar:baz not found`                                       | Module directory nested at wrong depth (must be exactly 3 levels under `custom/`)                                              | Restructure to `custom/<company>/<category>/<module>/`                                                          |
+| Module discovered but classes never run                                       | `@ConditionalOnProperty` flag not set                                                                                          | Set `<company>.<category>.enabled=true` in env or `application.properties`                                     |
+| `NoUniqueBeanDefinitionException` on upstream interface                       | Both upstream and custom `@Service`s active; custom one not annotated `@Primary` (and upstream isn't `@ConditionalOnMissingBean`) | Annotate the custom service `@Primary`, or wrap the upstream bean with `@ConditionalOnProperty("…enabled")` set to `false` to inactivate it |
+| Module's `META-INF/spring/...imports` ignored                                 | File extension wrong (`.import`, `.imports.txt`) or in wrong subdirectory                                                       | Exact path: `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`                  |
+| Jib image missing the new module                                             | Custom Docker image cached against an older `settings.gradle`                                                                  | `./gradlew :custom:docker:clean :custom:docker:jibDockerBuild`                                                  |
+| `gradle test` runs upstream tests for the module                              | Test-classpath layering issue                                                                                                  | Use `./gradlew :custom:<company>:<category>:<module>:test` directly                                            |
+
+## Cross-references
+
+- [Multi-Module Build](/build/gradle-multi-module) — the `settings.gradle` static include list this loader extends
+- [Dockerfile & Jib](/build/dockerfile-and-jib) — the second discovery loop in `custom/docker/build.gradle`
+- [Loan COB](/cob/loan-cob-overview) — what custom `LoanCOBBusinessStep`s plug into
+- [Provider Bootstrap](/provider/bootstrap-and-main) — where `@AutoConfiguration` beans get loaded during startup

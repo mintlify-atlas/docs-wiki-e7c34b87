@@ -1,0 +1,308 @@
+---
+title: "Rates: Generic Rate Catalogue for Loan Products"
+sidebarTitle: "Rate"
+description: "Reference for the generic Rate entity, RateAppliesTo, RateApiResource at /v1/rates and how loan products link via m_product_loan_rate."
+---
+
+Apache Fineract has **two distinct rate subsystems**. The "floating-rate" machinery in `org.apache.fineract.portfolio.floatingrates` powers variable-rate loans whose schedule is reflowed when a base rate changes (see [/rates/overview](/rates/overview) and [/rates/floating-rate-domain](/rates/floating-rate-domain)). This page documents the **other** one: the smaller `org.apache.fineract.portfolio.rate` package, an additive percentage that joins to loan products through `m_product_loan_rate` and applies as an extra rate on top of the loan-product nominal rate at disbursement time.
+
+The two systems do not interact. The generic `Rate` entity here is a static catalogue row — name, percentage, what it applies to — and is used by loan-product configuration to attach add-on rates (e.g. "Insurance Spread 0.25%", "Solidarity Fund 0.10%"). When a loan is disbursed from a product, the engine adds the percentages of all attached active rates to the schedule.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `Rate` entity | `fineract-core` | `org.apache.fineract.portfolio.rate.domain` |
+| `RateAppliesTo` enum | `fineract-core` | `org.apache.fineract.portfolio.rate.domain` |
+| `RateRepository`, `RateRepositoryWrapper` | `fineract-provider` | `org.apache.fineract.portfolio.rate.domain` |
+| `RateApiResource` (`/v1/rates`), `RateApiConstants`, `RateRequest` | `fineract-provider` | `org.apache.fineract.portfolio.rate.api` |
+| `RateAssembler`, `RateReadService`, `RateWriteService`, `RateEnumerations` | `fineract-provider` | `org.apache.fineract.portfolio.rate.service` |
+| `CreateRateCommandHandler`, `UpdateRateCommandHandler` | `fineract-provider` | `org.apache.fineract.portfolio.rate.handler` |
+| `RateDefinitionCommandFromApiJsonDeserializer` | `fineract-provider` | `org.apache.fineract.portfolio.rate.serialization` |
+| Exceptions (`RateNotFoundException`, `RateAlreadyExistException`) | `fineract-provider` | `org.apache.fineract.portfolio.rate.exception` |
+| `RateConfiguration` (Spring) | `fineract-provider` | `org.apache.fineract.portfolio.rate.starter` |
+
+Loan-product join sits in `fineract-loan/.../LoanProduct.java`:
+
+```java
+@ManyToMany
+@JoinTable(name = "m_product_loan_rate",
+           joinColumns = @JoinColumn(name = "product_loan_id"),
+           inverseJoinColumns = @JoinColumn(name = "rate_id"))
+private List<Rate> rates;
+```
+
+## Entity
+
+```java
+// fineract-core/.../portfolio/rate/domain/Rate.java
+@Entity
+@Table(name = "m_rate",
+       uniqueConstraints = { @UniqueConstraint(columnNames = { "name" }, name = "name") })
+public class Rate extends AbstractAuditableCustom {
+
+    @Column(name = "name", length = 250, unique = true) private String name;
+
+    @Column(name = "percentage", scale = 10, precision = 2, nullable = false)
+    private BigDecimal percentage;
+
+    @Column(name = "product_apply", length = 100) private Integer productApply;
+
+    @Column(name = "active", nullable = false) private boolean active;
+
+    @ManyToOne
+    @JoinColumn(name = "approve_user", nullable = true)
+    private AppUser approveUser;
+```
+
+Field semantics:
+
+- **`name`** — globally unique. Duplicate insertions raise `RateAlreadyExistException` (HTTP 409).
+- **`percentage`** — additive percentage. The column definition `precision = 2` is unusual (most monetary columns are 19/6) — it is wide on the SQL side but limited to two-digit decimal precision logically. Practical values are 0.10 — 5.00.
+- **`productApply`** — the `RateAppliesTo.value`. Today only `LOAN(1)` is supported.
+- **`active`** — toggle. Inactive rates are kept for history but excluded from new-loan computation.
+- **`approveUser`** — the `AppUser` who approved the rate (recorded once approved through the standard maker-checker flow). Nullable when maker-checker is disabled.
+
+The entity extends `AbstractAuditableCustom`, so created/modified timestamps and users are recorded automatically.
+
+## `RateAppliesTo`
+
+```java
+// fineract-core/.../portfolio/rate/domain/RateAppliesTo.java
+public enum RateAppliesTo {
+    INVALID(0, "rateAppliesTo.invalid"),
+    LOAN(1,    "rateAppliesTo.loan");
+    // ...
+    public static RateAppliesTo fromInt(final Integer rateAppliesTo) {
+        // returns LOAN for 1, INVALID otherwise
+    }
+    public boolean isLoanRate() { ... }
+}
+```
+
+Only the `LOAN` scope is currently wired. The enum is open-ended so future scopes (e.g. `SAVING`) can be added.
+
+## Factories
+
+```java
+public static Rate from(String name, BigDecimal percentage, RateAppliesTo productApply, Boolean active) {
+    return new Rate(name, percentage, productApply, active);
+}
+
+public static Rate fromJson(final JsonCommand command, AppUser user) {
+    final String name = command.stringValueOfParameterNamed("name");
+    final BigDecimal percentage = command.bigDecimalValueOfParameterNamed("percentage");
+    final RateAppliesTo productApply = RateAppliesTo.fromInt(command.integerValueOfParameterNamed("productApply"));
+    final boolean active = command.booleanPrimitiveValueOfParameterNamed("active");
+    return new Rate(name, percentage, productApply, active, user);
+}
+```
+
+## Parameter constants
+
+```java
+// fineract-provider/.../portfolio/rate/api/RateApiConstants.java
+public final class RateApiConstants {
+    public static final String approveUserIdParamName = "approveUserId";
+    public static final String rate            = "rate";
+    public static final String rateName        = "name";
+    public static final String ratePercentage  = "percentage";
+    public static final String rateProductApply = "productApply";
+}
+```
+
+These are the on-the-wire JSON keys.
+
+## REST surface — `RateApiResource`
+
+```java
+// fineract-provider/.../portfolio/rate/api/RateApiResource.java
+@Path("/v1/rates")
+@Component
+@Tag(name = "Rate")
+@RequiredArgsConstructor
+public class RateApiResource {
+
+    private static final Set<String> RESPONSE_DATA_PARAMETERS = new HashSet<>(
+            Arrays.asList("id", "name", "percentage", "productApply", "active"));
+    private static final String RESOURCE_NAME_FOR_PERMISSIONS = "RATE";
+
+    private final PlatformSecurityContext context;
+    private final RateReadService readPlatformService;
+    private final DefaultToApiJsonSerializer<RateData> toApiJsonSerializer;
+    private final PortfolioCommandSourceWritePlatformService commandsSourceWritePlatformService;
+```
+
+### Endpoints
+
+| Verb | Path | Purpose |
+| --- | --- | --- |
+| `GET`  | `/v1/rates` | List all rates. |
+| `GET`  | `/v1/rates/{rateId}` | Get one rate. |
+| `POST` | `/v1/rates` | Create a rate. Body: `RateRequest`. |
+| `PUT`  | `/v1/rates/{rateId}` | Update a rate. Body: `RateRequest`. |
+
+There is no DELETE — rates are kept for history and disabled by setting `active=false`.
+
+### Get one
+
+```java
+@GET
+@Path("{rateId}")
+public RateData retrieveRate(@PathParam("rateId") Long rateId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return this.readPlatformService.retrieveOne(rateId);
+}
+```
+
+### Create
+
+```java
+@POST
+public CommandProcessingResult createRate(final RateRequest rateRequest) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().createRate()
+            .withJson(toApiJsonSerializer.serialize(rateRequest)).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+`RateRequest`:
+
+```java
+@Data @AllArgsConstructor @NoArgsConstructor
+public class RateRequest implements Serializable {
+    private String name;
+    private BigDecimal percentage;
+    private Integer productApply;     // 1 for LOAN
+    private Boolean active;
+    private String locale;
+}
+```
+
+The deserializer (`RateDefinitionCommandFromApiJsonDeserializer`) validates that `name`, `percentage`, `productApply` are present and that `productApply == 1` (LOAN). Validation errors raise `PlatformApiDataValidationException` (HTTP 400).
+
+### Update
+
+```java
+@PUT
+@Path("{rateId}")
+public CommandProcessingResult updateRate(@PathParam("rateId") Long rateId, final RateRequest rateRequest) {
+    final CommandWrapper commandRequest = new CommandWrapperBuilder().updateRate(rateId)
+            .withJson(toApiJsonSerializer.serialize(rateRequest)).build();
+    return commandsSourceWritePlatformService.logCommandSource(commandRequest);
+}
+```
+
+The corresponding `UpdateRateCommandHandler` produces a `Map<String, Object> changes` that is recorded into the audit row.
+
+## Command handlers
+
+```java
+@CommandType(entity = "RATE", action = "CREATE")
+public class CreateRateCommandHandler implements NewCommandSourceHandler {
+    private final RateWriteService rateWriteService;
+    @Override public CommandProcessingResult processCommand(final JsonCommand command) {
+        return rateWriteService.createRate(command);
+    }
+}
+
+@CommandType(entity = "RATE", action = "UPDATE")
+public class UpdateRateCommandHandler implements NewCommandSourceHandler {
+    private final RateWriteService rateWriteService;
+    @Override public CommandProcessingResult processCommand(final JsonCommand command) {
+        return rateWriteService.updateRate(command.entityId(), command);
+    }
+}
+```
+
+`RateWriteServiceImpl` performs:
+
+1. Validate via the deserializer.
+2. Resolve the approving user from `PlatformSecurityContext`.
+3. Persist via `RateRepository.saveAndFlush(...)`.
+4. Map data-integrity violations (unique-name collisions) into `RateAlreadyExistException` (HTTP 409).
+
+## Read service
+
+`RateReadServiceImpl` is a thin `JdbcTemplate` wrapper:
+
+```java
+List<RateData> retrieveAllRates();
+RateData retrieveOne(Long rateId);
+```
+
+It selects `id`, `name`, `percentage`, `product_apply`, `active`. The product-apply value is decoded via `RateEnumerations` into an `EnumOptionData` block (`{ id, code, value }`).
+
+## Loan-product linkage
+
+The loan product holds a many-to-many to `Rate` through `m_product_loan_rate`:
+
+```java
+// fineract-loan/.../portfolio/loanproduct/domain/LoanProduct.java
+@ManyToMany
+@JoinTable(name = "m_product_loan_rate",
+           joinColumns = @JoinColumn(name = "product_loan_id"),
+           inverseJoinColumns = @JoinColumn(name = "rate_id"))
+private List<Rate> rates;
+
+public boolean updateRates(final List<Rate> newProductRates) {
+    if (newProductRates == null) {
+        // nothing to update
+        return false;
+    }
+    final Set<Rate> newSetOfRates = new HashSet<>(newProductRates);
+    // diff against current and replace
+}
+```
+
+When the loan product is updated through `LoanProductsApiResource`, the request may carry `rates: [1, 4, 7]` — a list of rate ids — which is resolved by `RateAssembler.fromParsedJson(jsonArray)` and passed into `LoanProduct.updateRates(...)`.
+
+### Application at disbursement
+
+When a loan is disbursed, the loan schedule engine reads the product's `rates` collection, filters to those with `active=true`, and **adds** their percentages to the loan's nominal interest rate before generating the schedule. This is a simple additive override; it does not introduce a separate row in the schedule.
+
+Example: if the product is "Standard Loan @ 12% annual" and it has two attached rates "Insurance 0.25%" and "Solidarity Fund 0.10%" both active, the engine generates the schedule at `12.35%`. This is the standard pattern for institutions that need to layer regulatory or fund-contribution add-ons on top of the headline rate.
+
+## Permissions
+
+- `READ_RATE`, `CREATE_RATE`, `UPDATE_RATE` — standard CRUD.
+- No `DELETE_RATE` since rates cannot be deleted.
+
+Maker-checker is supported through the command pipeline.
+
+## Failure modes
+
+| Exception | Status | Trigger |
+| --- | --- | --- |
+| `RateNotFoundException` | 404 | `{rateId}` unknown. |
+| `RateAlreadyExistException` | 409 | A rate with the same `name` already exists. |
+| `PlatformApiDataValidationException` | 400 | Missing/invalid fields in the request body. |
+
+## Edge cases
+
+- **Locked once attached to active loans.** Although the platform does not formally prevent updates to a rate already used by active loans, changing the percentage will affect any **new** disbursement using that product. Existing schedules are not reflowed. To change the rate seen by new loans without affecting historical ones, deactivate the rate and create a new one.
+- **`precision = 2` quirk.** The column has precision 2 but scale 10, which in MySQL effectively stores percentages with two integer digits and ten decimal digits. Pragmatically: store values like `0.250000`, not `25` for 25%.
+- **`approveUser` may remain null.** When maker-checker is not enabled, no separate approval step exists; the creator's id is recorded in the audit row, not in `approve_user`.
+
+## Relationship to floating-rate machinery
+
+| Aspect | `portfolio.rate.Rate` (this page) | `portfolio.floatingrates.FloatingRate` (see [/rates/overview](/rates/overview)) |
+| --- | --- | --- |
+| Purpose | Additive add-on percentage on top of nominal product rate. | Base rate with periods that drives the entire loan-rate calculation. |
+| Storage | `m_rate`, joined to product via `m_product_loan_rate`. | `m_floating_rates`, `m_floating_rates_periods`. |
+| Effect on schedule | Adds to the headline rate at disbursement. | Drives the full schedule; reflows on rate-change events for variable-rate loans. |
+| Lifecycle | Static catalogue. | Periodic updates via `FloatingRatesApiResource`. |
+
+Use `Rate` for static add-ons. Use `FloatingRate` for genuine variable-rate loans.
+
+## Cross-references
+
+- [/rates/overview](/rates/overview) — the floating-rate subsystem (different concept).
+- [/rates/floating-rate-domain](/rates/floating-rate-domain) — entity model for floating rates.
+- [/rates/floating-rates-api](/rates/floating-rates-api) — REST surface for floating rates.
+- [/loan/loan-product-api](/loan/loan-product-api) — where the `rates` array is referenced when creating/updating a loan product.
+- [/loan/loan-domain-model](/loan/loan-domain-model) — `LoanProduct.rates` linkage.
+- [/loan/loan-schedule-generator](/loan/loan-schedule-generator) — how the additive percentages flow into the schedule.
+- [/api/portfolio-apis](/api/portfolio-apis) — public REST tour.
+- [/command/overview](/command/overview) — `CommandWrapperBuilder.createRate()` / `.updateRate(id)`.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — `AbstractAuditableCustom` base class.

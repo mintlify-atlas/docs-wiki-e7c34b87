@@ -1,0 +1,305 @@
+---
+title: "Client Charges: Apply, Pay, Waive and Inactivate"
+sidebarTitle: "Client Charges"
+description: "Reference for ClientCharge, ClientChargePaidBy, ClientChargesApiResource and the pay/waive/inactivate workflow in Fineract."
+---
+
+# Client Charges
+
+Client-level charges are fees that attach to a client directly rather than
+to a specific loan or savings account. In Apache Fineract they are
+modelled by the `ClientCharge` entity, paid or waived through dedicated
+`ClientTransaction` rows, and exposed through the
+`ClientChargesApiResource`. Typical uses include onboarding fees,
+membership dues, account-opening fees and statutory levies.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `ClientCharge`, `ClientChargePaidBy`, `ClientTransaction`, `ClientTransactionType` | `fineract-provider` | `org.apache.fineract.portfolio.client.domain` |
+| `Charge` (catalogue), `ChargeTimeType`, `ChargeCalculationType` | `fineract-provider` | `org.apache.fineract.portfolio.charge.domain` |
+| `ClientChargesApiResource` | `fineract-provider` | `org.apache.fineract.portfolio.client.api` |
+| `ClientChargeWritePlatformService(Impl)`, `ClientChargeReadPlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.client.service` |
+| Handlers: `CreateClientCharge…`, `PayClientCharge…`, `WaiveClientCharge…`, `DeleteClientCharge…` | `fineract-provider` | `org.apache.fineract.portfolio.client.handler` |
+| `ClientApiConstants` (param + command strings) | `fineract-core` | `org.apache.fineract.portfolio.client.api` |
+
+See [Clients](/portfolio/clients) for the owning entity and
+[Client Transactions](/portfolio/client-transactions) for the
+counter-entry side.
+
+## Entity
+
+`ClientCharge` maps to `m_client_charge`:
+
+```java
+@Entity
+@Table(name = "m_client_charge")
+public class ClientCharge extends AbstractPersistableCustom<Long> {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "client_id", referencedColumnName = "id", nullable = false)
+    private Client client;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "charge_id", referencedColumnName = "id", nullable = false)
+    private Charge charge;
+
+    @Column(name = "charge_time_enum", nullable = false)
+    private Integer chargeTime;
+
+    @Column(name = "charge_due_date")
+    private LocalDate dueDate;
+
+    @Column(name = "charge_calculation_enum")
+    private Integer chargeCalculation;
+
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;
+
+    @Column(name = "amount_paid_derived", scale = 6, precision = 19)
+    private BigDecimal amountPaid;
+
+    @Column(name = "amount_waived_derived", scale = 6, precision = 19)
+    private BigDecimal amountWaived;
+
+    @Column(name = "amount_writtenoff_derived", scale = 6, precision = 19)
+    private BigDecimal amountWrittenOff;
+
+    @Column(name = "amount_outstanding_derived", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amountOutstanding;
+
+    @Column(name = "is_penalty", nullable = false)
+    private boolean penaltyCharge = false;
+
+    @Column(name = "is_paid_derived", nullable = false)
+    private boolean paid = false;
+
+    @Column(name = "waived", nullable = false)
+    private boolean waived = false;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean status = true;
+
+    @Column(name = "inactivated_on_date")
+    private LocalDate inactivationDate;
+}
+```
+
+### Field semantics
+
+| Column | Purpose |
+| --- | --- |
+| `charge_id` | FK into the catalogue `m_charge` |
+| `charge_time_enum` | `ChargeTimeType` — `SPECIFIED_DUE_DATE`, `CLIENT_SPECIFIED`, etc.; defaults from `Charge` |
+| `charge_calculation_enum` | `ChargeCalculationType` — flat / percentage of amount |
+| `amount` | The original charged amount |
+| `amount_paid_derived` | Running paid total (updated by `PayCharge`) |
+| `amount_waived_derived` | Running waived total |
+| `amount_writtenoff_derived` | Running written-off total |
+| `amount_outstanding_derived` | `amount − paid − waived − writtenOff` (cached) |
+| `is_penalty` | Inherited from the `Charge` |
+| `is_paid_derived` / `waived` | Quick flags; reflect outstanding == 0 |
+| `is_active` | False after `inactivate`; soft-delete flag |
+| `inactivated_on_date` | Filled by the `inactivate` command |
+
+`Charge` (charge catalogue) controls `chargeAppliesTo = CLIENT`, the
+currency and the default amount/calculation. Only charges with
+`chargeAppliesTo = CLIENT` can be added to a client.
+
+### ClientChargePaidBy
+
+A pay or waive operation does not directly mutate the charge in
+isolation — it also writes a `ClientTransaction` and links it back to the
+charge via `ClientChargePaidBy`:
+
+```java
+public class ClientChargePaidBy extends AbstractPersistableCustom<Long> {
+
+    public static ClientChargePaidBy instance(final ClientTransaction clientTransaction,
+                                              final ClientCharge clientCharge,
+                                              final BigDecimal amount) {
+        return new ClientChargePaidBy(clientTransaction, clientCharge, amount);
+    }
+}
+```
+
+This join row makes it possible to undo a transaction (`POST .../clients/
+{id}/transactions/{txId}?command=undo`) and have the charge derived
+columns re-computed correctly.
+
+## ClientChargesApiResource
+
+Mounted at `/v1/clients/{clientId}/charges`. Endpoints:
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/clients/{clientId}/charges` | List client charges (filterable by `chargeStatus`, `pendingPayment`) | `READ_CLIENTCHARGE` |
+| `GET` | `/v1/clients/{clientId}/charges/template` | Template: charge catalogue filtered to client-applicable | `READ_CLIENTCHARGE` |
+| `GET` | `/v1/clients/{clientId}/charges/{chargeId}` | Single charge | `READ_CLIENTCHARGE` |
+| `POST` | `/v1/clients/{clientId}/charges` | Apply a charge | `CREATE_CLIENTCHARGE` |
+| `POST` | `/v1/clients/{clientId}/charges/{chargeId}?command=paycharge\|waive\|inactivate` | State transitions | per command |
+| `DELETE` | `/v1/clients/{clientId}/charges/{chargeId}` | Delete (only if untouched) | `DELETE_CLIENTCHARGE` |
+
+The `command=` switch is implemented inline:
+
+```java
+if (is(commandParam, ClientApiConstants.CLIENT_CHARGE_COMMAND_WAIVE_CHARGE)) {
+    new CommandWrapperBuilder().waiveClientCharge(clientId, chargeId)...
+} else if (is(commandParam, ClientApiConstants.CLIENT_CHARGE_COMMAND_PAY_CHARGE)) {
+    new CommandWrapperBuilder().payClientCharge(clientId, chargeId)...
+} else if (is(commandParam, ClientApiConstants.CLIENT_CHARGE_COMMAND_INACTIVATE_CHARGE)) {
+    new CommandWrapperBuilder().inactivateClientCharge(clientId, chargeId)...
+} else {
+    throw new UnrecognizedQueryParamException("command", commandParam,
+        "waive", "paycharge", "inactivate");
+}
+```
+
+Recognised command parameters (from `ClientApiConstants`):
+
+| Constant | Value |
+| --- | --- |
+| `CLIENT_CHARGE_COMMAND_WAIVE_CHARGE` | `"waive"` |
+| `CLIENT_CHARGE_COMMAND_PAY_CHARGE` | `"paycharge"` |
+| `CLIENT_CHARGE_COMMAND_INACTIVATE_CHARGE` | `"inactivate"` |
+
+### Apply a charge
+
+```http
+POST /v1/clients/{clientId}/charges
+```
+
+```json
+{
+  "chargeId": 19,
+  "amount": 250.00,
+  "dueDate": "27 January 2025",
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Validation (`ClientChargeWritePlatformServiceImpl#addCharge`):
+
+- The `Charge` must have `chargeAppliesTo = CLIENT`, otherwise throws
+  `ChargeMustBePenaltyException` / `ClientChargeCannotBeAddedException`.
+- The currency of the charge is reconciled against the client's office
+  default currency.
+- `dueDate` defaults from the `Charge` if not given.
+
+### Pay a charge
+
+```http
+POST /v1/clients/{clientId}/charges/{chargeId}?command=paycharge
+```
+
+```json
+{
+  "transactionDate": "27 January 2025",
+  "amount": 100.00,
+  "paymentTypeId": 4,
+  "dateFormat": "dd MMMM yyyy",
+  "locale": "en"
+}
+```
+
+Effect:
+
+1. Creates a `ClientTransaction` row with `transaction_type_enum =
+   PAY_CHARGE (1)`, the supplied amount and an optional `PaymentDetail`.
+2. Inserts a `ClientChargePaidBy(transaction, charge, amount)` join row.
+3. Updates the derived columns on `ClientCharge`:
+   - `amount_paid_derived += amount`
+   - `amount_outstanding_derived -= amount`
+   - if `outstanding == 0` → `is_paid_derived = true`.
+
+The transaction-date must be on/after the client's activation date and
+on/before today (business date).
+
+### Waive a charge
+
+```http
+POST /v1/clients/{clientId}/charges/{chargeId}?command=waive
+```
+
+```json
+{ "locale": "en" }
+```
+
+Waiving has no `amount` payload — it always writes off the entire current
+outstanding. A `ClientTransaction` with `transaction_type_enum =
+WAIVE_CHARGE (2)` is produced and the derived `amount_waived_derived` and
+`waived = true` flags are updated.
+
+### Inactivate a charge
+
+`?command=inactivate` is a soft-delete reserved for charges that have
+**no** transactions and that are not yet due (or that you simply want to
+hide). It sets `is_active = false`, `inactivated_on_date = today` and
+makes the row invisible from default list queries
+(`ClientChargeReadPlatformServiceImpl` joins on `is_active`).
+
+### Delete
+
+`DELETE /v1/clients/{clientId}/charges/{chargeId}` is allowed only when:
+
+- The charge has no `ClientChargePaidBy` rows (no transactions).
+- It is not part of a closed accounting period.
+
+Otherwise prefer `inactivate`.
+
+## ClientTransactionType
+
+```java
+public enum ClientTransactionType {
+    PAY_CHARGE(1, "clientTransactionType.payCharge"),
+    WAIVE_CHARGE(2, "clientTransactionType.waiveCharge");
+}
+```
+
+There are no `WRITE_OFF` or `REFUND` transaction types at the client
+level — those flow through the loan/savings sub-systems. See
+[Client Transactions](/portfolio/client-transactions) for `ClientTransaction`.
+
+## Read path
+
+`ClientChargeReadPlatformServiceImpl` returns `ClientChargeData` DTOs.
+Useful query params on `GET .../charges`:
+
+| Query param | Effect |
+| --- | --- |
+| `chargeStatus=all` | All rows (default `active`) |
+| `chargeStatus=active` | `is_active = true` |
+| `chargeStatus=inactive` | `is_active = false` |
+| `chargeStatus=paid` | `is_paid_derived = true` |
+| `pendingPayment=true` | `amount_outstanding_derived > 0` |
+
+## Accounting and events
+
+Pay/waive operations are emitted as business events
+(`ClientChargeCreatedBusinessEvent`, `ClientChargePaidBusinessEvent`,
+`ClientChargeWaivedBusinessEvent`) so notification rules and external
+integrations can react. The cash leg is recorded via the standard
+journal-entry posting that the `ClientChargeWritePlatformServiceImpl`
+delegates to.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `ClientChargeNotFoundException` | Bad `chargeId` for the client |
+| `ClientChargeCannotBePayedException` | Pay on an inactive / fully-paid / waived charge |
+| `ClientChargeCannotBeWaivedException` | Waive when outstanding == 0 |
+| `ClientChargeCannotBeDeletedException` | Delete after a transaction |
+| `ClientHasBeenClosedException` | Charge action on a closed client |
+| `ChargeWithoutMandatoryFieldException` | Missing `dueDate` / `amount` |
+
+## Cross-references
+
+- [Clients](/portfolio/clients) — owning entity
+- [Client Transactions](/portfolio/client-transactions) — `ClientTransaction`
+  produced by `paycharge` / `waive`
+- [Loan overview](/loan/overview), [Savings overview](/savings/overview)
+  for the analogous loan- and savings-level charge flows
+- [Portfolio shared domain](/core/portfolio-shared-domain) — `Money`,
+  `MonetaryCurrency`, `Charge`, `ChargeTimeType`
+- [Portfolio APIs index](/api/portfolio-apis)

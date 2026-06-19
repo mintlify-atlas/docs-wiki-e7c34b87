@@ -1,0 +1,318 @@
+---
+title: "TaxComponent Entity, History and Percentage Versioning"
+sidebarTitle: "Tax Component"
+description: "Apache Fineract TaxComponent reference: m_tax_component fields, GL account pair, percentage versioning through TaxComponentHistory, applicable-rate lookup and update semantics."
+---
+
+A `TaxComponent` is the Apache Fineract atom for value-added tax: a named percentage with optional GL debit/credit account routing and a **versioned history** of its rate over time. The entity lives at `fineract-tax/src/main/java/org/apache/fineract/portfolio/tax/domain/TaxComponent.java` and maps to `m_tax_component`. The associated history rows live in `m_tax_component_history` (`TaxComponentHistory.java`).
+
+For how components combine into a group, see [TaxGroup](/tax/tax-group). For the REST surface that drives create / update, see [Tax API resources](/tax/tax-api-resources).
+
+## Entity declaration
+
+```java
+@Entity
+@Getter
+@Table(name = "m_tax_component")
+public class TaxComponent extends AbstractAuditableCustom {
+
+    @Column(name = "name", length = 100)
+    private String name;
+
+    @Column(name = "percentage", scale = 6, precision = 19, nullable = false)
+    private BigDecimal percentage;
+
+    @Column(name = "debit_account_type_enum")
+    private Integer debitAccountType;
+
+    @ManyToOne
+    @JoinColumn(name = "debit_account_id")
+    private GLAccount debitAccount;
+
+    @Column(name = "credit_account_type_enum")
+    private Integer creditAccountType;
+
+    @ManyToOne
+    @JoinColumn(name = "credit_account_id")
+    private GLAccount creditAccount;
+
+    @Column(name = "start_date", nullable = false)
+    private LocalDate startDate;
+
+    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
+    @JoinColumn(name = "tax_component_id", referencedColumnName = "id", nullable = false)
+    private Set<TaxComponentHistory> taxComponentHistories = new HashSet<>();
+
+    @OneToMany(cascade = CascadeType.DETACH, mappedBy = "taxComponent", orphanRemoval = false, fetch = FetchType.EAGER)
+    private Set<TaxGroupMappings> taxGroupMappings = new HashSet<>();
+    // ...
+}
+```
+
+`AbstractAuditableCustom` supplies the `id`, `createdBy`, `createdDate`, `lastModifiedBy`, `lastModifiedDate` columns. Both the history set and the back-reference to `TaxGroupMappings` are fetched eagerly because a single component is rarely large and consumers usually need the full history to evaluate a date-bound percentage.
+
+### Persisted fields
+
+| Column (`m_tax_component`) | Java field | Notes |
+| --- | --- | --- |
+| `name` (100) | `name` | Display name, e.g. "GST 5%". |
+| `percentage` (scale 6, precision 19) | `percentage` | The **currently effective** rate. Older rates live in `m_tax_component_history`. |
+| `debit_account_type_enum`, `debit_account_id` | `debitAccountType`, `debitAccount` | Optional GL account pair used by accounting rules to post the debit leg of the tax. |
+| `credit_account_type_enum`, `credit_account_id` | `creditAccountType`, `creditAccount` | Optional credit leg. |
+| `start_date` | `startDate` | Date from which the **current** `percentage` is effective. |
+
+`debitAccountType` and `creditAccountType` are integer codes of `GLAccountType` (`ASSET=1`, `LIABILITY=2`, `EQUITY=3`, `INCOME=4`, `EXPENSE=5`). The accounting rule engine in `fineract-accounting` uses the (type, account) pair to route the journal entries when the tax is realised.
+
+### Factory
+
+```java
+public static TaxComponent createTaxComponent(final String name, final BigDecimal percentage,
+        final GLAccountType debitAccountType,  final GLAccount debitAccount,
+        final GLAccountType creditAccountType, final GLAccount creditAccount,
+        final LocalDate startDate) {
+    return new TaxComponent(name, percentage, debitAccountType, debitAccount,
+                             creditAccountType, creditAccount, startDate);
+}
+```
+
+`TaxValidator.fromJson(...)` calls this factory after validating the inbound JSON and resolving the GL accounts via `GLAccountRepositoryWrapper`. The constructor only stores the integer values of `GLAccountType.getValue()` when the types are non-null — the fields are nullable.
+
+### Constructor — `private TaxComponent(...)`
+
+```java
+private TaxComponent(final String name, final BigDecimal percentage, final GLAccountType debitAccountType,
+        final GLAccount debitAccount, final GLAccountType creditAccountType, final GLAccount creditAccount,
+        final LocalDate startDate) {
+    this.name = name;
+    this.percentage = percentage;
+    if (debitAccountType != null)  { this.debitAccountType  = debitAccountType.getValue(); }
+    this.debitAccount = debitAccount;
+    if (creditAccountType != null) { this.creditAccountType = creditAccountType.getValue(); }
+    this.creditAccount = creditAccount;
+    this.startDate = startDate;
+}
+```
+
+Note the constructor stores `debitAccountType.getValue()` (an integer code) rather than the enum — same shape as every other Fineract entity that lets users pick from a fixed list of GL account types.
+
+## `m_tax_component_history` — percentage versioning
+
+```java
+@Entity
+@Table(name = "m_tax_component_history")
+public class TaxComponentHistory extends AbstractAuditableCustom {
+
+    @Column(name = "percentage", scale = 6, precision = 19, nullable = false)
+    private BigDecimal percentage;
+
+    @Column(name = "start_date", nullable = false)
+    private LocalDate startDate;
+
+    @Column(name = "end_date", nullable = false)
+    private LocalDate endDate;
+
+    public static TaxComponentHistory createTaxComponentHistory(final BigDecimal percentage,
+            final LocalDate startDate, final LocalDate endDate) {
+        return new TaxComponentHistory(percentage, startDate, endDate);
+    }
+
+    public boolean occursOnDayFromAndUpToAndIncluding(final LocalDate target) {
+        return DateUtils.isAfter(target, startDate())
+            && (endDate == null || !DateUtils.isAfter(target, endDate()));
+    }
+}
+```
+
+Each history row carries the **previous percentage**, the date it became active, and the date it stopped being active (which is the start date of the row that replaced it). The cascade is `ALL` + `orphanRemoval = true`, so deleting a `TaxComponent` cleans up its history.
+
+## Update — how versioning happens
+
+The most important method on `TaxComponent` is `update(JsonCommand command)`:
+
+```java
+public Map<String, Object> update(final JsonCommand command) {
+    final Map<String, Object> changes = new HashMap<>();
+
+    if (command.isChangeInStringParameterNamed(TaxApiConstants.nameParamName, this.name)) {
+        final String newValue = command.stringValueOfParameterNamed(TaxApiConstants.nameParamName);
+        changes.put(TaxApiConstants.nameParamName, newValue);
+        this.name = StringUtils.defaultIfEmpty(newValue, null);
+    }
+
+    if (command.isChangeInBigDecimalParameterNamed(TaxApiConstants.percentageParamName, this.percentage)) {
+        final BigDecimal newValue = command.bigDecimalValueOfParameterNamed(TaxApiConstants.percentageParamName);
+        changes.put(TaxApiConstants.percentageParamName, newValue);
+
+        LocalDate oldStartDate = this.startDate;
+        updateStartDate(command, changes, true);
+        LocalDate newStartDate = this.startDate;
+
+        TaxComponentHistory history = TaxComponentHistory.createTaxComponentHistory(this.percentage, oldStartDate, newStartDate);
+        this.taxComponentHistories.add(history);
+        this.percentage = newValue;
+    }
+    return changes;
+}
+```
+
+The flow when only the percentage changes:
+
+1. The **current** `(percentage, startDate)` is copied into a new `TaxComponentHistory(percentage=old, startDate=oldStart, endDate=newStart)`.
+2. The component's own `startDate` is updated to the date supplied in the JSON (or today's business date when no `startDate` is provided — see `updateStartDate(..., setAsCurrentDate=true)`).
+3. The component's `percentage` is replaced with the new value.
+
+The end-effect is that the database now stores: `(currentPct, currentStart)` on the component + a chain of `(oldPct, oldStart, oldEnd=currentStart)` rows in `m_tax_component_history`. No "soft delete" of old values — they are addressable via `getApplicablePercentage(date)` below.
+
+Update parameter coverage: only `name` and `percentage`. `debit_account_*` and `credit_account_*` are **immutable** after creation — the API resource itself documents this ("Debit and credit account details cannot be modified. All the future tax components would be replaced with the new percentage.").
+
+### Start-date handling
+
+```java
+private void updateStartDate(final JsonCommand command, final Map<String, Object> changes, boolean setAsCurrentDate) {
+    LocalDate startDate = DateUtils.getBusinessLocalDate();
+    if (command.parameterExists(TaxApiConstants.startDateParamName)) {
+        LocalDate startDateFromUI = command.localDateValueOfParameterNamed(TaxApiConstants.startDateParamName);
+        if (startDateFromUI != null) {
+            startDate = startDateFromUI;
+        }
+        this.startDate = startDate;
+        changes.put(TaxApiConstants.startDateParamName, startDate);
+    } else if (setAsCurrentDate) {
+        changes.put(TaxApiConstants.startDateParamName, startDate);
+        this.startDate = startDate;
+    }
+}
+```
+
+The tenant's **business local date** (`DateUtils.getBusinessLocalDate()`) is used when no `startDate` is supplied — important in multi-tenant deployments where the business day differs from the wall-clock date.
+
+## Date-bound percentage lookup
+
+```java
+public BigDecimal getApplicablePercentage(final LocalDate date) {
+    BigDecimal percentage = null;
+    if (occursOnDayFrom(date)) {
+        percentage = getPercentage();
+    } else {
+        for (TaxComponentHistory componentHistory : taxComponentHistories) {
+            if (componentHistory.occursOnDayFromAndUpToAndIncluding(date)) {
+                percentage = componentHistory.getPercentage();
+                break;
+            }
+        }
+    }
+    return percentage;
+}
+
+private boolean occursOnDayFrom(final LocalDate target) {
+    return DateUtils.isAfter(target, startDate());
+}
+```
+
+Semantics:
+
+- If the requested `date` is **strictly after** the component's current `startDate` → return the current `percentage`.
+- Otherwise scan the history: a row matches when `date > history.startDate AND (history.endDate IS NULL OR date <= history.endDate)`.
+- If no row matches, `null` is returned — callers (in `TaxGroup` / `TaxUtils`) treat this as "tax not yet active on that date" and skip the component.
+
+> Both `occursOnDayFrom(target)` and `TaxComponentHistory.occursOnDayFromAndUpToAndIncluding(target)` use `DateUtils.isAfter` (strict). Care is required around the start date: a transaction **on** the start date does **not** match — it has to be strictly after. This is the same rule used by `TaxGroupMappings`.
+
+## `allStartDates()`
+
+```java
+public Collection<LocalDate> allStartDates() {
+    List<LocalDate> dates = new ArrayList<>();
+    dates.add(startDate());
+    for (TaxComponentHistory componentHistory : taxComponentHistories) {
+        dates.add(componentHistory.startDate());
+    }
+    return dates;
+}
+```
+
+The "envelope" of dates on which this component's rate has changed. `TaxUtils` uses these dates as breakpoints when computing a tax schedule across a transaction or a date range (e.g. an annual statement). Consumers iterate the envelope, call `getApplicablePercentage(date)` per slice, and accumulate.
+
+## Identity and equality
+
+`TaxComponent` inherits the default `AbstractAuditableCustom` equality, which is **id-based**. Two transient (unsaved) instances are never equal; once persisted, they are equal iff their ids match. This is the right semantics for catalog rows that may be reused across groups.
+
+## Repository wrapper
+
+```java
+public interface TaxComponentRepositoryWrapper {
+    TaxComponent findOneWithNotFoundDetection(Long id);
+}
+```
+
+The implementation throws `TaxComponentNotFoundException` when the id is missing. Use this entry point in cross-module code — direct `TaxComponentRepository.findById(id)` exposes consumers to `Optional` handling and tends to produce inconsistent error responses.
+
+## Where `TaxComponent` is consumed
+
+- **TaxGroupMappings** (`fineract-tax`) — a tax group is built from `(TaxComponent, startDate, endDate)` tuples. Updating a component's percentage propagates automatically through `getApplicablePercentage(date)`.
+- **`TaxUtils`** (`fineract-tax/service/TaxUtils.java`) — the shared static helper that computes the per-component tax on a base amount at a date, including rounding-mode handling.
+- **Charges** — indirectly via `Charge.taxGroup`. Loan and savings transaction processors call into `TaxUtils` when settling fees that carry tax.
+
+## Worked example — versioning a rate over time
+
+Suppose GST is created on `2024-01-01` at `5%`. Internally:
+
+```
+m_tax_component(id=12, name="GST", percentage=5, start_date=2024-01-01, ...)
+m_tax_component_history -> (empty)
+```
+
+On `2024-04-01` an update raises the rate to `7%`:
+
+```json
+PUT /v1/taxes/component/12
+{
+  "percentage": 7,
+  "locale":     "en",
+  "dateFormat": "yyyy-MM-dd",
+  "startDate":  "2024-04-01"
+}
+```
+
+Inside `TaxComponent.update(command)`:
+
+1. The current `(percentage=5, startDate=2024-01-01)` is captured.
+2. A new history row is appended: `TaxComponentHistory(percentage=5, startDate=2024-01-01, endDate=2024-04-01)`.
+3. The component's `startDate` is overwritten to `2024-04-01`.
+4. The component's `percentage` is overwritten to `7`.
+
+DB after the update:
+
+```
+m_tax_component(id=12, name="GST", percentage=7, start_date=2024-04-01, ...)
+m_tax_component_history -> (percentage=5, start_date=2024-01-01, end_date=2024-04-01)
+```
+
+Now consider three queries:
+
+- `getApplicablePercentage(2024-03-15)` — `occursOnDayFrom(2024-03-15)` is `2024-03-15 > 2024-04-01`, false. Scan history: history row matches (`2024-01-01 < 2024-03-15 <= 2024-04-01`). Returns `5`.
+- `getApplicablePercentage(2024-04-01)` — `occursOnDayFrom(2024-04-01)` is `2024-04-01 > 2024-04-01`, false (strict). Scan history: matches (`2024-01-01 < 2024-04-01 <= 2024-04-01`). Returns `5`. **The day of the transition returns the old rate** — because the comparison is strict on both ends, the new rate becomes effective on `2024-04-02`.
+- `getApplicablePercentage(2024-04-02)` — `occursOnDayFrom(2024-04-02)` is `2024-04-02 > 2024-04-01`, true. Returns `7`.
+
+If a second update raises the rate to `8%` on `2024-09-01`, a new history row is appended:
+
+```
+m_tax_component(id=12, name="GST", percentage=8, start_date=2024-09-01, ...)
+m_tax_component_history -> (percentage=5, start_date=2024-01-01, end_date=2024-04-01)
+                           (percentage=7, start_date=2024-04-01, end_date=2024-09-01)
+```
+
+Queries:
+
+- `getApplicablePercentage(2024-05-15)` — history scan finds the second row (`2024-04-01 < 2024-05-15 <= 2024-09-01`). Returns `7`.
+- `getApplicablePercentage(2024-10-01)` — current rate applies. Returns `8`.
+
+The unbounded `endDate` of the **current** rate is implicit: it's whatever the component's `startDate` is, with no upper bound until the next update creates one.
+
+## Cross-references
+
+- For the entity diagram and composition rules: [TaxGroup](/tax/tax-group).
+- For the REST surface: [Tax API resources](/tax/tax-api-resources).
+- For how a `Charge` binds to a tax group: [Charge domain](/charge/charge-domain).
+- For the shared `GLAccount`, `GLAccountType`, `JsonCommand`, `DataValidatorBuilder` primitives: [Portfolio shared domain](/core/portfolio-shared-domain).
+- For how taxes flow into loan repayments: [Loan charges](/loan/loan-charges).
+- For savings tax application: [Savings charges](/savings/savings-charges).

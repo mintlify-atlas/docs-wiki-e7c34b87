@@ -1,0 +1,443 @@
+---
+title: "LoanRepaymentScheduleInstallment, History, and Model"
+sidebarTitle: "Schedule Domain"
+description: "Apache Fineract repayment schedule: LoanRepaymentScheduleInstallment fields, LoanRepaymentScheduleHistory, LoanScheduleModel, and generators."
+---
+
+The repayment schedule is the spine of every active loan in Apache Fineract. It is a list of `LoanRepaymentScheduleInstallment` rows owned by the parent `Loan`, plus an immutable historical snapshot in `LoanRepaymentScheduleHistory`, plus the projected-but-not-persisted `LoanScheduleModel` produced by the generators each time the math has to be re-run. This page documents all three.
+
+Source files (in `fineract-loan/src/main/java/org/apache/fineract/portfolio/loanaccount/`):
+
+- `domain/LoanRepaymentScheduleInstallment.java` — the persistent entity
+- `loanschedule/domain/LoanRepaymentScheduleHistory.java` — the snapshot
+- `loanschedule/domain/LoanScheduleModel.java`, `LoanScheduleModelPeriod.java`, `LoanScheduleModelRepaymentPeriod.java`, `LoanScheduleModelDisbursementPeriod.java` — the in-memory projection
+- `loanschedule/domain/LoanScheduleProcessingType.java`, `LoanScheduleType.java`
+- `loanschedule/domain/AbstractCumulativeLoanScheduleGenerator.java`, `CumulativeFlatInterestLoanScheduleGenerator.java`, `CumulativeDecliningBalanceInterestLoanScheduleGenerator.java`
+
+The generator interface plumbing is on [Schedule generator](/loan/loan-schedule-generator); the allocation order is on [Transaction processors](/loan/transaction-processors).
+
+## LoanRepaymentScheduleInstallment
+
+```java
+@Getter @Setter @Entity @Table(name = "m_loan_repayment_schedule")
+public class LoanRepaymentScheduleInstallment
+        extends AbstractAuditableWithUTCDateTimeCustom<Long>
+        implements Comparable<LoanRepaymentScheduleInstallment> {
+
+    @ManyToOne(optional = false) @JoinColumn(name = "loan_id", referencedColumnName = "id")
+    private Loan loan;
+
+    @Column(name = "installment", nullable = false) private Integer  installmentNumber;
+    @Column(name = "fromdate")                      private LocalDate fromDate;
+    @Column(name = "duedate",     nullable = false) private LocalDate dueDate;
+```
+
+### Scheduled (originally due) amounts
+
+These four columns are written once by the schedule generator and not changed by transactions:
+
+| Java field | Column | Source |
+| --- | --- | --- |
+| `principal` | `principal_amount` | Generator |
+| `interestCharged` | `interest_amount` | Generator (per `InterestMethod`) |
+| `feeChargesCharged` | `fee_charges_amount` | `LoanRepaymentScheduleProcessingWrapper` after charges attached |
+| `penaltyCharges` | `penalty_charges_amount` | Same |
+
+If the loan is **rescheduled** or **interest-recalculated**, these columns are overwritten — but a `LoanRepaymentScheduleHistory` row is first created from the old values (see below).
+
+### Paid / completed amounts (derived)
+
+Updated by the processor on every repayment/waiver/write-off:
+
+| Java field | Column |
+| --- | --- |
+| `principalCompleted` | `principal_completed_derived` |
+| `principalWrittenOff` | `principal_writtenoff_derived` |
+| `interestPaid` | `interest_completed_derived` |
+| `interestWaived` | `interest_waived_derived` |
+| `interestWrittenOff` | `interest_writtenoff_derived` |
+| `interestAccrued` | `accrual_interest_derived` |
+| `rescheduleInterestPortion` | `reschedule_interest_portion` |
+| `feeChargesPaid` | `fee_charges_completed_derived` |
+| `feeChargesWaived` | `fee_charges_waived_derived` |
+| `feeChargesWrittenOff` | `fee_charges_writtenoff_derived` |
+| `feeAccrued` | `accrual_fee_charges_derived` |
+| `penaltyChargesPaid` | `penalty_charges_completed_derived` |
+| `penaltyChargesWaived` | `penalty_charges_waived_derived` |
+| `penaltyChargesWrittenOff` | `penalty_charges_writtenoff_derived` |
+| `penaltyAccrued` | `accrual_penalty_charges_derived` |
+
+### Timing flags
+
+| Java field | Column |
+| --- | --- |
+| `totalPaidInAdvance` | `total_paid_in_advance_derived` (paid before `dueDate`) |
+| `totalPaidLate` | `total_paid_late_derived` (paid after `dueDate`) |
+| `obligationsMet` | `completed_derived` (true when all four buckets are settled) |
+| `obligationsMetOnDate` | `obligations_met_on_date` |
+| `recalculatedInterestComponent` | `recalculated_interest_component` (set by interest-recalc inserts) |
+| `additional` | `is_additional` (true for interest-only re-amortization inserts) |
+| `isDownPayment` | `is_down_payment` (true for the auto-down-payment row) |
+| `isReAged` | `is_re_aged` (true after re-aging) |
+
+### Progressive-loan credit fields
+
+```java
+@Column(name = "credits_amount",     scale = 6, precision = 19) private BigDecimal creditedPrincipal;
+@Column(name = "credited_interest",  scale = 6, precision = 19) private BigDecimal creditedInterest;
+@Column(name = "credited_fee",       scale = 6, precision = 19) private BigDecimal creditedFee;
+@Column(name = "credited_penalty",   scale = 6, precision = 19) private BigDecimal creditedPenalty;
+```
+
+Populated by the advanced-payment-allocation processor when an allocation rule sends a portion of a credit transaction (capitalized income, buy-down amortization) into a specific installment.
+
+### Owned collections
+
+```java
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY, mappedBy = "loanRepaymentScheduleInstallment")
+private Set<LoanInterestRecalcualtionAdditionalDetails> loanCompoundingDetails = new HashSet<>();
+
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY, mappedBy = "loanRepaymentScheduleInstallment")
+private Set<PostDatedChecks> postDatedChecks = new HashSet<>();
+
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY, mappedBy = "installment")
+private Set<LoanInstallmentCharge> installmentCharges = new HashSet<>();
+
+@OneToMany(cascade = CascadeType.ALL, orphanRemoval = true,
+           fetch = FetchType.LAZY, mappedBy = "installment")
+private Set<LoanTransactionToRepaymentScheduleMapping> loanTransactionToRepaymentScheduleMappings = new HashSet<>();
+```
+
+- `installmentCharges` are the per-installment fan-out of `INSTALMENT_FEE` (see [Loan charges](/loan/loan-charges)).
+- `loanTransactionToRepaymentScheduleMappings` is the inverse of the mapping table — "which transactions ever touched this installment".
+- `loanCompoundingDetails` records the compounding splits when interest recalculation is enabled.
+
+### Constructors
+
+Five constructors — the canonical one used by the generators:
+
+```java
+public LoanRepaymentScheduleInstallment(Loan loan, Integer installmentNumber,
+        LocalDate fromDate, LocalDate dueDate, BigDecimal principal, BigDecimal interest,
+        BigDecimal feeCharges, BigDecimal penaltyCharges, boolean recalculatedInterestComponent,
+        Set<LoanInterestRecalcualtionAdditionalDetails> compoundingDetails,
+        BigDecimal rescheduleInterestPortion, boolean isDownPayment) { … }
+```
+
+The progressive credit constructor:
+
+```java
+public LoanRepaymentScheduleInstallment(Loan loan, Integer installmentNumber, LocalDate fromDate, LocalDate dueDate,
+        BigDecimal principal, BigDecimal interestCharged, BigDecimal feeChargesCharged, BigDecimal penaltyCharges,
+        BigDecimal creditedPrincipal, BigDecimal creditedInterest, BigDecimal creditedFee, BigDecimal creditedPenalty,
+        boolean additional, boolean isDownPayment, boolean isReAged) { … }
+```
+
+### Comparable + ordering
+
+`compareTo` orders by `installmentNumber`. `Loan.repaymentScheduleInstallments` carries `@OrderBy("installmentNumber")` so the in-memory list is always sorted.
+
+### Key methods (selection)
+
+The entity exposes ~80 public methods. The frequently called ones:
+
+| Method | Returns/Effect |
+| --- | --- |
+| `getPrincipalOutstanding(MonetaryCurrency)` | `principal − principalCompleted − principalWrittenOff` as `Money` |
+| `getInterestOutstanding(MonetaryCurrency)` | Same shape for interest |
+| `getFeeChargesOutstanding(MonetaryCurrency)` | Same shape for fees |
+| `getPenaltyChargesOutstanding(MonetaryCurrency)` | Same for penalties |
+| `getTotalOutstanding(MonetaryCurrency)` | Sum of the four |
+| `payPrincipalComponent(LocalDate, Money)` | Records principal repayment, returns the actually-applied `Money` |
+| `payInterestComponent`, `payFeeChargesComponent`, `payPenaltyChargesComponent` | Same |
+| `waiveInterestComponent`, `waiveFeeChargesComponent`, `waivePenaltyChargesComponent` | Waivers |
+| `writeOffOutstandingPrincipal/Interest/Fee/Penalty` | Set on parent loan write-off |
+| `updateObligationsMet(MonetaryCurrency, LocalDate)` | Recomputes `obligationsMet` & `obligationsMetOnDate` |
+| `resetDerivedComponents()` | Zeroes all `*_derived` columns and `obligationsMet` (used during reverse-replay) |
+| `resetAccrualComponents()` | Zeroes the accrued columns |
+| `getInterestDue(MonetaryCurrency)` | `interestCharged + creditedInterest` minus waived |
+| `isOverdueOn(LocalDate)` | `!obligationsMet && dueDate < onDate` |
+| `isAdditional()`, `isDownPayment()`, `isReAged()`, `isRecalculatedInterestComponent()` | Type predicates |
+
+All `pay*Component(...)` calls take and return `Money` so the processor knows how much was unapplied (overflow into the next installment).
+
+## LoanRepaymentScheduleHistory
+
+When the schedule is rewritten (reschedule, interest-recalc compounding insert, EMI change), the previous installments are snapshotted into `m_loan_repayment_schedule_history`:
+
+```java
+@Entity @Table(name = "m_loan_repayment_schedule_history")
+public class LoanRepaymentScheduleHistory {
+    @ManyToOne @JoinColumn(name = "loan_id") private Loan loan;
+    @ManyToOne @JoinColumn(name = "loan_reschedule_request_id")
+    private LoanRescheduleRequest loanRescheduleRequest;
+
+    @Column(name = "installment", nullable = false) private Integer installmentNumber;
+    @Column(name = "fromdate") private LocalDate fromDate;
+    @Column(name = "duedate", nullable = false) private LocalDate dueDate;
+
+    @Column(name = "principal_amount", scale = 6, precision = 19) private BigDecimal principal;
+    @Column(name = "interest_amount", scale = 6, precision = 19) private BigDecimal interestCharged;
+    @Column(name = "fee_charges_amount", scale = 6, precision = 19) private BigDecimal feeChargesCharged;
+    @Column(name = "penalty_charges_amount", scale = 6, precision = 19) private BigDecimal penaltyCharges;
+
+    @Column(name = "version") private Integer version;
+    @Column(name = "created_date")     private LocalDateTime oldCreatedOnDate;
+    @Column(name = "createdby_id")     private Long createdByUser;
+    @Column(name = "lastmodifiedby_id") private Long lastModifiedByUser;
+    @Column(name = "lastmodified_date") private LocalDateTime oldLastModifiedOnDate;
+    @Column(name = "created_date_utc")  private OffsetDateTime createdDate;
+    @Column(name = "last_modified_date_utc") private OffsetDateTime lastModifiedDate;
+}
+```
+
+`LoanScheduleHistoryWritePlatformService` calls `LoanRepaymentScheduleHistory.copyFrom(installment)` for every active installment, persists the snapshot, then the new schedule overwrites `m_loan_repayment_schedule`.
+
+`LoanScheduleHistoryReadPlatformService.retrieveRepaymentArchiveSchedule(...)` reads it back as a `LoanScheduleData` for the `?associations=originalSchedule` query parameter on `GET /v1/loans/{id}`.
+
+## LoanScheduleModel (in-memory projection)
+
+The generators produce `LoanScheduleModel` — an immutable POJO that lives only long enough to be persisted into installments or returned to a `/template` endpoint:
+
+```java
+public class LoanScheduleModel {
+    private final Collection<LoanScheduleModelPeriod> periods;
+    private final ApplicationCurrency applicationCurrency;
+    private final int loanTermInDays;
+    private final BigDecimal totalPrincipalDisbursed;
+    private final BigDecimal totalPrincipalExpected;
+    private final BigDecimal totalPrincipalPaid;
+    private final BigDecimal totalInterestCharged;
+    private final BigDecimal totalFeeChargesCharged;
+    private final BigDecimal totalPenaltyChargesCharged;
+    private final BigDecimal totalRepaymentExpected;
+    private final BigDecimal totalOutstanding;
+    …
+}
+```
+
+`LoanScheduleModelPeriod` is an interface with two implementations:
+
+```java
+public interface LoanScheduleModelPeriod {
+    Integer periodNumber();
+    LocalDate periodFromDate();
+    LocalDate periodDueDate();
+    BigDecimal principalDue();
+    BigDecimal interestDue();
+    BigDecimal feeChargesDue();
+    BigDecimal penaltyChargesDue();
+    BigDecimal totalDueForPeriod();
+    boolean isRecalculatedInterestComponent();
+    boolean isDownPaymentPeriod();
+    // …
+}
+```
+
+- `LoanScheduleModelRepaymentPeriod` — one period of the schedule, returned by `Cumulative*Generator`.
+- `LoanScheduleModelDisbursementPeriod` — a disbursement row (period 0 effectively), used to mark when each tranche is expected.
+
+When a write service has to persist a fresh schedule it iterates the model's periods and constructs `LoanRepaymentScheduleInstallment` rows, one per `LoanScheduleModelRepaymentPeriod`.
+
+## LoanApplicationTerms
+
+The generators are pure-ish functions: they take `LoanApplicationTerms`, `HolidayDetailDTO`, optional charges, and `MathContext`, and they return a `LoanScheduleModel`. `LoanApplicationTerms` is the data carrier:
+
+```java
+public final class LoanApplicationTerms {
+    private final AmortizationMethod amortizationMethod;
+    private final InterestMethod interestMethod;
+    private final InterestCalculationPeriodMethod interestCalculationPeriodMethod;
+    private final Money principal;
+    private final Integer numberOfRepayments;
+    private final Integer repaymentEvery;
+    private final PeriodFrequencyType repaymentPeriodFrequencyType;
+    private final BigDecimal annualNominalInterestRate;
+    private final LocalDate expectedDisbursementDate;
+    private final LocalDate repaymentsStartingFromDate;
+    private final LoanScheduleType loanScheduleType;
+    private final LoanScheduleProcessingType loanScheduleProcessingType;
+    private final BigDecimal fixedEmiAmount;
+    private final Integer principalGrace;
+    private final Integer interestPaymentGrace;
+    private final Integer interestChargingGrace;
+    private final BigDecimal principalThresholdForLastInstalment;
+    private final List<DisbursementData> disbursementDatas;          // multi-tranche
+    private final List<LoanTermVariationsData> loanTermVariations;
+    private final BigDecimal fixedPrincipalPercentagePerInstallment;
+    // … 60+ fields total, built via the Builder inner class
+}
+```
+
+The `Builder` is used by `LoanScheduleAssembler` (in `fineract-provider`) to construct terms from the API JSON or from a `Loan` entity.
+
+## LoanScheduleType: cumulative vs progressive
+
+```java
+public enum LoanScheduleType {
+    CUMULATIVE("Cumulative"),
+    PROGRESSIVE("Progressive");
+}
+```
+
+Persisted as `loan_schedule_type` on the loan product (and copied into `LoanProductRelatedDetail`).
+
+- **Cumulative**: classic. Once the schedule is generated at disbursement, every transaction is allocated by a processor that walks the installments in order. The generators are `CumulativeFlatInterestLoanScheduleGenerator` and `CumulativeDecliningBalanceInterestLoanScheduleGenerator`.
+- **Progressive**: the modular post-1.10 model. The schedule rolls forward continuously and the `AdvancedPaymentScheduleTransactionProcessor` allocates with payment-allocation rules. The generator is in `fineract-progressive-loan` — see [Progressive loan overview](/progressive-loan/overview).
+
+## LoanScheduleProcessingType: horizontal vs vertical
+
+```java
+public enum LoanScheduleProcessingType {
+    HORIZONTAL("Horizontal"),
+    VERTICAL("Vertical");
+}
+```
+
+Only meaningful for `PROGRESSIVE`:
+
+- **Horizontal**: a payment fills each installment fully before moving to the next (penalty/fee/interest/principal of installment 1, then installment 2, …).
+- **Vertical**: a payment fills the same bucket across installments before moving to the next bucket (all penalties first, then all fees, then all interest, then all principal).
+
+The default for cumulative loans is horizontal; vertical is opt-in for progressive products.
+
+## Generators (overview)
+
+The interface is on [Schedule generator](/loan/loan-schedule-generator). The concrete implementations are:
+
+| Class | Module | Picks `LoanScheduleType` × `InterestMethod` |
+| --- | --- | --- |
+| `CumulativeFlatInterestLoanScheduleGenerator` | fineract-loan | CUMULATIVE × FLAT |
+| `CumulativeDecliningBalanceInterestLoanScheduleGenerator` | fineract-loan | CUMULATIVE × DECLINING_BALANCE |
+| `ProgressiveLoanScheduleGenerator` | fineract-progressive-loan | PROGRESSIVE × * |
+
+All three extend `AbstractCumulativeLoanScheduleGenerator` (which itself implements `LoanScheduleGenerator`). The shared logic — date generation, holiday adjustment, grace periods, EMI override, currency rounding — is in the abstract base and in `DefaultScheduledDateGenerator`.
+
+`LoanScheduleGeneratorFactory.create(LoanScheduleType, InterestMethod)` returns the right generator instance:
+
+```java
+@Component @RequiredArgsConstructor
+public class DefaultLoanScheduleGeneratorFactory implements LoanScheduleGeneratorFactory {
+    private final ProgressiveLoanScheduleGenerator                progressiveLoanScheduleGenerator;
+    private final CumulativeFlatInterestLoanScheduleGenerator     cumulativeFlatInterestLoanScheduleGenerator;
+    private final CumulativeDecliningBalanceInterestLoanScheduleGenerator
+                                                                  cumulativeDecliningBalanceInterestLoanScheduleGenerator;
+
+    @Override
+    public LoanScheduleGenerator create(LoanScheduleType loanScheduleType, InterestMethod interestMethod) {
+        return switch (loanScheduleType) {
+            case CUMULATIVE  -> cumulativeLoanScheduleGenerator(interestMethod);
+            case PROGRESSIVE -> progressiveLoanScheduleGenerator;
+        };
+    }
+
+    private LoanScheduleGenerator cumulativeLoanScheduleGenerator(InterestMethod interestMethod) {
+        return switch (interestMethod) {
+            case FLAT               -> cumulativeFlatInterestLoanScheduleGenerator;
+            case DECLINING_BALANCE  -> cumulativeDecliningBalanceInterestLoanScheduleGenerator;
+            case INVALID            -> null;
+        };
+    }
+}
+```
+
+## LoanRepaymentScheduleProcessingWrapper
+
+This non-entity utility (`fineract-loan/.../domain/LoanRepaymentScheduleProcessingWrapper.java`) sits between `LoanCharge`s and `LoanRepaymentScheduleInstallment`s. Its job is to fold the charge amounts into each installment's `feeChargesCharged` / `penaltyCharges` totals once the schedule rows already exist:
+
+```java
+public class LoanRepaymentScheduleProcessingWrapper {
+    public void reprocess(MonetaryCurrency currency, LocalDate disbursementDate,
+                          List<LoanRepaymentScheduleInstallment> repaymentPeriods, Set<LoanCharge> loanCharges) { … }
+}
+```
+
+It is called by the processor after a charge is added/waived to keep the installment-level fees correct. The single-charge variant is `SingleLoanChargeRepaymentScheduleProcessingWrapper`.
+
+## ScheduleGeneratorDTO
+
+`fineract-loan/.../data/ScheduleGeneratorDTO.java` is the parameter object that bundles everything needed to re-run the generator:
+
+```java
+public final class ScheduleGeneratorDTO {
+    final LoanScheduleGeneratorFactory loanScheduleFactory;
+    final CurrencyData currency;
+    final ApplicationCurrency applicationCurrency;
+    final LocalDate recalculateFrom;
+    final HolidayDetailDTO holidayDetailDTO;
+    final BigDecimal overdueCharge;
+    final Money overdueChargeAmount;
+    final boolean isInterestRecalculationEnabled;
+    final boolean isFirstRepaymentDateAllowedOnHoliday;
+    final boolean isInterestToBeRecoveredFirstWhenGreaterThanEMI;
+    final boolean isPrincipalCompoundingDisabledForOverdueLoans;
+    final LocalDate businessDate;
+    …
+}
+```
+
+Built by `LoanUtilService.buildScheduleGeneratorDTO(loan, recalcFromDate)` and passed into `LoanScheduleService.recreateLoanSchedule(...)`.
+
+## LoanScheduleService
+
+The orchestrator (in `fineract-loan/.../service/LoanScheduleService.java`) wraps the generators:
+
+```java
+public interface LoanScheduleService {
+    void   regenerateRepaymentSchedule(Loan loan, ScheduleGeneratorDTO dto);
+    LoanScheduleDTO rescheduleNextInstallments(Loan loan, LocalDate recalculateFrom,
+                                               ScheduleGeneratorDTO dto, boolean wasArchivedScheduleDeleted);
+    // …
+}
+```
+
+Concrete impl is `LoanScheduleServiceImpl`. Most write paths in `LoanWritePlatformServiceJpaRepositoryImpl` call `scheduleService.regenerateRepaymentSchedule(...)` after a state change that touches the schedule (disbursement, multi-tranche update, reschedule, charge applied during compounding window).
+
+## Querying the schedule
+
+Two API patterns return schedule data:
+
+1. **Loan template / loan-schedule template**: `LoanScheduleApiResource` (`fineract-loan/.../api/LoanScheduleApiResource.java`) runs the generator without persisting — used by the UI for previews.
+2. **Read of an existing loan**: `GET /v1/loans/{loanId}?associations=repaymentSchedule` calls `LoanReadPlatformService.retrieveRepaymentSchedule(...)` which materialises `LoanScheduleData` from the `m_loan_repayment_schedule` rows.
+
+The DTO chain is `LoanRepaymentScheduleInstallment → LoanRepaymentScheduleInstallmentData → LoanSchedulePeriodData → LoanScheduleData`. See [Loan read service](/loan/loan-read-service).
+
+## Repositories
+
+```java
+public interface LoanRepaymentScheduleInstallmentRepository
+        extends JpaRepository<LoanRepaymentScheduleInstallment, Long> {
+    List<LoanRepaymentScheduleInstallment> findByLoanIdAndDueDateGreaterThanEqual(Long loanId, LocalDate date);
+    // …
+}
+
+public interface LoanRepaymentScheduleHistoryRepository
+        extends JpaRepository<LoanRepaymentScheduleHistory, Long> {
+    List<LoanRepaymentScheduleHistory> findByLoanIdAndVersion(Long loanId, Integer version);
+}
+```
+
+Most of the time installments are reached through `Loan.repaymentScheduleInstallments` rather than the repository directly — the `@OrderBy("installmentNumber")` annotation guarantees the in-memory list is sorted.
+
+## Cross-references
+
+<CardGroup cols={2}>
+  <Card title="Loan domain model" icon="database" href="/loan/loan-domain-model">
+    The `Loan` entity that owns `repaymentScheduleInstallments` and `LoanSummary`.
+  </Card>
+  <Card title="Loan transactions" icon="arrow-right-arrow-left" href="/loan/loan-transactions">
+    `LoanTransactionToRepaymentScheduleMapping` — how transactions point into installments.
+  </Card>
+  <Card title="Schedule generator" icon="table" href="/loan/loan-schedule-generator">
+    The factory and concrete generators that produce `LoanScheduleModel` and ultimately `LoanRepaymentScheduleInstallment` rows.
+  </Card>
+  <Card title="Transaction processors" icon="filter" href="/loan/transaction-processors">
+    The strategies that walk the installment list to allocate each payment.
+  </Card>
+  <Card title="Progressive loan overview" icon="arrows-rotate" href="/progressive-loan/overview">
+    The progressive scheduler + advanced payment allocation.
+  </Card>
+</CardGroup>

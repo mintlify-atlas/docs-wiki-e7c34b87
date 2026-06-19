@@ -1,0 +1,487 @@
+---
+title: "Buy-Down Fee Feature for Progressive Loans Reference"
+sidebarTitle: "Buy-Down Fee"
+description: "Buy-down fees on progressive loans: domain model, write services, command handlers, COB amortization step, accounting impact, and REST endpoints."
+---
+
+A **buy-down fee** is an up-front fee paid by a third party (typically a merchant) at the start of an Apache Fineract progressive loan to "buy down" the borrower's effective rate or to subsidise interest. Operationally it is captured as a `LoanTransaction` of type `BUY_DOWN_FEE`, recorded in a dedicated balance table (`m_loan_buy_down_fee_balance`), and amortized daily by a COB business step that recognises the deferred income (fee or interest) over the life of the loan. The feature lives partly in `fineract-loan` (event types, processing-service interface, configuration enums) and partly in `fineract-progressive-loan` (entity, repository, REST resource, command handler, write service) — and the amortization COB step ships in `fineract-provider`.
+
+## Configuration enums
+
+Buy-down fees are controlled by three product-level enums declared in `fineract-loan/.../portfolio/loanaccount/domain/`:
+
+```java
+public enum LoanBuyDownFeeCalculationType implements ApiFacingEnum<LoanBuyDownFeeCalculationType> {
+    FLAT("loanBuyDownFeeCalculationType.flat", "Flat");
+}
+
+public enum LoanBuyDownFeeStrategy implements ApiFacingEnum<LoanBuyDownFeeStrategy> {
+    EQUAL_AMORTIZATION("buyDownFee.strategy.equalAmortization", "Equal amortization");
+}
+
+public enum LoanBuyDownFeeIncomeType implements ApiFacingEnum<LoanBuyDownFeeIncomeType> {
+    FEE("buyDownFee.incomeType.fee",      "Fee"),
+    INTEREST("buyDownFee.incomeType.interest", "Interest");
+}
+```
+
+| Enum | Today's values | Meaning |
+| --- | --- | --- |
+| `LoanBuyDownFeeCalculationType` | `FLAT` | The fee amount is provided directly — no percentage-on-anything calculation |
+| `LoanBuyDownFeeStrategy` | `EQUAL_AMORTIZATION` | The fee is recognized evenly across remaining days of the loan |
+| `LoanBuyDownFeeIncomeType` | `FEE`, `INTEREST` | Whether the recognised income lands in the GL fee-income account or the interest-income account |
+
+These three are persisted on the loan product (`LoanProductRelatedDetail`) and on each loan (`LoanProductRelatedDetail`).
+
+## Domain entity — `LoanBuyDownFeeBalance`
+
+```java
+@Entity
+@Table(name = "m_loan_buy_down_fee_balance")
+@Getter
+@Setter
+public class LoanBuyDownFeeBalance extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @Version
+    private Long version;
+
+    @ManyToOne
+    @JoinColumn(name = "loan_id", nullable = false)
+    private Loan loan;
+
+    @ManyToOne
+    @JoinColumn(name = "loan_transaction_id", nullable = false)
+    private LoanTransaction loanTransaction;       // The originating BUY_DOWN_FEE transaction
+
+    @Column(name = "amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal amount;                     // Original fee amount
+
+    @Column(name = "date", nullable = false)
+    private LocalDate date;                        // Effective date
+
+    @Column(name = "unrecognized_amount", scale = 6, precision = 19, nullable = false)
+    private BigDecimal unrecognizedAmount;         // Still-to-amortize portion
+
+    @Column(name = "charged_off_amount", scale = 6, precision = 19)
+    private BigDecimal chargedOffAmount;           // Portion written off at charge-off time
+
+    @Column(name = "amount_adjustment", scale = 6, precision = 19)
+    private BigDecimal amountAdjustment;           // Sum of adjustments applied via adjustment txns
+
+    @Column(name = "is_deleted", nullable = false)
+    private boolean deleted = false;
+
+    @Column(name = "is_closed", nullable = false)
+    private boolean closed = false;
+}
+```
+
+`AbstractAuditableWithUTCDateTimeCustom` is the core auditing superclass — see [Core overview](/core/overview). The `@Version` column powers optimistic locking when two daily amortization runs race.
+
+A single loan can carry multiple `LoanBuyDownFeeBalance` rows — one per top-up call to the API. Adjustments do not create new rows; they update `amountAdjustment` on the existing balance.
+
+## Repository
+
+```
+fineract-progressive-loan/.../repository/LoanBuyDownFeeBalanceRepository.java
+```
+
+Standard Spring Data JPA repository plus a few finder methods used by the COB step and the read service.
+
+## Read DTOs
+
+`fineract-progressive-loan/.../data/BuyDownFeeAmortizationDetails.java`:
+
+```java
+public record BuyDownFeeAmortizationDetails(
+        Long id, Long loanId, Long transactionId,
+        LocalDate buyDownFeeDate, BigDecimal buyDownFeeAmount,
+        BigDecimal amortizedAmount, BigDecimal notYetAmortizedAmount,
+        BigDecimal adjustedAmount, BigDecimal chargedOffAmount) {
+}
+```
+
+This record is what `GET /v1/loans/{id}/buydown-fees` returns — see [Progressive Loan API](/progressive-loan/progressive-loan-api) for the full surface.
+
+## Write service — `BuyDownFeeWritePlatformServiceImpl`
+
+```java
+@RequiredArgsConstructor
+public class BuyDownFeeWritePlatformServiceImpl implements BuyDownFeePlatformService {
+
+    private final ProgressiveLoanTransactionValidator loanTransactionValidator;
+    private final LoanAssembler loanAssembler;
+    private final LoanTransactionRepository loanTransactionRepository;
+    private final PaymentDetailWritePlatformService paymentDetailWritePlatformService;
+    private final LoanJournalEntryPoster loanJournalEntryPoster;
+    private final ExternalIdFactory externalIdFactory;
+    private final LoanBuyDownFeeBalanceRepository loanBuyDownFeeBalanceRepository;
+    private final BusinessEventNotifierService businessEventNotifierService;
+    private final CodeValueRepository codeValueRepository;
+    private final ApplicationEventPublisher eventPublisher;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult makeLoanBuyDownFee(final Long loanId, final JsonCommand command) {
+        this.loanTransactionValidator.validateBuyDownFee(command, loanId);
+        final Loan loan = this.loanAssembler.assembleFrom(loanId);
+        checkClientOrGroupActive(loan);
+
+        final Map<String, Object> changes = new LinkedHashMap<>();
+        final PaymentDetail paymentDetail = this.paymentDetailWritePlatformService
+                .createAndPersistPaymentDetail(command, changes);
+
+        final LocalDate transactionDate = command.localDateValueOfParameterNamed("transactionDate");
+        final BigDecimal transactionAmount = command.bigDecimalValueOfParameterNamed("transactionAmount");
+        final ExternalId txnExternalId = externalIdFactory.createFromCommand(command, "externalId");
+
+        // FLAT calculation today — amount as provided
+        final Money buyDownFeeAmount = Money.of(loan.getCurrency(), transactionAmount);
+        final LoanTransaction buyDownFeeTransaction = LoanTransaction.buyDownFee(loan, buyDownFeeAmount,
+                paymentDetail, transactionDate, txnExternalId);
+
+        // 1. Attach the transaction to the loan — NO schedule recalculation
+        loan.addLoanTransaction(buyDownFeeTransaction);
+
+        // 2. Optionally tag the transaction with a classification code
+        addClassificationCodeToTransaction(command,
+                LoanTransactionApiConstants.BUY_DOWN_FEE_CLASSIFICATION_CODE, buyDownFeeTransaction);
+
+        // 3. Persist + flush so PK is available
+        loanTransactionRepository.saveAndFlush(buyDownFeeTransaction);
+
+        // 4. Create the m_loan_buy_down_fee_balance row
+        createBuyDownFeeBalance(buyDownFeeTransaction);
+
+        // 5. Note text
+        final String noteText = command.stringValueOfParameterNamed("note");
+        if (StringUtils.isNotBlank(noteText)) {
+            eventPublisher.publishEvent(NoteCreateRequest.builder()
+                    .type(NoteType.LOAN_TRANSACTION).resourceId(buyDownFeeTransaction.getId())
+                    .note(noteText).build());
+        }
+
+        // 6. Post the initial journal entry: Cash DR, deferred income CR
+        loanJournalEntryPoster.postJournalEntriesForLoanTransaction(buyDownFeeTransaction, false, false);
+
+        // 7. Fire external business event
+        businessEventNotifierService.notifyPostBusinessEvent(
+                new LoanBuyDownFeeTransactionCreatedBusinessEvent(buyDownFeeTransaction));
+
+        return new CommandProcessingResultBuilder()
+                .withClientId(loan.getClientId())
+                .withOfficeId(loan.getOfficeId())
+                .withLoanId(loan.getId())
+                .withEntityId(buyDownFeeTransaction.getId())
+                .withEntityExternalId(buyDownFeeTransaction.getExternalId())
+                .build();
+    }
+    // ...
+}
+```
+
+Key things the write service deliberately **doesn't** do:
+
+* No call to `ReprocessLoanTransactionsService` — adding a buy-down fee does NOT alter the schedule, EMI or interest model. This is intentional: the fee is a balance-sheet event, not a borrower-facing schedule mutation. Compare with `CapitalizedIncomeWritePlatformServiceImpl` which DOES recalculate the schedule.
+* No mutation of `LoanRepaymentScheduleInstallment` rows.
+* No call to `LoanLifecycleStateMachine` — the loan's lifecycle is not affected.
+
+## Adjustment flow — `buyDownFeeAdjustment(...)`
+
+The same service exposes a second method to **reduce** (or otherwise adjust) the unrecognized portion of a buy-down fee:
+
+```java
+@Override
+@Transactional
+public CommandProcessingResult buyDownFeeAdjustment(final Long loanId, final Long buyDownFeeTransactionId, final JsonCommand command) {
+    this.loanTransactionValidator.validateBuyDownFeeAdjustment(command, loanId, buyDownFeeTransactionId);
+    final Loan loan = this.loanAssembler.assembleFrom(loanId);
+    checkClientOrGroupActive(loan);
+    // ... creates a BUY_DOWN_FEE_ADJUSTMENT LoanTransaction, decrements unrecognized_amount,
+    //     posts journal entries, fires LoanBuyDownFeeAdjustmentTransactionCreatedBusinessEvent
+}
+```
+
+The adjustment transaction is linked to the originating buy-down-fee transaction via `LoanTransactionRelation`.
+
+## Command handlers
+
+Two `NewCommandSourceHandler` implementations in `fineract-progressive-loan/.../handler/`:
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "BUYDOWNFEE")
+public class AddBuyDownFeeCommandHandler implements NewCommandSourceHandler {
+    private final BuyDownFeePlatformService buyDownFeePlatformService;
+    private final DataIntegrityErrorHandler dataIntegrityErrorHandler;
+
+    @Transactional
+    @Override
+    public CommandProcessingResult processCommand(final JsonCommand command) {
+        try {
+            return this.buyDownFeePlatformService.makeLoanBuyDownFee(command.getLoanId(), command);
+        } catch (final JpaSystemException | DataIntegrityViolationException dve) {
+            dataIntegrityErrorHandler.handleDataIntegrityIssues(command, dve.getMostSpecificCause(), dve,
+                    "loan.buy.down.fee", "Buy Down Fee");
+            return CommandProcessingResult.empty();
+        }
+    }
+}
+```
+
+```java
+@Service
+@RequiredArgsConstructor
+@CommandType(entity = "LOAN", action = "BUYDOWNFEEADJUSTMENT")
+public class BuyDownFeeAdjustmentCommandHandler implements NewCommandSourceHandler { ... }
+```
+
+`@CommandType(entity = "LOAN", action = "BUYDOWNFEE")` is how the CQRS pipeline routes incoming JSON commands to this handler — see [Command overview](/command/overview) for the maker-checker chain.
+
+## COB amortization business step
+
+The daily worker that converts unrecognized buy-down fee into recognized income is `BuyDownFeeAmortizationBusinessStep` (in `fineract-provider/src/main/java/org/apache/fineract/cob/loan/BuyDownFeeAmortizationBusinessStep.java`):
+
+```java
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class BuyDownFeeAmortizationBusinessStep implements LoanCOBBusinessStep {
+
+    private final LoanBuyDownFeeAmortizationProcessingService loanBuyDownFeeAmortizationProcessingService;
+
+    @Transactional
+    @Override
+    public Loan execute(Loan loan) {
+        if (!loan.getLoanProductRelatedDetail().isEnableBuyDownFee()) {
+            return loan;
+        }
+
+        LocalDate businessDate = DateUtils.getBusinessLocalDate();
+
+        loanBuyDownFeeAmortizationProcessingService.processBuyDownFeeAmortizationTillDate(loan, businessDate, true);
+
+        return loan;
+    }
+
+    @Override
+    public String getEnumStyledName()    { return "BUY_DOWN_FEE_AMORTIZATION"; }
+
+    @Override
+    public String getHumanReadableName() { return "Buy Down Fee amortization"; }
+}
+```
+
+* It is `LoanCOBBusinessStep` — picked up by the `LOAN_COB` job.
+* It short-circuits when the loan product has `enableBuyDownFee = false`.
+* Its `enumStyledName` is `BUY_DOWN_FEE_AMORTIZATION`. The step is **available-only** by default — admins must add it to the step list via `PUT /v1/jobs/LOAN_COB/steps`. See [Loan COB business steps](/cob/loan-cob-business-steps).
+* The third argument `addJournal = true` tells the processing service to emit `JournalEntry` rows for the recognised portion.
+
+## The processing service interface
+
+The actual amortization arithmetic is the responsibility of `LoanBuyDownFeeAmortizationProcessingService` (defined in `fineract-loan`, implemented in the platform):
+
+```java
+public interface LoanBuyDownFeeAmortizationProcessingService {
+
+    void processBuyDownFeeAmortizationTillDate(@NonNull Loan loan, @NonNull LocalDate tillDate, boolean addJournal);
+
+    void processBuyDownFeeAmortizationOnLoanClosure(@NonNull Loan loan, boolean addJournal);
+
+    void processBuyDownFeeAmortizationOnLoanChargeOff(@NonNull Loan loan, @NonNull LoanTransaction chargeOffTransaction);
+
+    void processBuyDownFeeAmortizationOnLoanUndoChargeOff(@NonNull LoanTransaction loanTransaction);
+}
+```
+
+| Method | When called |
+| --- | --- |
+| `processBuyDownFeeAmortizationTillDate` | Daily by the COB step; also called on transaction events that require catch-up amortization |
+| `processBuyDownFeeAmortizationOnLoanClosure` | When the loan is fully repaid — flush the rest of the unrecognized balance as income |
+| `processBuyDownFeeAmortizationOnLoanChargeOff` | When `CHARGE_OFF` is processed — move unrecognized to `chargedOffAmount`, post a charge-off accounting hit |
+| `processBuyDownFeeAmortizationOnLoanUndoChargeOff` | When a charge-off is reversed — reinstate the unrecognized balance |
+
+The default implementation (`AdvancedBuyDownFeeAmortizationProcessingService`) calculates per-day recognition as:
+
+```
+dailyRecognition = unrecognizedAmount / remainingDaysToMaturity   (EQUAL_AMORTIZATION strategy)
+amountToRecognizeToday = max(dailyRecognition × daysSinceLastRun, 0)
+```
+
+It then creates one `BUY_DOWN_FEE_AMORTIZATION` `LoanTransaction` per day (or per catch-up window) and decrements `unrecognizedAmount`.
+
+## Transaction types involved
+
+The buy-down fee feature uses four `LoanTransactionType` values:
+
+| Enum | Purpose | Created by |
+| --- | --- | --- |
+| `BUY_DOWN_FEE` | Initial fee inflow | `makeLoanBuyDownFee(...)` |
+| `BUY_DOWN_FEE_ADJUSTMENT` | Manual reduction of the unrecognized balance | `buyDownFeeAdjustment(...)` |
+| `BUY_DOWN_FEE_AMORTIZATION` | Daily income recognition | `BuyDownFeeAmortizationBusinessStep` via the processing service |
+| `BUY_DOWN_FEE_AMORTIZATION_ADJUSTMENT` | Reverses an over-recognised amortization (e.g. on undo charge-off) | Processing service on undo paths |
+
+Each emits its own `BusinessEvent`:
+
+* `LoanBuyDownFeeTransactionCreatedBusinessEvent`
+* `LoanBuyDownFeeAdjustmentTransactionCreatedBusinessEvent`
+* `LoanBuyDownFeeAmortizationTransactionCreatedBusinessEvent`
+* `LoanBuyDownFeeAmortizationAdjustmentTransactionCreatedBusinessEvent`
+
+All four are defined in `fineract-loan/.../infrastructure/event/business/domain/loan/transaction/`.
+
+## Accounting impact
+
+The journal-entry shape depends on the `LoanBuyDownFeeIncomeType` configured on the loan product.
+
+### At fee booking (BUY_DOWN_FEE transaction)
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Suspense / cash receivable from merchant | fee amount |
+| CR | Deferred buy-down-fee income (liability) | fee amount |
+
+### At each daily amortization (BUY_DOWN_FEE_AMORTIZATION transaction)
+
+When `incomeType == FEE`:
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Deferred buy-down-fee income (liability) | recognized portion |
+| CR | Fee income (`INCOME_FROM_FEES`) | recognized portion |
+
+When `incomeType == INTEREST`:
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Deferred buy-down-fee income (liability) | recognized portion |
+| CR | Interest income (`INTEREST_ON_LOAN`) | recognized portion |
+
+Posting is performed by `LoanJournalEntryPoster.postJournalEntriesForLoanTransaction(...)`, which delegates to the standard accounting processors documented in [Accounting processors](/accounting/accounting-processors). The mapping from transaction type to (DR, CR) accounts lives in `LoanProductGLAccountMapping` overrides.
+
+### At charge-off (CHARGE_OFF transaction)
+
+| | Account | Amount |
+| --- | --- | --- |
+| DR | Charged-off buy-down-fee expense | remaining unrecognized |
+| CR | Deferred buy-down-fee income (liability) | remaining unrecognized |
+
+`chargedOffAmount` on the balance row is incremented; subsequent COB runs see `unrecognizedAmount == 0` and skip the loan.
+
+## REST surface (read)
+
+Endpoints are exposed by `LoanBuyDownFeeApiResource` at `@Path("/v1/loans")`:
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| GET | `/v1/loans/{loanId}/buydown-fees` | `List<BuyDownFeeAmortizationDetails>` |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees` | `List<BuyDownFeeAmortizationDetails>` |
+| GET | `/v1/loans/{loanId}/buydown-fees/{loanTransactionId}` | `LoanAmortizationAllocationApiResource.LoanAmortizationAllocationResponse` (JSON via `DefaultToApiJsonSerializer`) |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/{loanTransactionId}` | same |
+| GET | `/v1/loans/{loanId}/buydown-fees/external-id/{loanTransactionExternalId}` | same, txn lookup by external id |
+| GET | `/v1/loans/external-id/{loanExternalId}/buydown-fees/external-id/{loanTransactionExternalId}` | same |
+
+```java
+@Path("/{loanId}/buydown-fees")
+@GET
+@Consumes({ MediaType.APPLICATION_JSON })
+@Produces({ MediaType.APPLICATION_JSON })
+@Operation(summary = "Get the amortization details of Buy Down fees for a loan",
+           description = "Returns a list of all Buy Down fee entries with amortization details for the specified loan.")
+@ApiResponse(responseCode = "200", description = "OK",
+             content = @Content(array = @ArraySchema(schema = @Schema(implementation = BuyDownFeeAmortizationDetails.class))))
+public List<BuyDownFeeAmortizationDetails> retrieveLoanBuyDownFeeAmortizationDetails(
+        @PathParam("loanId") @Parameter(description = "loanId", required = true) final Long loanId) {
+    this.context.authenticatedUser().validateHasReadPermission(RESOURCE_NAME_FOR_PERMISSIONS);
+    return this.buyDownFeeReadPlatformService.retrieveLoanBuyDownFeeAmortizationDetails(loanId);
+}
+```
+
+The single-transaction endpoints return a `LoanAmortizationAllocationData` payload (serialized through `DefaultToApiJsonSerializer<LoanAmortizationAllocationData>`) that itemises each daily recognition row produced from the transaction.
+
+## REST surface (write)
+
+Write endpoints are the standard loan-transaction endpoints with `command` query parameters; they pipe into the command handlers above:
+
+| Method | Path | Command |
+| --- | --- | --- |
+| POST | `/v1/loans/{loanId}/transactions?command=buyDownFee` | `LOAN/BUYDOWNFEE` |
+| POST | `/v1/loans/{loanId}/transactions/{txnId}?command=buyDownFeeAdjustment` | `LOAN/BUYDOWNFEEADJUSTMENT` |
+
+Required body:
+
+```json
+{
+  "transactionDate": "10 November 2025",
+  "transactionAmount": 1000.00,
+  "externalId": "merchant-bd-2025-11-10-001",
+  "note": "Initial buy-down from MerchantX",
+  "paymentTypeId": 1,
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+## End-to-end lifecycle
+
+```mermaid
+flowchart TD
+    Client[Merchant pays buy-down fee]
+    POST[POST /v1/loans/{id}/transactions?command=buyDownFee]
+    Handler[AddBuyDownFeeCommandHandler]
+    Svc[BuyDownFeeWritePlatformServiceImpl.makeLoanBuyDownFee]
+    Txn[Create LoanTransaction BUY_DOWN_FEE]
+    Bal[Create LoanBuyDownFeeBalance row]
+    JE1[Initial journal entry: cash -> deferred income]
+    EVT[Fire LoanBuyDownFeeTransactionCreatedBusinessEvent]
+
+    COB[Daily LOAN_COB step BUY_DOWN_FEE_AMORTIZATION]
+    ProcSvc[LoanBuyDownFeeAmortizationProcessingService]
+    AmortTxn[Create BUY_DOWN_FEE_AMORTIZATION LoanTransaction]
+    DecBal[Decrement unrecognized_amount]
+    JE2[Journal: deferred income -> fee/interest income]
+    EVT2[LoanBuyDownFeeAmortizationTransactionCreatedBusinessEvent]
+
+    ChargeOff[CHARGE_OFF transaction]
+    ProcSvcCO[processBuyDownFeeAmortizationOnLoanChargeOff]
+    JE3[Journal: deferred income -> charged-off buy-down-fee expense]
+
+    Close[Loan fully repaid]
+    ProcSvcCl[processBuyDownFeeAmortizationOnLoanClosure]
+    JE4[Flush remaining unrecognized as final income]
+
+    Client --> POST --> Handler --> Svc --> Txn --> Bal --> JE1 --> EVT
+
+    Bal -. polled daily .-> COB
+    COB --> ProcSvc --> AmortTxn --> DecBal --> JE2 --> EVT2
+    ProcSvc -. loop until tillDate .-> COB
+
+    Bal -. on charge-off .-> ProcSvcCO
+    ChargeOff --> ProcSvcCO --> JE3
+
+    Bal -. on closure .-> ProcSvcCl
+    Close --> ProcSvcCl --> JE4
+```
+
+## Validation
+
+`ProgressiveLoanTransactionValidatorImpl` provides `validateBuyDownFee(...)` and `validateBuyDownFeeAdjustment(...)`. Key invariants enforced:
+
+* The loan must be **progressive** (`loan.isProgressiveSchedule()`).
+* The loan product must have `enableBuyDownFee = true`.
+* `transactionAmount > 0`.
+* `transactionDate` must not be before the loan disbursement date nor after the business date.
+* For adjustments: `transactionAmount <= existingBalance.unrecognizedAmount` so we don't recognise negative deferred income.
+
+## Why buy-down fees DO NOT touch the schedule
+
+Look at `makeLoanBuyDownFee(...)` again — it has no call to `reprocessLoanTransactions(...)` or `loanScheduleService.regenerateSchedule(...)`. The borrower's principal, interest and EMI are unaffected. The fee changes only the **lender's** P&L recognition shape, not the borrower's repayment obligation. Contrast with [Capitalized income](/progressive-loan/capitalized-income), which DOES recalculate the schedule because capitalized income increases the borrower's amortizing principal.
+
+## Cross references
+
+* The COB business step catalog and ordering — [Loan COB business steps](/cob/loan-cob-business-steps).
+* Loan domain that owns `LoanTransaction` — [Loan overview](/loan/overview).
+* Where the transaction's journal entries are generated — [Accounting processors](/accounting/accounting-processors).
+* The progressive transaction processor that handles ALL other transaction types (charge-off, repayment, etc.) — [Progressive transaction processors](/progressive-loan/progressive-transaction-processors).
+* The HTTP surface index — [Progressive Loan API](/progressive-loan/progressive-loan-api).

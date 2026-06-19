@@ -1,0 +1,271 @@
+---
+title: "Payment Types: Cash vs ACH and the PaymentType API"
+sidebarTitle: "Payment Types"
+description: "Reference for the PaymentType domain entity, PaymentTypeApiResource, command pipeline integration, system-defined types and how cash vs ACH is enforced."
+---
+
+Apache Fineract uses `PaymentType` as the catalogue of "ways money can move" for every monetary transaction it records — loan repayments, savings deposits/withdrawals, share purchases, charge payments, accounting entries, journal lines. The entity is intentionally tiny — a name, a description, a flag separating cash from non-cash, and an ordering hint — but it is referenced by `PaymentDetail` (see [/portfolio/payment-details](/portfolio/payment-details)) on essentially every transaction table in the system, and it is the discriminator used by the accounting layer to decide whether a movement hits the cash account or a clearing/suspense account.
+
+This page is the reference for the entity, the REST resource that maintains the catalogue, the new `CommandPipeline` integration the resource uses, and the cash-versus-ACH semantics. All code lives in `fineract-core` so any module can reuse it.
+
+## Module layout
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `PaymentType` entity | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.domain` |
+| `PaymentTypeRepository`, `PaymentTypeRepositoryWrapper` | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.domain` |
+| `PaymentTypeApiResource` (JAX-RS) | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.api` |
+| `PaymentTypeCreateCommand`, `PaymentTypeUpdateCommand`, `PaymentTypeDeleteCommand` | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.command` |
+| `PaymentTypeCreateRequest`/`Response`, `PaymentTypeUpdateRequest`/`Response`, `PaymentTypeDeleteRequest`/`Response`, `PaymentTypeData` | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.data` |
+| `PaymentTypeCreateCommandHandler`, `PaymentTypeUpdateCommandHandler`, `PaymentTypeDeleteCommandHandler` | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.handler` |
+| `PaymentTypeNotFoundException` | `fineract-core` | `org.apache.fineract.portfolio.paymenttype.exception` |
+
+Because the package lives in `fineract-core`, no module needs a Spring-bean alias to look up payment types — it can inject the wrapper directly.
+
+## Entity
+
+`PaymentType` is a flat record with no relationships:
+
+```java
+// fineract-core/.../portfolio/paymenttype/domain/PaymentType.java
+@Getter
+@Setter
+@Entity
+@Table(name = "m_payment_type")
+@NoArgsConstructor
+@AllArgsConstructor
+public class PaymentType extends AbstractPersistableCustom<Long> {
+
+    @Column(name = "value")
+    private String name;
+
+    @Column(name = "description")
+    private String description;
+
+    @Column(name = "is_cash_payment")
+    private Boolean isCashPayment;
+
+    @Column(name = "order_position")
+    private Long position;
+
+    @Column(name = "code_name")
+    private String codeName;
+
+    @Column(name = "is_system_defined")
+    private Boolean isSystemDefined;
+}
+```
+
+Field semantics:
+
+- **`name`** — human-readable label. Loan / savings transactions show it on receipts and statements. Stored in the column `value` for historical reasons.
+- **`description`** — free text shown on configuration screens.
+- **`isCashPayment`** — the crucial flag. When `true` the payment type is "real cash" and the accounting layer posts the transaction to the cash GL account. When `false` it represents a non-cash movement (ACH, RTGS, mobile money, card, cheque) and the transaction posts to a clearing or suspense account configured on the product. See [/accounting/overview](/accounting/overview) for how the choice flows into journal entries.
+- **`position`** — used to keep the catalogue in a stable order on UI dropdowns.
+- **`codeName`** — optional reference into the generic Code framework, useful for grouping or external mapping.
+- **`isSystemDefined`** — protects builtin types from deletion. `true` for any type the system itself created (e.g. through migrations) so an operator cannot accidentally drop "Cash" while live loans reference it.
+
+All fields are nullable except the Lombok-driven id and the JPA constraints; in practice every catalogue row carries at least `name` and `isCashPayment`.
+
+## Lifecycle
+
+The lifecycle is plain CRUD — no submitted/approved states. Persistence runs through `PaymentTypeRepository` (a Spring Data JPA repository) and `PaymentTypeRepositoryWrapper` which throws `PaymentTypeNotFoundException` when an id is missing.
+
+`PaymentTypeNotFoundException` extends `AbstractPlatformResourceNotFoundException` with `error.msg.payment.type.not.found` and is mapped to HTTP 404 by the global exception mapper.
+
+## REST surface
+
+The endpoint is mounted at `/v1/paymenttypes`. The resource is one of the few in the codebase that uses the new `CommandPipeline` instead of the legacy `PortfolioCommandSourceWritePlatformService`:
+
+```java
+// fineract-core/.../portfolio/paymenttype/api/PaymentTypeApiResource.java
+@Path("/v1/paymenttypes")
+@Component
+@Tag(name = "Payment Type", description = "This defines the payment type")
+@RequiredArgsConstructor
+public class PaymentTypeApiResource {
+
+    private final PaymentTypeReadService readPlatformService;
+    private final CommandPipeline commandPipeline;
+    private final DefaultToApiJsonSerializer<PaymentTypeData> jsonSerializer;
+```
+
+### GET — list
+
+```java
+@GET
+@Operation(summary = "Retrieve all Payment Types", description = "Retrieve list of payment types")
+public List<PaymentTypeData> getAllPaymentTypes(@QueryParam("onlyWithCode") final boolean onlyWithCode) {
+    return onlyWithCode
+            ? readPlatformService.retrieveAllPaymentTypesWithCode()
+            : readPlatformService.retrieveAllPaymentTypes();
+}
+```
+
+`?onlyWithCode=true` restricts the list to payment types that have `codeName` set — useful for UIs that want the subset paired with a Code framework lookup.
+
+### GET — by id
+
+```java
+@GET
+@Path("{paymentTypeId}")
+@Operation(summary = "Retrieve a Payment Type", description = "Retrieves a payment type")
+public PaymentTypeData retrieveOnePaymentType(@PathParam("paymentTypeId") final Long paymentTypeId) {
+    return readPlatformService.retrieveOne(paymentTypeId);
+}
+```
+
+### POST — create
+
+```java
+@POST
+public PaymentTypeCreateResponse createPaymentType(PaymentTypeCreateRequest request) {
+    final var command = new PaymentTypeCreateCommand();
+    command.setPayload(request);
+    final Supplier<PaymentTypeCreateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+`PaymentTypeCreateRequest` is a Lombok DTO with `name`, `description`, `isCashPayment`, `position`, `codeName`. `PaymentTypeCreateResponse` returns the new id and the persisted record so clients don't have to round-trip a `GET`.
+
+### PUT — update
+
+```java
+@PUT
+@Path("{paymentTypeId}")
+public PaymentTypeUpdateResponse updatePaymentType(@PathParam("paymentTypeId") final Long paymentTypeId,
+                                                   final PaymentTypeUpdateRequest request) {
+    request.setId(paymentTypeId);
+    final var command = new PaymentTypeUpdateCommand();
+    command.setPayload(request);
+    final Supplier<PaymentTypeUpdateResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+### DELETE
+
+```java
+@DELETE
+@Path("{paymentTypeId}")
+@Operation(summary = "Delete a Payment Type", operationId = "deleteCodePaymentType")
+public PaymentTypeDeleteResponse deleteCode(@PathParam("paymentTypeId") final Long paymentTypeId) {
+    final var command = new PaymentTypeDeleteCommand();
+    command.setPayload(PaymentTypeDeleteRequest.builder().id(paymentTypeId).build());
+    final Supplier<PaymentTypeDeleteResponse> response = commandPipeline.send(command);
+    return response.get();
+}
+```
+
+If the type is `isSystemDefined=true`, the delete handler refuses with `PaymentTypeNotDeletableException` (mapped to HTTP 403). Likewise, a payment type still referenced by `m_payment_detail` rows raises a foreign-key violation at the database level — the read API exposes a "used by" count via the wrapper, but deletion is best done after verifying with a query.
+
+## Command pipeline integration
+
+Unlike the legacy `commandsSourceWritePlatformService.logCommandSource(...)` path, `PaymentTypeApiResource` uses the modern `CommandPipeline` directly. Each command is a typed object:
+
+```java
+// fineract-core/.../portfolio/paymenttype/command/PaymentTypeCreateCommand.java
+public final class PaymentTypeCreateCommand implements Command<PaymentTypeCreateRequest, PaymentTypeCreateResponse> {
+    private PaymentTypeCreateRequest payload;
+    public void setPayload(PaymentTypeCreateRequest payload) { this.payload = payload; }
+    @Override public PaymentTypeCreateRequest getPayload() { return payload; }
+}
+```
+
+The matching handler — `PaymentTypeCreateCommandHandler` — is a Spring component that the pipeline discovers by the command type. It validates the payload, calls `paymentTypeMapper.mapFrom(request)`, persists through the repository and returns a `PaymentTypeCreateResponse`. The pipeline transparently handles auditing, maker-checker enrolment and idempotency keys.
+
+See [/command/overview](/command/overview) for the pipeline architecture; this resource is one of the cleanest examples to follow when migrating other resources from the legacy path.
+
+## Cash vs ACH semantics
+
+The single most important attribute on a payment type is `isCashPayment`. It changes:
+
+- **Accounting** — Cash payments post to the cash GL account of the product. Non-cash payments post to the configured fund-source / clearing account. See [/accounting/overview](/accounting/overview) and the per-product "cash vs accrual" rules.
+- **Receipts** — Cash payments do not require any of the bank fields on `PaymentDetail`. ACH/RTGS/cheque types normally come with `accountNumber`, `routingCode`, `bankNumber` and optionally `checkNumber`.
+- **Reporting** — Daily-balance and reconciliation reports filter by `is_cash_payment` to compute teller positions.
+
+Operational guidance: a typical Fineract install seeds a small catalogue at install time, then adds local types as the financial institution rolls out channels. Common examples seen in production:
+
+| `name` | `isCashPayment` | `codeName` | Typical use |
+| --- | --- | --- | --- |
+| Cash | true | — | Branch teller |
+| ACH | false | `ACH` | Bulk credit/debit |
+| RTGS | false | `RTGS` | Large value transfer |
+| Cheque | false | `CHEQUE` | Customer cheque drop |
+| Mobile money | false | `MM` | M-Pesa / Airtel Money |
+| Card | false | `CARD` | POS / debit |
+| Adjustment | true | — | Manual correction at branch |
+
+`isSystemDefined=true` is usually reserved for "Cash" and "Adjustment".
+
+## Where `PaymentType` is referenced
+
+Every transaction-bearing entity that supports payment metadata holds a foreign key into `m_payment_type` indirectly through `m_payment_detail`. The detail entity itself is documented in [/portfolio/payment-details](/portfolio/payment-details); briefly the chain is:
+
+```
+LoanTransaction          ─┐
+SavingsAccountTransaction │
+ShareAccountTransaction   ├──▶ PaymentDetail (m_payment_detail) ──▶ PaymentType (m_payment_type)
+JournalEntry              │
+ClientTransaction        ─┘
+```
+
+When a transaction is created via REST, the request body carries either `paymentTypeId` (preferred) or `paymentTypeId` plus the optional bank fields. The transaction's write service calls `PaymentDetailWritePlatformService.createAndPersistPaymentDetail(command, changes)` which resolves the type via `PaymentTypeRepositoryWrapper.findOneWithNotFoundDetection(paymentTypeId)`. If the id is absent, no `PaymentDetail` row is created — meaning "default channel" semantics for the product.
+
+## Mappers and template
+
+The package contains a MapStruct-style mapper (`PaymentTypeMapper`) used by the read service and the create-request handler to convert between `PaymentType` ↔ `PaymentTypeData` ↔ `PaymentTypeCreateRequest`. The read service exposes:
+
+```java
+List<PaymentTypeData> retrieveAllPaymentTypes();
+List<PaymentTypeData> retrieveAllPaymentTypesWithCode();
+PaymentTypeData retrieveOne(Long id);
+```
+
+There is no `template` endpoint — the catalogue is intentionally flat and rendered by listing all rows. The "type chooser" UI populated from `GET /v1/paymenttypes` is what backs every transaction form in the platform.
+
+## Failure modes
+
+- **HTTP 404** — `PaymentTypeNotFoundException` (`error.msg.payment.type.not.found`) — when `{paymentTypeId}` is unknown.
+- **HTTP 400** — validation errors from the command handler (missing `name`, duplicate position, invalid `codeName`).
+- **HTTP 403** — attempting to delete a `isSystemDefined=true` type.
+- **HTTP 409 / DB integrity** — attempting to delete a type referenced by `m_payment_detail`. The handler intentionally lets the DB constraint trip rather than scanning every transaction table.
+
+## Auditing
+
+Because the resource flows through `CommandPipeline`, every create/update/delete generates an audited `commands` row. The audit row records the `payload` JSON and the actor (current `AppUser` from `PlatformSecurityContext`). If maker-checker is enabled for the payment-type resource, the change is parked until approved. See [/command/overview](/command/overview).
+
+## Extensibility
+
+To add a new payment-type-aware feature (e.g. "card terminal id"):
+
+1. Add the column to `m_payment_detail` (since it lives per transaction, not per type) — see [/portfolio/payment-details](/portfolio/payment-details).
+2. Update `PaymentDetailConstants` with the parameter name.
+3. Wire serialization in `PaymentDetail.generatePaymentDetail(...)` and `PaymentDetailData`.
+4. If the new field is type-specific (only meaningful for `isCashPayment=false`), validate at the resource layer of the calling write service.
+
+You generally **do not** add columns to `m_payment_type` itself; the type is meant to be a small dictionary, not a bag of channel configuration.
+
+## Seeding and migrations
+
+A clean install does not preload `m_payment_type` — every Fineract install therefore needs an initial seed step. Two patterns are common:
+
+1. **Liquibase changeset** — write a `<insert>` per type with `is_system_defined=true` for the immutable ones (Cash, Adjustment). This is the recommended path for institutions that have a static channel mix.
+2. **POST loop at install time** — run a script that issues `POST /v1/paymenttypes` for each type. This lets the operator review and confirm channel naming, and it captures the audit trail of who created what.
+
+When upgrading to a major version, check the Liquibase changelog for any new system-defined types the platform may rely on (e.g. an internal "Accrual" or "Provisioning" type used by jobs). The `is_system_defined=true` flag protects them from accidental deletion.
+
+## Caching considerations
+
+There is intentionally no cache around `PaymentType`. The catalogue is small (single-digit to low-double-digit rows), and every transaction-write path resolves the type by id through `PaymentTypeRepositoryWrapper.findOneWithNotFoundDetection(...)`. Hibernate's first-level cache absorbs the read inside a single transaction; the second-level cache could be enabled per deployment if profiling shows the lookup is hot.
+
+## Cross-references
+
+- [/portfolio/payment-details](/portfolio/payment-details) — the per-transaction record that owns the channel-specific fields.
+- [/loan/loan-repayment-schedule-domain](/loan/loan-repayment-schedule-domain) — loan transactions reference payment details.
+- [/savings/savings-transactions](/savings/savings-transactions) — savings transactions reference payment details.
+- [/accounting/overview](/accounting/overview) — cash vs non-cash GL routing.
+- [/command/overview](/command/overview) — the typed `CommandPipeline` used by this resource.
+- [/core/portfolio-shared-domain](/core/portfolio-shared-domain) — the `AbstractPersistableCustom` base class.
+- [/api/portfolio-apis](/api/portfolio-apis) — the end-user API tour.

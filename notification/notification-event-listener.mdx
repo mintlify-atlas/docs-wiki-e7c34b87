@@ -1,0 +1,299 @@
+---
+title: "Notification Domain Listeners — From Business Events to Inbox Rows"
+sidebarTitle: "Event Listener"
+description: "How Apache Fineract registers post-business-event listeners, builds NotificationData payloads, fans them out by office and permission, and persists per-user inbox rows."
+---
+
+The producer side of the Apache Fineract notification subsystem lives in `NotificationDomainServiceImpl` and `UserNotificationServiceImpl`. The first class wires one `BusinessEventListener` per supported event into `BusinessEventNotifierService`; the second turns the event payload into a `NotificationData` and decides which `AppUser` ids should receive it. This page walks the listener registration, every concrete listener, the `buildNotification` helper, the office / permission fanout, and the JDBC inserts performed on the receiving side.
+
+## Where the wiring happens
+
+`NotificationDomainServiceImpl` is constructed by `NotificationConfiguration` and uses `@PostConstruct` to register listeners. The exact method:
+
+```java
+// fineract-provider/src/main/java/org/apache/fineract/notification/service/NotificationDomainServiceImpl.java
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationDomainServiceImpl implements NotificationDomainService {
+
+    private final BusinessEventNotifierService businessEventNotifierService;
+    private final PlatformSecurityContext context;
+    private final UserNotificationService userNotificationService;
+
+    @PostConstruct
+    public void addListeners() {
+        businessEventNotifierService.addPostBusinessEventListener(ClientCreateBusinessEvent.class, new ClientCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(SavingsApproveBusinessEvent.class, new SavingsAccountApprovedListener());
+        businessEventNotifierService.addPostBusinessEventListener(CentersCreateBusinessEvent.class, new CenterCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(GroupsCreateBusinessEvent.class, new GroupCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(SavingsDepositBusinessEvent.class, new SavingsAccountDepositListener());
+        businessEventNotifierService.addPostBusinessEventListener(ShareProductDividentsCreateBusinessEvent.class,
+                new ShareProductDividendCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(FixedDepositAccountCreateBusinessEvent.class,
+                new FixedDepositAccountCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(RecurringDepositAccountCreateBusinessEvent.class,
+                new RecurringDepositAccountCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(SavingsPostInterestBusinessEvent.class,
+                new SavingsPostInterestListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanCreatedBusinessEvent.class, new LoanCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanApprovedBusinessEvent.class, new LoanApprovedListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanCloseBusinessEvent.class, new LoanClosedListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanChargebackTransactionBusinessEvent.class,
+                new LoanChargebackTransactionListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanCloseAsRescheduleBusinessEvent.class,
+                new LoanCloseAsRescheduledListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanTransactionMakeRepaymentPostBusinessEvent.class,
+                new LoanMakeRepaymentListener());
+        businessEventNotifierService.addPostBusinessEventListener(LoanProductCreateBusinessEvent.class, new LoanProductCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(SavingsCreateBusinessEvent.class, new SavingsAccountCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(SavingsCloseBusinessEvent.class, new SavingsAccountClosedListener());
+        businessEventNotifierService.addPostBusinessEventListener(ShareAccountCreateBusinessEvent.class, new ShareAccountCreatedListener());
+        businessEventNotifierService.addPostBusinessEventListener(ShareAccountApproveBusinessEvent.class,
+                new ShareAccountApprovedListener());
+    }
+}
+```
+
+Two things to notice:
+
+1. `addPostBusinessEventListener` — listeners run *after* the originating business transaction commits, so a failure here never rolls back the loan or client save.
+2. Every listener is an inner class; the outer class holds the three collaborators it needs (`BusinessEventNotifierService` for self-registration, `PlatformSecurityContext` for the acting user, `UserNotificationService` to actually publish).
+
+See [`/core/event-business`](/core/event-business) for the underlying `BusinessEventNotifierService` mechanics.
+
+## The event-to-notification table
+
+Every listener calls `buildNotification(permission, objectType, objectIdentifier, notificationContent, eventType, appUserId, officeId)`. The arguments are observable in the inbox row, so this table is the authoritative mapping shipped today.
+
+| `BusinessEvent` class | Permission (used for fanout) | `objectType` | `eventType` (action) | Content |
+| --- | --- | --- | --- | --- |
+| `ClientCreateBusinessEvent` | `ACTIVATE_CLIENT` | `client` | `created` | `New client created` |
+| `CentersCreateBusinessEvent` | `ACTIVATE_CENTER` | `center` | `created` | `New center created` |
+| `GroupsCreateBusinessEvent` | `ACTIVATE_GROUP` | `group` | `created` | `New group created` |
+| `SavingsDepositBusinessEvent` | `READ_SAVINGSACCOUNT` | `savingsAccount` | `depositMade` | `Deposit made` |
+| `ShareProductDividentsCreateBusinessEvent` | `READ_DIVIDEND_SHAREPRODUCT` | `shareProduct` | `dividendPosted` | `Dividend posted to account` |
+| `FixedDepositAccountCreateBusinessEvent` | `APPROVE_FIXEDDEPOSITACCOUNT` | `fixedDeposit` | `created` | `New fixed deposit account created` |
+| `RecurringDepositAccountCreateBusinessEvent` | `APPROVE_RECURRINGDEPOSITACCOUNT` | `recurringDepositAccount` | `created` | `New recurring deposit account created` |
+| `SavingsApproveBusinessEvent` (savings) | `ACTIVATE_SAVINGSACCOUNT` | `savingsAccount` | `approved` | `Savings account approved` |
+| `SavingsApproveBusinessEvent` (fixed deposit) | `ACTIVATE_FIXEDDEPOSITACCOUNT` | `fixedDeposit` | `approved` | `Fixed deposit account approved` |
+| `SavingsApproveBusinessEvent` (recurring) | `ACTIVATE_RECURRINGDEPOSITACCOUNT` | `recurringDepositAccount` | `approved` | `Recurring deposit account approved` |
+| `SavingsPostInterestBusinessEvent` | `READ_SAVINGSACCOUNT` | `savingsAccount` | `interestPosted` | `Interest posted to account` |
+| `LoanCreatedBusinessEvent` | `APPROVE_LOAN` | `loan` | `created` | `New loan created` |
+| `LoanApprovedBusinessEvent` | `DISBURSE_LOAN` | `loan` | `approved` | `New loan approved` |
+| `LoanCloseBusinessEvent` | `READ_LOAN` | `loan` | `loanClosed` | `Loan closed` |
+| `LoanCloseAsRescheduleBusinessEvent` | `READ_Rescheduled Loans` | `loan` | `loanRescheduled` | `Loan has been rescheduled` |
+| `LoanChargebackTransactionBusinessEvent` | constant `LOAN_CHARGEBACK_TRANSACTION_PERMISSION` | constant `LOAN_CHARGEBACK_TRANSACTION_OBJECT_TYPE` | constant `LOAN_CHARGEBACK_TRANSACTION_EVENT_TYPE` | constant `LOAN_CHARGEBACK_TRANSACTION_NOTIFICATION` |
+| `LoanTransactionMakeRepaymentPostBusinessEvent` | `READ_LOAN` | `loan` | `repaymentMade` | `Repayment made` |
+| `LoanProductCreateBusinessEvent` | `READ_LOANPRODUCT` | `loanProduct` | `created` | `New loan product created` |
+| `SavingsCreateBusinessEvent` | `APPROVE_SAVINGSACCOUNT` | `savingsAccount` | `created` | `New savings account created` |
+| `SavingsCloseBusinessEvent` | `READ_SAVINGSACCOUNT` | `savingsAccount` | `closed` | `Savings has gone into dormant` |
+| `ShareAccountCreateBusinessEvent` | `APPROVE_SHAREACCOUNT` | `shareAccount` | `created` | `New share account created` |
+| `ShareAccountApproveBusinessEvent` | `ACTIVATE_SHAREACCOUNT` | `shareAccount` | `approved` | `Share account approved` |
+
+The permission column drives the fanout — only users whose roles contain that permission (or `ALL_FUNCTIONS`) become recipients. The `objectType` / `objectId` are surfaced verbatim in the REST inbox payload so the UI can deep-link to the right detail screen.
+
+## Anatomy of a listener
+
+The simplest listener — `ClientCreatedListener` — shows the pattern. Each inner class reads its strongly-typed payload, then makes one `buildNotification` call:
+
+```java
+private final class ClientCreatedListener implements BusinessEventListener<ClientCreateBusinessEvent> {
+
+    @Override
+    public void onBusinessEvent(ClientCreateBusinessEvent event) {
+        Client client = event.get();
+        buildNotification("ACTIVATE_CLIENT", "client", client.getId(),
+                "New client created", "created",
+                context.authenticatedUser().getId(), client.getOffice().getId());
+    }
+}
+```
+
+A few notes on this style:
+
+* `event.get()` returns the typed domain object the event carries (`Client`, `Loan`, `SavingsAccount`, …). The `BusinessEvent` base class enforces compile-time payload types.
+* `context.authenticatedUser().getId()` is the *actor* — the user who made the change. The actor is later filtered out of the recipient set so people do not get notified about their own actions.
+* `client.getOffice().getId()` is the office whose users are candidates. This is **not** the actor's office — for portfolio events it is the entity's office (e.g. the loan's office for `LoanCreatedBusinessEvent.getOfficeId()`), which is the office that owns the data.
+
+Listeners that resolve from a `CommandProcessingResult` follow the same shape but pull office and entity ids from the command result:
+
+```java
+private final class CenterCreatedListener implements BusinessEventListener<CentersCreateBusinessEvent> {
+
+    @Override
+    public void onBusinessEvent(CentersCreateBusinessEvent event) {
+        CommandProcessingResult commandProcessingResult = event.get();
+        buildNotification("ACTIVATE_CENTER", "center",
+                commandProcessingResult.getGroupId(),
+                "New center created", "created",
+                context.authenticatedUser().getId(),
+                commandProcessingResult.getOfficeId());
+    }
+}
+```
+
+The `SavingsApproveBusinessEvent` listener is the only branching one — it switches on `savingsAccount.depositAccountType()` to emit a different permission / object type per `DepositAccountType` enum value (`SAVINGS_DEPOSIT`, `FIXED_DEPOSIT`, `RECURRING_DEPOSIT`).
+
+## `buildNotification` — the producer entry point
+
+The private helper at the bottom of `NotificationDomainServiceImpl` simply forwards into `UserNotificationService`:
+
+```java
+private void buildNotification(String permission, String objectType, Long objectIdentifier, String notificationContent,
+        String eventType, Long appUserId, Long officeId) {
+    userNotificationService.notifyUsers(permission, objectType, objectIdentifier,
+            notificationContent, eventType, appUserId, officeId);
+}
+```
+
+The actual producer logic — including the office query, the permission filter, the `NotificationData` construction, and the publish — lives in `UserNotificationServiceImpl`.
+
+## Producer side: `UserNotificationServiceImpl.notifyUsers(String, ...)`
+
+```java
+// fineract-provider/src/main/java/org/apache/fineract/notification/service/UserNotificationServiceImpl.java
+@Override
+public void notifyUsers(String permission, String objectType, Long objectIdentifier, String notificationContent, String eventType,
+        Long appUserId, Long officeId) {
+
+    if (userNotificationSystemIsEnabled()) {
+        String tenantIdentifier = ThreadLocalContextUtil.getTenant().getTenantIdentifier();
+        Set<Long> userIds = getNotifiableUserIds(officeId, permission);
+        NotificationData notificationData = new NotificationData().setObjectType(objectType).setObjectId(objectIdentifier)
+                .setAction(eventType).setActorId(appUserId).setContent(notificationContent).setRead(false).setSystemGenerated(false)
+                .setTenantIdentifier(tenantIdentifier).setOfficeId(officeId).setUserIds(userIds);
+        try {
+            notificationEventPublisher.broadcastNotification(notificationData);
+        } catch (Exception e) {
+            // We want to avoid rethrowing the exception to stop the business transaction from rolling back
+            log.error("Error while broadcasting notification event", e);
+        }
+    }
+}
+```
+
+Three behaviours pinned in this method:
+
+1. **Feature flag short-circuit** — `userNotificationSystemIsEnabled()` checks `fineractProperties.getNotification().getUserNotificationSystem().isEnabled()`. When `false`, the method is a no-op.
+2. **Tenant stamping** — `tenantIdentifier` is read from `ThreadLocalContextUtil`. This matters because the JMS / Spring event will be re-dispatched on the consumer side; the tenant has to travel with the payload.
+3. **Swallowed exceptions** — a publish failure is logged and discarded. The business transaction commits regardless. This is intentional and is part of why the listener runs as a *post* business event listener rather than *pre*.
+
+### Office + permission fanout
+
+`getNotifiableUserIds` does the candidate-set computation in plain Java over `AppUserRepository`:
+
+```java
+private Set<Long> getNotifiableUserIds(Long officeId, String permission) {
+    Collection<AppUser> users = appUserRepository.findByOfficeId(officeId);
+    Collection<AppUser> usersWithPermission = users.stream()
+            .filter(aU -> aU.hasAnyPermission(permission, "ALL_FUNCTIONS"))
+            .toList();
+    return usersWithPermission.stream().map(AppUser::getId).collect(toSet());
+}
+```
+
+The query is by `officeId` only — there is no hierarchy walk to parent offices. Users that hold `ALL_FUNCTIONS` always qualify, which is how superuser roles see every notification. The result set is intentionally a `Set<Long>` so deduplication is automatic.
+
+## Consumer side: `UserNotificationServiceImpl.notifyUsers(NotificationData)`
+
+After the transport (Spring event or JMS) delivers the `NotificationData`, `NotificationEventListener.receive(...)` calls the second overload:
+
+```java
+@Override
+public void notifyUsers(NotificationData notificationData) {
+    if (userNotificationSystemIsEnabled()) {
+        Long appUserId = notificationData.getActorId();
+        Set<Long> userIds = notificationData.getUserIds();
+
+        if (notificationData.getOfficeId() != null) {
+            List<Long> tempUserIds = new ArrayList<>(userIds);
+            for (Long userId : tempUserIds) {
+                AppUser appUser = appUserRepository.findById(userId).orElseThrow();
+                if (!Objects.equals(appUser.getOffice().getId(), notificationData.getOfficeId())) {
+                    userIds.remove(userId);
+                }
+            }
+        }
+
+        // Don't notify the same user who triggered the event
+        if (userIds.contains(appUserId)) {
+            userIds.remove(appUserId);
+        }
+
+        notificationWritePlatformService.notify(userIds,
+                notificationData.getObjectType(), notificationData.getObjectId(),
+                notificationData.getAction(), notificationData.getActorId(),
+                notificationData.getContent(), notificationData.isSystemGenerated());
+    }
+}
+```
+
+Two filters happen here even though the producer already shortlisted recipients:
+
+* **Office re-check** — every candidate user is reloaded from `AppUserRepository` and dropped if their current office no longer matches `officeId`. This protects against stale `userIds` payloads (the user could have moved offices between produce and consume).
+* **Actor exclusion** — the acting user is removed from the recipient set at the very last step. So if the only candidate user *is* the actor, no inbox rows are written.
+
+## Persistence — `NotificationWritePlatformServiceImpl.notify(...)`
+
+The final step is the database write. `NotificationWritePlatformServiceImpl` (wired in `NotificationConfiguration`) creates one `Notification` row plus N `NotificationMapper` rows:
+
+```java
+// effective shape — see NotificationWritePlatformServiceImpl
+public void notify(Set<Long> userIds, String objectType, Long objectIdentifier, String action,
+        Long actorId, String notificationContent, boolean isSystemGenerated) {
+
+    Notification notification = new Notification()
+            .setObjectType(objectType)
+            .setObjectIdentifier(objectIdentifier)
+            .setAction(action)
+            .setActorId(actorId)
+            .setSystemGenerated(isSystemGenerated)
+            .setNotificationContent(notificationContent)
+            .setCreatedAt(LocalDateTime.now());
+    notificationGeneratorWritePlatformService.create(notification);
+
+    for (Long userId : userIds) {
+        AppUser user = appUserRepository.findById(userId).orElseThrow();
+        NotificationMapper mapper = new NotificationMapper()
+                .setNotification(notification)
+                .setUserId(user)
+                .setRead(false)
+                .setCreatedAt(LocalDateTime.now());
+        notificationMapperWritePlatformService.create(mapper);
+    }
+}
+```
+
+The two-table layout is what lets a single notification be marked as read by one user without affecting another. See [`/core/notification-data`](/core/notification-data) for the entity column definitions.
+
+## Adding a new event mapping
+
+The recipe is:
+
+1. **Pick or create a `BusinessEvent`** in the relevant portfolio module (see [`/core/event-business`](/core/event-business)). Make sure it is fired from the corresponding `*WritePlatformServiceImpl`.
+2. **Add an inner class** in `NotificationDomainServiceImpl` that implements `BusinessEventListener<YourEvent>` and calls `buildNotification(...)` with the right permission, objectType, action, content, actor, and officeId.
+3. **Register it** in `addListeners()` via `businessEventNotifierService.addPostBusinessEventListener(YourEvent.class, new YourListener())`.
+4. **Pick a permission** that already exists in `m_permission` — users that hold this permission (or `ALL_FUNCTIONS`) become recipients.
+5. (optional) **Expose constants** on the event class — the `LoanChargebackTransactionBusinessEvent` example shows the pattern (`LOAN_CHARGEBACK_TRANSACTION_PERMISSION`, `LOAN_CHARGEBACK_TRANSACTION_OBJECT_TYPE`, `LOAN_CHARGEBACK_TRANSACTION_EVENT_TYPE`, `LOAN_CHARGEBACK_TRANSACTION_NOTIFICATION`) so future readers see the wiring inline.
+
+There is no annotation-based discovery — every mapping must appear inside `addListeners()`.
+
+## Caveats and gotchas
+
+| Behaviour | Reason |
+| --- | --- |
+| The actor receives no notification even if their own role grants the permission. | Explicit `userIds.remove(appUserId)` on the consumer side. |
+| Closing a loan emits a notification but disbursing one does not (until v25.x). | Only the events listed in the table above are wired. Add a listener if you need more. |
+| Notifications are not generated when the originating action runs in batch / system-user mode without an `AppUser`. | `context.authenticatedUser()` would throw — but most domain events do still carry an authenticated user from the COB worker context. |
+| If `officeId` is `null` on the payload, the office re-check on the consumer is skipped — every shortlisted user (minus the actor) gets a row. | The `if (notificationData.getOfficeId() != null)` guard. |
+| Permission spelling matters. `READ_Rescheduled Loans` (note the mixed case and space) is the actual string used for reschedules. Mismatched permissions silently drop recipients. | Hard-coded constants. |
+
+## Cross references
+
+| Topic | Page |
+| --- | --- |
+| `BusinessEventNotifierService.addPostBusinessEventListener` | [`/core/event-business`](/core/event-business) |
+| `CommandProcessingResult` returned from write services | [`/command/overview`](/command/overview) |
+| `AppUser.hasAnyPermission` and `ALL_FUNCTIONS` | [`/core/security-services`](/core/security-services) |
+| Where the publish goes after `broadcastNotification` | [`/notification/spring-and-activemq`](/notification/spring-and-activemq) |
+| How users actually consume the rows | [`/notification/notification-api`](/notification/notification-api) |

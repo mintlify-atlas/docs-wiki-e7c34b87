@@ -1,0 +1,331 @@
+---
+title: "Task Executor Config: Default and Configurable Thread Pools"
+sidebarTitle: "Task Executor Config"
+description: "TaskExecutorConfig declares the default and prototype ThreadPoolTaskExecutor beans plus the TaskExecutorConstant registry used by JMS, COB and batch jobs."
+---
+
+`TaskExecutorConfig` defines the two general-purpose `ThreadPoolTaskExecutor`
+beans that Apache Fineract uses for background work outside the request thread.
+A companion `TaskExecutorConstant` class holds the canonical bean names so
+sibling modules can `@Qualifier` the right executor without typos.
+
+This page maps the executor inventory, explains the sizing model, and shows
+how it composes with the *other* asynchronous executor in the codebase — the
+`fineractEventExecutor` configured by [Spring Config](/provider/spring-config).
+
+For runtime-level coverage (JVM thread budgets, ForkJoinPool interactions, COB
+partition workers), see [/runtime/task-executors](/runtime/task-executors).
+
+## The two configuration files
+
+### `TaskExecutorConfig.java`
+
+```java
+@Configuration
+public class TaskExecutorConfig {
+
+    @Autowired
+    private FineractProperties fineractProperties;
+
+    @Bean(TaskExecutorConstant.DEFAULT_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor fineractDefaultThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor threadPoolTaskExecutor = new ThreadPoolTaskExecutor();
+        threadPoolTaskExecutor.setCorePoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorCorePoolSize());
+        threadPoolTaskExecutor.setMaxPoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorMaxPoolSize());
+        return threadPoolTaskExecutor;
+    }
+
+    @Bean(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+    @Scope(scopeName = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+    public ThreadPoolTaskExecutor fineractConfigurableThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor threadPoolTaskExecutor = new ThreadPoolTaskExecutor();
+        threadPoolTaskExecutor.setCorePoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorCorePoolSize());
+        threadPoolTaskExecutor.setMaxPoolSize(fineractProperties.getTaskExecutor().getDefaultTaskExecutorMaxPoolSize());
+        return threadPoolTaskExecutor;
+    }
+}
+```
+
+### `TaskExecutorConstant.java`
+
+```java
+public final class TaskExecutorConstant {
+
+    private TaskExecutorConstant() { }
+
+    public static final String DEFAULT_TASK_EXECUTOR_BEAN_NAME = "fineractDefaultThreadPoolTaskExecutor";
+    public static final String CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME = "fineractConfigurableThreadPoolTaskExecutor";
+    public static final String EVENT_TASK_EXECUTOR_BEAN_NAME = "externalEventJmsProducerExecutor";
+    public static final String LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME = "loanCOBCatchUpThreadPoolTaskExecutor";
+    public static final String WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME = "workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor";
+}
+```
+
+## Bean inventory
+
+The constants file is the canonical list of background executors in the
+deployment. Not all of them are defined in `TaskExecutorConfig` — some live in
+sibling modules but reuse the same naming convention. The complete catalog:
+
+| Constant | Bean name | Defined in | Purpose |
+| --- | --- | --- | --- |
+| `DEFAULT_TASK_EXECUTOR_BEAN_NAME` | `fineractDefaultThreadPoolTaskExecutor` | `TaskExecutorConfig` (this file) | Singleton. Used by services that need one shared executor for occasional async work. |
+| `CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME` | `fineractConfigurableThreadPoolTaskExecutor` | `TaskExecutorConfig` | **Prototype**-scoped. Each injection point gets a fresh executor that the consuming bean can resize on the fly. |
+| `EVENT_TASK_EXECUTOR_BEAN_NAME` | `externalEventJmsProducerExecutor` | `fineract-core` (external event module) | Dedicated to JMS producer fan-out for external events. |
+| `LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME` | `loanCOBCatchUpThreadPoolTaskExecutor` | `fineract-cob` | Drives parallel COB catch-up for loans missing close-of-business runs. |
+| `WORKING_CAPITAL_LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME` | `workingCapitalLoanCOBCatchUpThreadPoolTaskExecutor` | `fineract-working-capital-loan` | Same idea, scoped to working-capital loan products. |
+
+`fineractEventExecutor` from [Spring Config](/provider/spring-config) is a
+*sixth* executor that is *not* in this constant list — it is hard-wired into
+Spring's `applicationEventMulticaster` and not normally injected by name.
+
+## Default vs configurable — the scoping difference
+
+Both `fineractDefaultThreadPoolTaskExecutor` and
+`fineractConfigurableThreadPoolTaskExecutor` are created with the same
+configuration:
+
+```java
+threadPoolTaskExecutor.setCorePoolSize(
+    fineractProperties.getTaskExecutor().getDefaultTaskExecutorCorePoolSize());
+threadPoolTaskExecutor.setMaxPoolSize(
+    fineractProperties.getTaskExecutor().getDefaultTaskExecutorMaxPoolSize());
+```
+
+What differs is the bean scope:
+
+### `DEFAULT` — singleton
+
+The default executor is created once at application start. Every `@Autowired`
+injection of:
+
+```java
+@Qualifier(TaskExecutorConstant.DEFAULT_TASK_EXECUTOR_BEAN_NAME)
+private ThreadPoolTaskExecutor executor;
+```
+
+receives the **same** instance. Tasks submitted to it share queue and pool
+budgets across all consumers.
+
+### `CONFIGURABLE` — prototype
+
+```java
+@Bean(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+@Scope(scopeName = ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+public ThreadPoolTaskExecutor fineractConfigurableThreadPoolTaskExecutor() { ... }
+```
+
+Every injection — or programmatic `applicationContext.getBean(name)` — produces
+a *fresh* `ThreadPoolTaskExecutor`. The caller is then free to mutate it
+(`setCorePoolSize`, `setMaxPoolSize`, add a `ThreadFactory`, …) without
+affecting other consumers.
+
+Pattern:
+
+```java
+@Autowired
+@Qualifier(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+private ThreadPoolTaskExecutor executor;
+
+@PostConstruct
+public void init() {
+    executor.setCorePoolSize(myWorkloadSpecificCoreSize);
+    executor.setMaxPoolSize(myWorkloadSpecificMaxSize);
+    executor.setThreadNamePrefix("MyBatch-");
+    executor.initialize();
+}
+```
+
+After `initialize()` the underlying `ThreadPoolExecutor` is started and the
+executor is ready. This pattern is used by the COB partition workers and by
+the bulk-import processors.
+
+## Properties
+
+The two values both come from
+`fineractProperties.getTaskExecutor().getDefaultTaskExecutor*PoolSize()`. So:
+
+```properties
+fineract.taskExecutor.defaultTaskExecutorCorePoolSize=10
+fineract.taskExecutor.defaultTaskExecutorMaxPoolSize=50
+```
+
+These are also defaults — `FineractProperties` ships with sane numbers that
+fit a small box but should be tuned for production. Higher values give more
+parallelism at the cost of memory (each thread stack ~512KB by default) and
+database connection pressure (each thread can hold a JDBC connection).
+
+## How this differs from `fineractEventExecutor`
+
+| Aspect | `fineractEventExecutor` (`SpringConfig`) | `fineractDefaultThreadPoolTaskExecutor` (`TaskExecutorConfig`) |
+| --- | --- | --- |
+| Purpose | Backs Spring `ApplicationEventMulticaster` for `@EventListener` async dispatch | General-purpose background work, directly injected |
+| Sizing | Smart defaults: `2×cores` / `5×cores`, queue=100 | Read from `FineractProperties` |
+| Rejection policy | `CallerRunsPolicy` (back-pressure) | Default `AbortPolicy` |
+| Thread name | `FineractEvent-N` | No prefix set in defaults (consumers may add one) |
+| Bean scope | Singleton | Singleton (DEFAULT) + Prototype (CONFIGURABLE) |
+| Security context propagation | Yes — wrapped in `DelegatingSecurityContextAsyncTaskExecutor` | No automatic wrapping — consumer must wrap if needed |
+
+A general rule: if you have an `@EventListener`, you don't need to touch these
+executors. If you have an explicit `executor.execute(() -> …)` call, this is
+where the executor comes from.
+
+## How sibling modules reuse the constants
+
+The COB module looks like:
+
+```java
+@Configuration
+public class LoanCOBExecutorConfig {
+
+    @Bean(TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+    public ThreadPoolTaskExecutor loanCOBCatchUpThreadPoolTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        ...
+        return executor;
+    }
+}
+```
+
+Consumers then:
+
+```java
+@Autowired
+@Qualifier(TaskExecutorConstant.LOAN_COB_CATCH_UP_TASK_EXECUTOR_BEAN_NAME)
+private ThreadPoolTaskExecutor executor;
+```
+
+The constants live in `fineract-provider` because that is the assembly module
+every sibling depends on transitively (via `fineract-core`). A change to a
+constant string here would break dependent modules at compile time — which
+is exactly what makes the constant useful.
+
+## Lifecycle and shutdown
+
+Spring's `ThreadPoolTaskExecutor` is `DisposableBean` aware. By default it does
+**not** wait for in-flight tasks on shutdown — it interrupts them. If you need
+graceful shutdown (as `SpringConfig` does for `fineractEventExecutor`), call:
+
+```java
+executor.setWaitForTasksToCompleteOnShutdown(true);
+executor.setAwaitTerminationSeconds(60);
+```
+
+`TaskExecutorConfig` does **not** set these on the default/configurable beans
+— the assumption is that callers know best whether their background tasks
+should be drained or killed at shutdown.
+
+## Caveats
+
+- The **default** executor's queue is unbounded (the default
+  `ThreadPoolTaskExecutor` `queueCapacity` is `Integer.MAX_VALUE`). Combined
+  with `AbortPolicy`, a runaway producer will exhaust memory long before
+  rejection kicks in. Set `queueCapacity` explicitly if you submit tasks at a
+  high rate.
+- The **configurable** executor is *not* initialized by Spring's container. The
+  consuming bean must call `executor.initialize()` after configuring the pool
+  — otherwise the underlying `ThreadPoolExecutor` is `null` and every
+  `execute()` will NPE.
+- These executors do **not** propagate `MDC` (logging correlation IDs). Wrap
+  them in `MDCDelegatingTaskExecutor` (or copy the MDC map manually) if log
+  correlation across thread hops matters.
+
+## When to use which executor
+
+A pragmatic decision tree:
+
+1. **Are you implementing an `@EventListener`?** Don't pick an executor.
+   `applicationEventMulticaster` already routes you to `fineractEventExecutor`.
+2. **Do you have an explicit `executor.execute(() -> ...)` call?**
+   - **Need security context propagation?** Use `fineractEventExecutor`
+     (it's already wrapped) — or wrap a `DEFAULT` executor with
+     `DelegatingSecurityContextAsyncTaskExecutor` yourself.
+   - **Need a custom pool size for a long-lived processor?** Inject
+     `CONFIGURABLE`, reconfigure in `@PostConstruct`, and call `initialize()`.
+   - **Need none of the above?** Inject `DEFAULT`.
+3. **Are you in the COB pipeline?** Use one of the named COB executors
+   directly.
+4. **Are you in external-event JMS production?** Use
+   `EVENT_TASK_EXECUTOR_BEAN_NAME`.
+
+## Metrics and observability
+
+Spring Boot Actuator auto-registers each `ThreadPoolTaskExecutor` bean with
+the `MeterRegistry`, exposing these gauges:
+
+| Metric | Meaning |
+| --- | --- |
+| `executor.active` | Currently running tasks |
+| `executor.pool.size` | Threads currently in the pool |
+| `executor.pool.max` | Max pool size |
+| `executor.pool.core` | Core pool size |
+| `executor.queued` | Tasks waiting in the queue |
+| `executor.queue.remaining` | Remaining queue capacity |
+| `executor.completed` | Cumulative completed tasks |
+
+Tagged by `name` (the bean name). So Grafana dashboards can show every
+executor's saturation side by side, and alerts on
+`executor.queue.remaining{name="fineractDefaultThreadPoolTaskExecutor"} < 10`
+will fire well before tasks get rejected.
+
+## Common pitfalls
+
+### Forgetting to `initialize()` the configurable executor
+
+```java
+@Autowired @Qualifier(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+private ThreadPoolTaskExecutor executor;
+
+@PostConstruct
+public void init() {
+    executor.setCorePoolSize(20);
+    // ❌ forgot to call executor.initialize()
+}
+
+public void run() {
+    executor.execute(...); // NullPointerException — pool not initialized
+}
+```
+
+Always call `initialize()` after configuring a `CONFIGURABLE` executor.
+
+### Sharing the configurable executor by name in multiple beans
+
+Because it's a prototype scope, each `@Autowired` gets a *different* instance.
+If two beans depend on the same executor, they will both inject their own and
+configure them separately. Either:
+
+- Make the bean a singleton via `@Bean` of your own that delegates to the
+  prototype, or
+- Use the `DEFAULT` executor and let the two beans share the pool.
+
+### Forgetting MDC
+
+Logback's `MDC` is also a `ThreadLocal`. Tasks submitted to either executor
+will *not* see the publisher's MDC values (correlation ID, tenant ID).
+`CorrelationHeaderFilter` (see [Web Config](/provider/web-config)) writes
+those values on the request thread; if your background task logs need them,
+copy the MDC map at submission and restore it inside the task.
+
+A common pattern:
+
+```java
+Map<String, String> mdc = MDC.getCopyOfContextMap();
+executor.execute(() -> {
+    if (mdc != null) MDC.setContextMap(mdc);
+    try {
+        doWork();
+    } finally {
+        MDC.clear();
+    }
+});
+```
+
+## Related pages
+
+- [Spring Config](/provider/spring-config) — the *event* multicaster executor.
+- [/runtime/task-executors](/runtime/task-executors) — runtime view of every
+  pool in the deployment, including the COB and Spring Batch ones.
+- [/runtime/logging-and-correlation](/runtime/logging-and-correlation) —
+  the MDC context that tasks must propagate explicitly.
+- [Provider Overview](/provider/overview) — module map.

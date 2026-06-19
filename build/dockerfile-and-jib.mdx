@@ -1,0 +1,358 @@
+---
+title: "Container Image Build: Jib Configuration and No Dockerfile"
+sidebarTitle: "Jib & Dockerfile"
+description: "How Apache Fineract builds its container image with the Jib Gradle plugin: base image, ports, JVM flags, layered classpath, dependencies block, and the custom-image variant under custom/docker."
+---
+
+Apache Fineract **does not ship a `Dockerfile`** in the repository root or anywhere inside the published modules. The official `fineract:latest` and `fineract:<version>` images are produced entirely by the [Google Jib](https://github.com/GoogleContainerTools/jib) Gradle plugin, which packages the compiled classes, generated OpenAPI spec, third-party JARs, and runtime configuration into an OCI image **without invoking the Docker daemon at all**. This page documents the `jib { … }` block in `fineract-provider/build.gradle`, the second `jib { … }` block in `custom/docker/build.gradle` that produces the optional `fineract-custom` image, and the Gradle tasks that drive both.
+
+<Note>
+There is exactly one `Dockerfile` referenced anywhere in the tree, and it lives only on the doc-site — the runtime artifact path is `jib` → OCI registry (or local Docker daemon) → `docker compose up`. If you're looking for a Dockerfile to edit, you won't find one; edit the `jib` block instead.
+</Note>
+
+## Why Jib instead of a Dockerfile
+
+Jib resolves the application classpath at build time and writes it into the image as **three deterministic layers**: dependencies (rarely changes), resources (changes when config / OpenAPI spec changes), and classes (changes every commit). That layering is what keeps `docker pull fineract:latest` fast on subsequent releases — the dependency layer is reused.
+
+| Concern                  | Dockerfile approach                                   | Jib (Fineract approach)                                              |
+|--------------------------|-------------------------------------------------------|-----------------------------------------------------------------------|
+| Build dependency         | `docker` CLI + daemon                                 | Pure Gradle / JVM; no daemon required                                 |
+| Layering                 | Manual `COPY` ordering                                | Automatic: deps → resources → classes                                 |
+| Reproducibility          | Timestamp-sensitive                                   | `creationTime = USE_CURRENT_TIMESTAMP` (configurable to epoch)        |
+| Multi-arch               | `docker buildx` setup                                 | Single `platforms { … }` block in DSL                                 |
+| Registry push            | `docker push`                                         | `gradle jib` (direct registry write) or `gradle jibDockerBuild` (daemon) |
+| Adding a JDBC driver     | New `RUN` step                                        | Add to `jib.dependencies { implementation '…' }`                      |
+
+## The `jib { … }` block in fineract-provider
+
+Source: `fineract-provider/build.gradle` lines 264–304.
+
+```groovy
+apply plugin: 'com.google.cloud.tools.jib'
+
+jib {
+    from {
+        image = 'azul/zulu-openjdk-alpine:21'
+        platforms {
+            platform {
+                architecture = System.getProperty("os.arch").equals("aarch64") ? "arm64" : "amd64"
+                os = 'linux'
+            }
+        }
+    }
+
+    to {
+        image = 'fineract'
+        tags = [
+            "${project.version}",
+            'latest'
+        ]
+    }
+
+    container {
+        creationTime = 'USE_CURRENT_TIMESTAMP'
+        mainClass = 'org.apache.fineract.ServerApplication'
+        extraClasspath = ['/app/plugins/*']
+        args = [
+            '-Duser.home=/tmp',
+            '-Dfile.encoding=UTF-8',
+            '-Duser.timezone=UTC',
+            '-Djava.security.egd=file:/dev/./urandom'
+        ]
+        ports = ['8080/tcp', '8443/tcp']
+        labels = [maintainer: 'Aleksandar Vidakovic <aleks@apache.org>']
+        user = 'nobody:nogroup'
+    }
+
+    allowInsecureRegistries = true
+
+    dependencies {
+        implementation 'org.mariadb.jdbc:mariadb-java-client'
+        implementation 'org.postgresql:postgresql'
+    }
+}
+```
+
+Read it field-by-field.
+
+### `from { image / platforms }`
+
+The base image is `azul/zulu-openjdk-alpine:21` — Azul's Zulu OpenJDK 21 distribution on Alpine. Two consequences:
+
+- **Glibc vs musl** — Alpine uses musl libc. Any native library you ship (PDF rendering, native crypto) must be musl-compatible or you'll see `Error loading shared library …: No such file`. Fineract itself uses only pure-Java code, so this is normally fine.
+- **Architecture detection** — the DSL inspects `System.getProperty("os.arch")` on the build host. If you build on Apple Silicon (`aarch64`) you get an `arm64` image; otherwise `amd64`. There is **no fan-out** — the image is single-arch per build. To produce a manifest list covering both architectures you'd run `gradle jib` once on each host (or once in a Linux/amd64 CI runner and once on an arm64 runner) and combine with `docker buildx imagetools create`.
+
+### `to { image / tags }`
+
+```groovy
+to {
+    image = 'fineract'
+    tags = ["${project.version}", 'latest']
+}
+```
+
+The image reference is the unqualified name `fineract`, which means:
+
+- `gradle jibDockerBuild` writes `fineract:<version>` and `fineract:latest` to the **local Docker daemon**.
+- `gradle jib` would try to push to `docker.io/library/fineract` (Docker Hub root namespace) — almost certainly not what you want. Override with `-Djib.to.image=ghcr.io/yourorg/fineract` on the command line, or set the property in `~/.gradle/gradle.properties`.
+
+`project.version` flows from the root `build.gradle` (or `gradle.properties`), so each release gets a versioned tag plus the floating `latest`.
+
+### `container { … }` — runtime entrypoint
+
+| Field             | Value                                                                                                  | Why it matters                                                                                                                                                                                  |
+|-------------------|--------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `creationTime`    | `USE_CURRENT_TIMESTAMP`                                                                                | Image config `Created` field reflects build time. For reproducible-build CI, switch to `EPOCH_PLUS_SECOND` or a fixed timestamp.                                                                  |
+| `mainClass`       | `org.apache.fineract.ServerApplication`                                                                | Spring Boot main class; equivalent to `java -jar` but Jib launches `java -cp /app/resources:/app/classes:/app/libs/* org.apache.fineract.ServerApplication`.                                     |
+| `extraClasspath`  | `['/app/plugins/*']`                                                                                   | Adds a runtime drop-in folder. Mount additional JARs into `/app/plugins/` (custom modules, JDBC drivers, JMS clients) and they become visible to Spring Boot's classloader.                       |
+| `args`            | `-Duser.home=/tmp`, `-Dfile.encoding=UTF-8`, `-Duser.timezone=UTC`, `-Djava.security.egd=file:/dev/./urandom` | These are **program arguments** to `mainClass`, not JVM flags. They map to `args[0..3]` and the `ServerApplication.main(String[] args)` ignores them — they are also passed as `-D` system-property syntax which Spring Boot picks up via `SystemEnvironmentPropertySource`. |
+| `ports`           | `['8080/tcp', '8443/tcp']`                                                                             | Recorded in `EXPOSE`. 8080 is the default HTTP listener; 8443 is HTTPS. Both surface in Kubernetes `containerPort` and `docker port`.                                                            |
+| `labels`          | `[maintainer: 'Aleksandar Vidakovic <aleks@apache.org>']`                                              | OCI image label.                                                                                                                                                                                |
+| `user`            | `'nobody:nogroup'`                                                                                     | The container does **not** run as root. Anything that needs to write must target a writable mount — Fineract writes only to `/tmp` (configured via `user.home`) and stdout.                       |
+
+JVM heap / GC flags are **not** in the Jib config. They are passed at container-runtime via the `JAVA_TOOL_OPTIONS` environment variable, e.g. `JAVA_TOOL_OPTIONS=-Xmx1G -XX:MaxMetaspaceSize=256m` (see `kubernetes/fineract-server-deployment.yml` and the `docker-compose-*.yml` files).
+
+### `allowInsecureRegistries = true`
+
+Lets Jib talk to plain-HTTP registries (typically internal Harbor / Nexus mirrors over a private network). Production push to a public registry should still use HTTPS — the flag merely whitelists insecure as a fallback.
+
+### `dependencies { implementation … }`
+
+```groovy
+dependencies {
+    implementation 'org.mariadb.jdbc:mariadb-java-client'
+    implementation 'org.postgresql:postgresql'
+}
+```
+
+This is **Jib's** dependency block, not Gradle's. It declares JARs that should land on the image classpath **even though they are not compile-time dependencies of fineract-provider**. The MariaDB and PostgreSQL JDBC drivers are runtime-only — the application code talks to JPA / Hikari which load the driver class name from configuration. Adding them here puts the driver JARs in `/app/libs/` so the running container can connect to either RDBMS without a second image build.
+
+If your deployment uses MySQL (note: not MariaDB), add `'com.mysql:mysql-connector-j'` here. The custom-image variant under `custom/docker/build.gradle` already does this.
+
+## Task wiring
+
+Two tasks at the bottom of `fineract-provider/build.gradle` glue Jib into the build graph:
+
+```groovy
+tasks.jib.dependsOn(bootJar, resolve)
+tasks.jibDockerBuild.dependsOn(bootJar, resolve)
+```
+
+| Task                            | What it does                                                                                                                                            |
+|---------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `:fineract-provider:bootJar`    | Spring Boot fat-jar packaging — produces `build/libs/fineract-provider-<version>.jar`. Jib does not consume the fat jar directly; the dependency exists so that `compileJava`, resource processing, and `bootJar`'s own classpath assembly all finish before Jib snapshots the layers. |
+| `:fineract-provider:resolve`    | Swagger-core's task that resolves `@Operation` annotations and emits `build/resources/main/static/fineract.json|.yaml`. Doing this **before** Jib means the OpenAPI spec ships inside the image at `/app/resources/static/fineract.json`. |
+| `:fineract-provider:jib`        | Build image and **push** to the registry in `jib.to.image`.                                                                                            |
+| `:fineract-provider:jibDockerBuild` | Build image and load it into the **local Docker daemon** (so `docker images` lists `fineract:latest`). This is what the `docker-compose-*.yml` profiles assume. |
+
+Typical local build:
+
+```bash
+./gradlew :fineract-provider:jibDockerBuild
+# → fineract:<version>, fineract:latest in your local docker
+docker compose -f docker-compose.yml up -d
+```
+
+Typical CI release:
+
+```bash
+./gradlew :fineract-provider:jib \
+    -Djib.to.image=ghcr.io/apache/fineract \
+    -Djib.to.auth.username=$GHCR_USER \
+    -Djib.to.auth.password=$GHCR_TOKEN
+```
+
+## The second `jib { … }` block: `custom/docker`
+
+When you want an image that includes all customer modules under `custom/<company>/<category>/<module>/`, you build a separate project `:custom:docker` that produces `fineract-custom:latest`. Source: `custom/docker/build.gradle`.
+
+```groovy
+description = 'Fineract Custom Docker Image'
+
+apply plugin: 'java'
+apply plugin: 'com.google.cloud.tools.jib'
+apply from: "${rootDir}/buildSrc/src/main/groovy/org.apache.fineract.dependencies.gradle"
+
+jib {
+    from {
+        image = 'azul/zulu-openjdk-alpine:21'
+        platforms {
+            platform {
+                architecture = System.getProperty("os.arch").equals("aarch64") ? "arm64" : "amd64"
+                os = 'linux'
+            }
+        }
+    }
+
+    to {
+        image = 'fineract-custom'
+        tags = ["${project.version}", 'latest']
+    }
+
+    container {
+        creationTime = 'USE_CURRENT_TIMESTAMP'
+        mainClass = 'org.apache.fineract.ServerApplication'
+        args = [
+            '-Duser.home=/tmp',
+            '-Dfile.encoding=UTF-8',
+            '-Duser.timezone=UTC',
+            '-Djava.security.egd=file:/dev/./urandom'
+        ]
+        ports = ['8080/tcp', '8443/tcp']
+        labels = [maintainer: 'Aleksandar Vidakovic <aleks@apache.org>']
+        user = 'nobody:nogroup'
+    }
+
+    allowInsecureRegistries = true
+
+    dependencies {
+        implementation project(':fineract-core')
+        implementation project(':fineract-provider')
+        // NOTE: dynamically load all custom modules
+        file("${rootDir}/custom").eachDir { companyDir ->
+            if ('build' != companyDir.name && 'docker' != companyDir.name) {
+                file("${rootDir}/custom/${companyDir.name}").eachDir { categoryDir ->
+                    if ('build' != categoryDir.name) {
+                        file("${rootDir}/custom/${companyDir.name}/${categoryDir.name}").eachDir { moduleDir ->
+                            if ('build' != moduleDir.name) {
+                                implementation project(":custom:${companyDir.name}:${categoryDir.name}:${moduleDir.name}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        implementation 'org.mariadb.jdbc:mariadb-java-client'
+        implementation 'com.mysql:mysql-connector-j'
+        implementation 'org.postgresql:postgresql'
+        annotationProcessor 'org.springframework.boot:spring-boot-autoconfigure-processor'
+        annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+    }
+
+    pluginExtensions {
+        pluginExtension {
+            implementation = 'com.google.cloud.tools.jib.gradle.extension.layerfilter.JibLayerFilterExtension'
+            configuration {
+                filters {
+                    filter {
+                        glob = '/app/resources/**'
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Differences from the provider's block:
+
+| Aspect                       | `fineract-provider` block               | `custom/docker` block                                                            |
+|------------------------------|------------------------------------------|-----------------------------------------------------------------------------------|
+| Image name                   | `fineract`                              | `fineract-custom`                                                                |
+| Module sources               | only fineract-provider classes/resources | walks `custom/` tree and adds every discovered `:custom:<company>:<category>:<module>` as an `implementation` |
+| MySQL driver                 | not bundled                             | bundled (`com.mysql:mysql-connector-j`)                                          |
+| `extraClasspath`             | `['/app/plugins/*']`                    | not configured                                                                   |
+| Annotation processors        | inherited from fineract-provider        | explicitly added (`spring-boot-autoconfigure-processor`, `…-configuration-processor`) so the auto-config metadata files end up in the image |
+| `pluginExtensions`           | none                                    | `JibLayerFilterExtension` drops `/app/resources/**` so the giant resources layer is not duplicated between the fineract-provider classes and the custom layer |
+
+The dynamic `file("${rootDir}/custom").eachDir { … }` loop mirrors the equivalent loop in `settings.gradle`. Together they implement the customer-module discovery pattern documented in [Custom Modules](/build/custom-modules).
+
+Build the custom image:
+
+```bash
+./gradlew :custom:docker:jibDockerBuild
+# → fineract-custom:<version>, fineract-custom:latest
+docker compose -f docker-compose-custom.yml up -d
+```
+
+## What lives inside the image
+
+Once the image is built, you can inspect the layers:
+
+```bash
+docker run --rm --entrypoint sh fineract:latest -c 'ls /app && echo --- && ls /app/libs | head'
+```
+
+```
+classes
+libs
+resources
+---
+HikariCP-<ver>.jar
+spring-boot-<ver>.jar
+mariadb-java-client-<ver>.jar
+postgresql-<ver>.jar
+…
+```
+
+- `/app/classes/` — `fineract-provider`'s compiled Java classes and (in the custom image) every `:custom:*` module's classes.
+- `/app/resources/` — `application.properties`, Liquibase changelogs (`db/changelog/**`), generated OpenAPI (`static/fineract.json`, `static/fineract.yaml`), Avro schemas, JS report templates.
+- `/app/libs/` — third-party JARs. The deps layer.
+- `/app/plugins/` — empty by default; bind-mount custom JARs here without rebuilding (provider image only).
+- `/tmp/` — writable scratch (`user.home`).
+
+There is no shell entrypoint — `mainClass` is invoked directly by Jib's launcher. To get a shell for debugging:
+
+```bash
+docker run --rm -it --entrypoint sh fineract:latest
+# or, since /bin/sh exists on Alpine
+```
+
+## JVM tuning at runtime (not at build time)
+
+Because the Jib block does not bake heap settings, **all** memory and GC flags must be supplied at container start. The standard mechanism is `JAVA_TOOL_OPTIONS`, which the JVM reads before parsing `args`. From `kubernetes/fineract-server-deployment.yml`:
+
+```yaml
+env:
+- name: JAVA_TOOL_OPTIONS
+  value: '-Xmx1G -XX:MaxMetaspaceSize=256m'
+```
+
+From `docker-compose-development.yml` (and the env files under `config/docker/env/`):
+
+```
+FINERACT_JAVA_TOOL_OPTIONS=-Xmx1G -XX:MaxMetaspaceSize=256m -Dfile.encoding=UTF-8
+```
+
+If you want G1GC tuning, container-aware ergonomics, or remote debug:
+
+```
+JAVA_TOOL_OPTIONS=-Xmx2G -XX:+UseG1GC -XX:MaxGCPauseMillis=200 \
+                  -XX:+UseContainerSupport -XX:MaxRAMPercentage=75 \
+                  -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
+```
+
+These compose with the four `-D` args already baked into the image (`user.home`, `file.encoding`, `user.timezone`, `java.security.egd`) — no conflicts because they configure orthogonal subsystems.
+
+## Adding a custom JDBC driver or JMS client
+
+Three options, ranked by preference:
+
+1. **Mount at `/app/plugins/`** (provider image only). No image rebuild. Works because of `extraClasspath = ['/app/plugins/*']`. Example for an Oracle driver:
+
+    ```yaml
+    volumes:
+      - ./drivers/ojdbc11.jar:/app/plugins/ojdbc11.jar:ro
+    ```
+
+2. **Add to `jib.dependencies` in `custom/docker/build.gradle`** and rebuild the custom image. Permanent and reviewable.
+
+3. **Edit the upstream provider block.** Only if the driver should be part of every Apache release — almost never the right call for proprietary drivers.
+
+## Common pitfalls
+
+| Symptom                                                                                | Cause                                                                                              | Fix                                                                                  |
+|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| `gradle jib` pushes to `docker.io/library/fineract` and fails with 401                  | `jib.to.image` is unqualified                                                                      | Set `-Djib.to.image=<registry>/<namespace>/fineract`                                  |
+| `Permission denied` writing logs                                                       | Container runs as `nobody:nogroup`                                                                 | Log to stdout (already the default with Logback console appender), not to a file     |
+| Image is `amd64` on Apple Silicon and refuses to run                                    | Build host is intel; arch was hardcoded `amd64`                                                    | Build on aarch64 host, or override `-Djib.from.platforms[0].architecture=arm64`       |
+| `fineract.json` missing inside image                                                   | Ran `gradle jib` directly without `:fineract-provider:resolve` running first                       | Use the wired-up tasks (`tasks.jib.dependsOn(bootJar, resolve)` is meant to prevent this) |
+| Custom module classes missing from `fineract-custom:latest`                            | Module not picked up by the `settings.gradle` discovery loop (`build/` folder name, wrong nesting) | See [Custom Modules](/build/custom-modules) for the discovery rules                   |
+
+## Cross-references
+
+- [Multi-Module Build](/build/gradle-multi-module) — settings.gradle and the module list
+- [Custom Modules](/build/custom-modules) — the dynamic loader that feeds both `settings.gradle` and the custom-docker `jib.dependencies` block
+- [Compose Profiles](/build/docker-compose-profiles) — which `docker-compose-*.yml` consumes which image
+- [Kubernetes Manifests](/build/kubernetes-manifests) — how the image is referenced from the K8s YAMLs
+- [Swagger / OpenAPI generation](/build/swagger-and-openapi) — where `fineract.json` (baked into the image) comes from

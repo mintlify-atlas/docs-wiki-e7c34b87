@@ -1,0 +1,340 @@
+---
+title: "Notes: Polymorphic Annotations on Portfolio Entities"
+sidebarTitle: "Notes"
+description: "Reference for the Fineract Note entity, NoteType discriminator and the polymorphic /v1/{resourceType}/{resourceId}/notes API."
+---
+
+# Notes
+
+`Note` is the free-text annotation entity used across Apache Fineract.
+A single `m_note` row can hang off a client, a group, a loan, a loan
+transaction, a savings account, a savings transaction or a share
+account — the polymorphism is encoded by both the `noteTypeId` integer
+and by the fact that each entity has its own nullable FK column. The
+REST surface mirrors the polymorphism: `/v1/{resourceType}/{resourceId}/
+notes`.
+
+| Concern | Module | Package |
+| --- | --- | --- |
+| `NoteType` enum | `fineract-core` | `org.apache.fineract.portfolio.note.domain` |
+| `Note` entity | `fineract-provider` | `org.apache.fineract.portfolio.note.domain` |
+| `NoteRepository` | `fineract-provider` | `org.apache.fineract.portfolio.note.domain` |
+| `NotesApiResource` (polymorphic) | `fineract-provider` | `org.apache.fineract.portfolio.note.api` |
+| `NoteReadPlatformService(Impl)`, `NoteWritePlatformService(Impl)` | `fineract-provider` | `org.apache.fineract.portfolio.note.service` |
+| Commands / handlers (`CreateNote…`, `UpdateNote…`, `DeleteNote…`) | `fineract-provider` | `org.apache.fineract.portfolio.note.command` / `.handler` |
+| Listeners (notify on client / loan events) | `fineract-provider` | `org.apache.fineract.portfolio.note.listener` |
+| Exceptions: `NoteNotFoundException`, `NoteResourceNotSupportedException` | `fineract-provider` | `org.apache.fineract.portfolio.note.exception` |
+
+## NoteType
+
+The `NoteType` enum is the discriminator. The *third* field is the URL
+fragment the resource accepts — e.g. `clients`, `loans` — and the fourth
+field is a human-readable description.
+
+```java
+public enum NoteType {
+    CLIENT(100,             "noteType.client",            "clients",            "Client note"),
+    LOAN(200,               "noteType.loan",              "loans",              "Loan note"),
+    LOAN_TRANSACTION(300,   "noteType.loan.transaction",  "loanTransactions",   "Loan transaction note"),
+    SAVING_ACCOUNT(500,     "noteType.saving",            "savings",            " account note"),
+    GROUP(600,              "noteType.group",             "groups",             "Group note"),
+    SHARE_ACCOUNT(700,      "noteType.shares",            "accounts/share",     "Share account note"),
+    SAVINGS_TRANSACTION(800,"noteType.savings.transaction","savingsTransactions","Savings transaction note");
+}
+```
+
+Two lookup maps are built in a static initialiser:
+
+```java
+private static final Map<Integer, NoteType> BY_ID  = ...; // noteTypeId → NoteType
+private static final Map<String,  NoteType> BY_API = ...; // apiUrl    → NoteType
+```
+
+| `noteTypeId` | Enum | URL `resourceType` | Anchor field |
+| --- | --- | --- | --- |
+| 100 | `CLIENT` | `clients` | `client_id` |
+| 200 | `LOAN` | `loans` | `loan_id` (and `client_id`) |
+| 300 | `LOAN_TRANSACTION` | `loanTransactions` | `loan_id` + `loan_transaction_id` |
+| 500 | `SAVING_ACCOUNT` | `savings` | `savings_account_id` |
+| 600 | `GROUP` | `groups` | `group_id` |
+| 700 | `SHARE_ACCOUNT` | `accounts/share` | `share_account_id` |
+| 800 | `SAVINGS_TRANSACTION` | `savingsTransactions` | `savings_account_id` + `savings_account_transaction_id` |
+
+There is no `Note 400` — the integer space has gaps for legacy reasons.
+Do not renumber: external systems may have persisted the wire codes.
+
+## Entity
+
+```java
+@Entity
+@Table(name = "m_note")
+public class Note extends AbstractAuditableWithUTCDateTimeCustom<Long> {
+
+    @ManyToOne @JoinColumn(name = "client_id",                       nullable = true)
+    private Client client;
+    @ManyToOne @JoinColumn(name = "group_id",                        nullable = true)
+    private Group group;
+    @ManyToOne @JoinColumn(name = "loan_id",                         nullable = true)
+    private Loan loan;
+    @ManyToOne @JoinColumn(name = "loan_transaction_id",             nullable = true)
+    private LoanTransaction loanTransaction;
+    @ManyToOne @JoinColumn(name = "savings_account_id",              nullable = true)
+    private SavingsAccount savingsAccount;
+    @ManyToOne @JoinColumn(name = "savings_account_transaction_id",  nullable = true)
+    private SavingsAccountTransaction savingsTransaction;
+    @ManyToOne @JoinColumn(name = "share_account_id",                nullable = true)
+    private ShareAccount shareAccount;
+
+    @Column(name = "note", length = 1000)
+    private String note;
+
+    @Column(name = "note_type_enum")
+    private Integer noteTypeId;
+}
+```
+
+Each anchor column is nullable; **exactly one (or in the loan-/savings-
+transaction case, exactly two paired) is set per row**. Listing factory
+methods on the entity make this explicit:
+
+```java
+public static Note clientNote(Client client, String note);
+public static Note groupNote(Group group, String note);
+public static Note loanNote(Loan loan, String note);
+public static Note loanTransactionNote(Loan loan, LoanTransaction tx, String note);
+public static Note savingNote(SavingsAccount account, String note);
+public static Note savingsTransactionNote(SavingsAccount account,
+                                          SavingsAccountTransaction tx, String note);
+public static Note shareNote(ShareAccount account, String note);
+```
+
+The loan / savings / share factories also back-fill `client_id`:
+
+```java
+private Note(final Loan loan, final String note) {
+    this.loan = loan;
+    this.client = loan.client();      // ← back-link
+    this.note = note;
+    this.noteTypeId = NoteType.LOAN.getValue();
+}
+```
+
+This makes "all notes for a client" queries one indexed scan, even though
+the originating note was attached to a loan.
+
+## NotesApiResource
+
+Mounted at `/v1/{resourceType}/{resourceId}/notes`. The `resourceType`
+must be one of the URL fragments in `NoteType.apiUrl`, otherwise the
+write path throws `NoteResourceNotSupportedException`.
+
+| Method | Path | Operation | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/{resourceType}/{resourceId}/notes` | List | `READ_<RESOURCENOTE>` |
+| `GET` | `/v1/{resourceType}/{resourceId}/notes/{noteId}` | Single | `READ_<RESOURCENOTE>` |
+| `POST` | `/v1/{resourceType}/{resourceId}/notes` | Create | `CREATE_<RESOURCENOTE>` |
+| `PUT` | `/v1/{resourceType}/{resourceId}/notes/{noteId}` | Update text | `UPDATE_<RESOURCENOTE>` |
+| `DELETE` | `/v1/{resourceType}/{resourceId}/notes/{noteId}` | Hard delete | `DELETE_<RESOURCENOTE>` |
+
+The permission name is derived from the resource. For example, on a
+client note: `READ_CLIENTNOTE`, `CREATE_CLIENTNOTE`, etc.
+
+### Concrete URLs
+
+| Note type | Example URL |
+| --- | --- |
+| `CLIENT` | `POST /v1/clients/109/notes` |
+| `GROUP` | `POST /v1/groups/12/notes` |
+| `LOAN` | `POST /v1/loans/445/notes` |
+| `LOAN_TRANSACTION` | `POST /v1/loanTransactions/9001/notes` |
+| `SAVING_ACCOUNT` | `POST /v1/savings/77/notes` |
+| `SAVINGS_TRANSACTION` | `POST /v1/savingsTransactions/2002/notes` |
+| `SHARE_ACCOUNT` | `POST /v1/accounts/share/3003/notes` |
+
+### Create request
+
+```http
+POST /v1/clients/109/notes
+Content-Type: application/json
+```
+
+```json
+{ "note": "Met on site, KYC docs received, awaiting verification." }
+```
+
+Validation:
+
+- `note` must be non-blank and ≤ 1000 chars.
+- The resource id must resolve to the right entity for the
+  `resourceType`. The write service translates `resourceType` to a
+  `NoteType` and dispatches to the right factory.
+
+### Response
+
+```json
+{
+  "officeId": 1,
+  "clientId": 109,
+  "resourceId": 23,
+  "resourceIdentifier": 23,
+  "subResourceId": null
+}
+```
+
+`resourceId` is the new `note.id`.
+
+### Update
+
+`PUT /v1/{resourceType}/{resourceId}/notes/{noteId}` only changes the
+`note` text. The entity's `update(String)` returns the change map and
+silently no-ops if the text is unchanged (case-insensitive comparison
+via `Strings.CI.equals`).
+
+### Delete
+
+Hard delete — there is no `is_active` flag. Use sparingly; notes are
+often the only audit trail of conversations.
+
+## Read service
+
+`NoteReadPlatformServiceImpl` builds `NoteData`:
+
+```java
+public record NoteData(
+    Long id, Long clientId, Long groupId, Long loanId,
+    Long loanTransactionId, Long savingsAccountId,
+    Long savingsTransactionId, Long shareAccountId,
+    EnumOptionData noteType, String note,
+    Long createdById, String createdByUsername,
+    OffsetDateTime createdOn, ...
+) {}
+```
+
+The list endpoint filters by the resource columns on `m_note` and
+joins `m_appuser` for the `createdByUsername` resolution.
+
+## Listeners
+
+`org.apache.fineract.portfolio.note.listener` houses listeners that
+automatically create system-generated notes in response to certain
+business events (e.g. loan state changes). Look at the wired
+`@EventListener` methods for the exact list — they are useful to know
+about because they explain why notes can appear without an explicit user
+action.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `NoteNotFoundException` | Bad `noteId` |
+| `NoteResourceNotSupportedException` | `resourceType` not recognised by `NoteType.fromApiUrl` |
+| `ClientNotFoundException` / `LoanNotFoundException` / etc. | The anchor entity id is bad |
+
+## Patterns
+
+- **Conversation history on a client** — `GET /v1/clients/{id}/notes`
+  returns *all* notes whose `client_id = id`, including those that were
+  originally attached to a loan or savings account (because the
+  factories back-link `client_id`). This avoids merging multiple
+  endpoints client-side.
+- **System notes** — system-generated notes carry the standard audit
+  fields; filter on `createdByUsername == "system"` (or the configured
+  system user) in your UI to differentiate them.
+- **External-id round-tripping** — when integrating with an external
+  CRM, store the upstream record id in `note.note` itself (1000 chars is
+  enough) or stash it in a structured way like
+  `"[crm:42] note text..."`.
+
+## Response shapes
+
+### Single note
+
+```json
+{
+  "id": 23,
+  "clientId": 109,
+  "groupId": null,
+  "loanId": null,
+  "loanTransactionId": null,
+  "savingsAccountId": null,
+  "savingsTransactionId": null,
+  "shareAccountId": null,
+  "noteType": { "id": 100, "code": "noteType.client", "value": "Client note" },
+  "note": "Met on site, KYC docs received, awaiting verification.",
+  "createdById": 12,
+  "createdByUsername": "loanofficer1",
+  "createdOn": "2025-01-27T09:42:13Z",
+  "updatedById": 12,
+  "updatedByUsername": "loanofficer1",
+  "updatedOn": "2025-01-27T09:42:13Z"
+}
+```
+
+### List
+
+A flat array of the same shape, ordered by `createdOn DESC`.
+
+## Command handlers
+
+| Handler | Triggered by |
+| --- | --- |
+| `CreateNoteCommandHandler` | `POST /v1/{resourceType}/{id}/notes` |
+| `UpdateNoteCommandHandler` | `PUT  /v1/{resourceType}/{id}/notes/{noteId}` |
+| `DeleteNoteCommandHandler` | `DELETE /v1/{resourceType}/{id}/notes/{noteId}` |
+
+The resource type is propagated to the handler as a `NoteType` so the
+write service can resolve the right anchor entity:
+
+```java
+NoteType noteType = NoteType.fromApiUrl(resourceType);
+if (noteType == null) {
+    throw new NoteResourceNotSupportedException(resourceType);
+}
+```
+
+## Listener-generated notes
+
+The `note.listener` package wires a handful of `@EventListener` beans
+that auto-create notes in response to portfolio events. Typical
+examples (consult the package for the authoritative list):
+
+- A note is appended to a client when its status changes (activate /
+  close / reactivate).
+- A loan-transaction note is appended on certain LoanTransaction events
+  (e.g. write-off).
+
+Distinguish system-generated notes by inspecting `createdByUsername`
+against the configured system user, or by querying for the note text
+prefix used by the listeners.
+
+## Common exceptions
+
+| Exception | When |
+| --- | --- |
+| `NoteNotFoundException` | Bad `noteId` |
+| `NoteResourceNotSupportedException` | `resourceType` not in `NoteType.BY_API` |
+| `ClientNotFoundException` / `LoanNotFoundException` / `GroupNotFoundException` / etc. | Anchor entity does not resolve |
+
+## Read service
+
+`NoteReadPlatformServiceImpl` filters by the anchor column corresponding
+to the URL `resourceType`:
+
+```sql
+SELECT n.* , au.id AS createdById, au.username AS createdByUsername, ...
+FROM m_note n
+LEFT JOIN m_appuser au ON au.id = n.createdby_id
+WHERE n.client_id = ?      -- when resourceType = clients
+ORDER BY n.created_date DESC
+```
+
+The mapper resolves `noteTypeId` through `NoteType.fromInt` and wraps it
+in `EnumOptionData(id, code, description)`.
+
+## Cross-references
+
+- [Clients](/portfolio/clients), [Groups and Centers](/portfolio/groups-and-centers)
+- [Loan overview](/loan/overview), [Savings overview](/savings/overview)
+- [Portfolio shared domain](/core/portfolio-shared-domain) — the
+  auditing superclass
+- [Portfolio APIs index](/api/portfolio-apis)
