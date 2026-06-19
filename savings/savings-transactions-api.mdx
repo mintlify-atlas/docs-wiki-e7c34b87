@@ -1,0 +1,286 @@
+---
+title: "Savings Transactions API Subsystem — Apache Fineract"
+sidebarTitle: "Transactions API"
+description: "Internal map of SavingsAccountTransactionsApiResource: path constants, CommandWrapperBuilder factories, permission codes and the JPA write-path."
+---
+
+This page is the subsystem-internal counterpart of the public [Savings Account Transactions](/api/savings-account-transactions) reference. Apache Fineract routes every money movement on a `SavingsAccount` — deposit, withdrawal, force-withdrawal, hold, release, post-interest, undo, reverse, modify — through one Jersey resource class and one entry point on the command bus. This page lists each endpoint, the `CommandWrapperBuilder` factory it calls, and what happens between `logCommandSource` and the JPA save.
+
+## Source
+
+```
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsAccountTransactionsApiResource.java
+```
+
+Declaration (line 70):
+
+```java
+@Path("/v1/savingsaccounts/{savingsId}/transactions")
+@Component
+@Tag(name = "Savings Account Transactions", description = "")
+@RequiredArgsConstructor
+public class SavingsAccountTransactionsApiResource {
+```
+
+Swagger payload classes live in `SavingsAccountTransactionsApiResourceSwagger.java` in the same package.
+
+## Collaborators
+
+| Field | Role |
+|---|---|
+| `PlatformSecurityContext` | Calls `validateHasReadPermission(SAVINGS_ACCOUNT_RESOURCE_NAME)` on every GET. |
+| `DefaultToApiJsonSerializer<SavingsAccountTransactionData>` | JSON serialisation of read results. |
+| `PortfolioCommandSourceWritePlatformService` | Single entry into the command pipeline. |
+| `ApiRequestParameterHelper` | Parses `pretty`, `associations`, partial-response settings. |
+| `SavingsAccountReadPlatformService` | Read delegate for `retrieveOne`, `template`, transaction projections. |
+| `PaymentTypeReadService` | Populates payment-type options on the template. |
+| `SavingsAccountTransactionSearchService` | Search and advanced-query backends. |
+
+## Path and permission constants
+
+From `fineract-core/src/main/java/org/apache/fineract/portfolio/savings/SavingsApiConstants.java`:
+
+| Constant | Value |
+|---|---|
+| `SAVINGS_ACCOUNT_RESOURCE_NAME` | `"savingsaccount"` |
+| `SAVINGS_ACCOUNT_TRANSACTION_RESOURCE_NAME` | `"savingsaccount.transaction"` |
+| `COMMAND_HOLD_AMOUNT` | `"holdAmount"` |
+| `COMMAND_RELEASE_AMOUNT` | `"releaseAmount"` |
+| `COMMAND_UNDO_TRANSACTION` | `"undo"` |
+| `COMMAND_REVERSE_TRANSACTION` | `"reverse"` |
+| `COMMAND_ADJUST_TRANSACTION` | `"modify"` |
+
+Reads check `validateHasReadPermission("savingsaccount")` directly. Writes derive their permission code from the action / entity pair attached to the `CommandWrapper` — e.g. `DEPOSIT_SAVINGSACCOUNT`, `WITHDRAWAL_SAVINGSACCOUNT`, `HOLDAMOUNT_SAVINGSACCOUNT`, `UNDOTRANSACTION_SAVINGSACCOUNT`, `REVERSETRANSACTION_SAVINGSACCOUNT`, `ADJUSTTRANSACTION_SAVINGSACCOUNT`, `RELEASEAMOUNT_SAVINGSACCOUNT`.
+
+## Endpoint table
+
+`@Path` is relative to `/v1/savingsaccounts/{savingsId}/transactions`. The dispatch is by the `?command=` query parameter for writes.
+
+| Method | Sub-path | Param | Builder factory or read delegate |
+|---|---|---|---|
+| `GET` | `template` | — | `SavingsAccountReadPlatformService.retrieveDepositTransactionTemplate` + `PaymentTypeReadService.retrieveAllPaymentTypes` |
+| `GET` | `{transactionId}` | — | `SavingsAccountReadPlatformService.retrieveSavingsTransaction(savingsId, transactionId, DepositAccountType.SAVINGS_DEPOSIT)` |
+| `GET` | `search` | `TransactionSearchRequest` query params | `SavingsAccountTransactionSearchService.searchTransactions` |
+| `POST` | `query` | `AdvancedQueryRequest` body | `SavingsAccountTransactionSearchService.queryTransactions` |
+| `POST` | `` | `command=deposit` | `savingsAccountDeposit(savingsId)` |
+| `POST` | `` | `command=gsimDeposit` | `gsimSavingsAccountDeposit(savingsId)` |
+| `POST` | `` | `command=withdrawal` | `savingsAccountWithdrawal(savingsId)` |
+| `POST` | `` | `command=force-withdrawal` | `savingsAccountForceWithdrawal(savingsId)` |
+| `POST` | `` | `command=postInterestAsOn` | `savingsAccountInterestPosting(savingsId)` |
+| `POST` | `` | `command=holdAmount` | `holdAmount(savingsId)` |
+| `POST` | `{transactionId}` | `command=undo` | `undoSavingsAccountTransaction(savingsId, transactionId)` |
+| `POST` | `{transactionId}` | `command=reverse` | `reverseSavingsAccountTransaction(savingsId, transactionId)` |
+| `POST` | `{transactionId}` | `command=modify` | `adjustSavingsAccountTransaction(savingsId, transactionId)` |
+| `POST` | `{transactionId}` | `command=releaseAmount` | `releaseAmount(savingsId, transactionId)` |
+
+Any other `command=` value throws `UnrecognizedQueryParamException` listing the allowed values.
+
+## How the resource dispatches a `POST`
+
+The `transaction(...)` method on the resource uses a Java `switch` expression:
+
+```java
+final CommandWrapper commandRequest = switch (StringUtils.trimToEmpty(commandParam)) {
+    case "deposit"            -> builder.savingsAccountDeposit(savingsId).build();
+    case "gsimDeposit"        -> builder.gsimSavingsAccountDeposit(savingsId).build();
+    case "withdrawal"         -> builder.savingsAccountWithdrawal(savingsId).build();
+    case "force-withdrawal"   -> builder.savingsAccountForceWithdrawal(savingsId).build();
+    case "postInterestAsOn"   -> builder.savingsAccountInterestPosting(savingsId).build();
+    case SavingsApiConstants.COMMAND_HOLD_AMOUNT -> builder.holdAmount(savingsId).build();
+    default -> throw new UnrecognizedQueryParamException("command", commandParam, ...);
+};
+final CommandProcessingResult result = this.commandsSourceWritePlatformService.logCommandSource(commandRequest);
+```
+
+The transaction-id endpoint (`adjustTransaction`) uses the same pattern but supplies the `transactionId` to the builder so the produced `CommandWrapper` has `entityId = accountId`, `subentityId = transactionId` and `transactionId = transactionId.toString()`.
+
+`CommandWrapperBuilder.savingsAccountDeposit` (in `fineract-core`) is representative:
+
+```java
+public CommandWrapperBuilder savingsAccountDeposit(final Long accountId) {
+    this.actionName = "DEPOSIT";
+    this.entityName = "SAVINGSACCOUNT";
+    this.savingsId  = accountId;
+    this.entityId   = null;
+    this.href       = "/savingsaccounts/" + accountId + "/transactions";
+    return this;
+}
+```
+
+`holdAmount`, `releaseAmount` and the undo / reverse / modify builders set actions `HOLDAMOUNT`, `RELEASEAMOUNT`, `UNDOTRANSACTION`, `REVERSETRANSACTION`, `ADJUSTTRANSACTION` and supply a `subentityId` for the transaction-id endpoints.
+
+## Request lifecycle into the JPA write service
+
+Once `commandsSourceWritePlatformService.logCommandSource(commandRequest)` is called, the path is:
+
+1. `PortfolioCommandSourceWritePlatformServiceImpl.logCommandSource` rehydrates the JSON body into a `JsonCommand`, resolves the maker-checker decision via `CommandSourceService`, and forwards to `SynchronousCommandProcessingService.executeCommand(wrapper, command, isApprovedByChecker)`.
+2. `SynchronousCommandProcessingService` looks up the handler keyed by `entity + action` via `CommandHandlerProvider`. For deposit that is `DepositSavingsAccountCommandHandler` annotated `@CommandType(entity = "SAVINGSACCOUNT", action = "DEPOSIT")`.
+3. The handler calls a single method on `SavingsAccountWritePlatformService`:
+
+| Action | Handler | Write-service method |
+|---|---|---|
+| `DEPOSIT` | `DepositSavingsAccountCommandHandler` | `deposit(savingsId, command)` |
+| `WITHDRAWAL` | `WithdrawSavingsAccountCommandHandler` | `withdraw(savingsId, command)` |
+| `HOLDAMOUNT` | `HoldAmountFromSavingsAccountCommandHandler` | `holdAmount(savingsId, command)` |
+| `RELEASEAMOUNT` | `ReleaseAmountFromSavingsAccountCommandHandler` | `releaseAmount(savingsTransactionId)` |
+| `UNDOTRANSACTION` | `UndoTransactionSavingsAccountCommandHandler` | `undoTransaction(savingsId, transactionId, allowAccountTransferModification)` |
+| `REVERSETRANSACTION` | `ReverseTransactionSavingsAccountCommandHandler` | `reverseTransaction(savingsId, transactionId, allowAccountTransferModification)` |
+| `ADJUSTTRANSACTION` | `AdjustTransactionSavingsAccountCommandHandler` | `adjustSavingsTransaction(savingsId, transactionId, command)` |
+| `POSTINTEREST` (`postInterestAsOn`) | `PostInterestSavingsAccountCommandHandler` | `postInterest(savingsId, postInterestOnDate, isInterestTransfer)` |
+
+4. The write-service method is `@Transactional`, loads the `SavingsAccount` aggregate through `SavingsAccountAssembler`, mutates it, persists, then publishes a `BusinessEvent` (e.g. `SavingsDepositBusinessEvent`).
+5. `SynchronousCommandProcessingService` saves the `CommandSource` row, returns the `CommandProcessingResult`, and the resource serialises it.
+
+The full pipeline is documented under [Command sources](/command/command-source) and [Synchronous command processing](/command/synchronous-command-processing).
+
+## JPA linkage
+
+Every transaction endpoint touches:
+
+| Table | JPA entity | When |
+|---|---|---|
+| `m_savings_account_transaction` | `SavingsAccountTransaction` | every write; reads also hit this table via the search service. |
+| `m_savings_account` | `SavingsAccount` | running balance, status, `lastInterestPostedTill`, on-hold totals all live on the parent row. |
+| `m_deposit_account_on_hold_transaction` | `DepositAccountOnHoldTransaction` | hold / release endpoints. |
+| `m_account_transfer_transaction` | `AccountTransferTransaction` | `undoTransaction` and `reverseTransaction` use the `allowAccountTransferModification` flag to bridge into the account-transfer module. |
+| `m_savings_account_charge_paid_by` | `SavingsAccountChargePaidBy` | populated when the transaction pays a charge. |
+| `m_payment_detail` | `PaymentDetail` | optional `paymentTypeId` / cheque / bank info from the body. |
+| `acc_gl_journal_entry` | `JournalEntry` | the accounting processor fires asynchronously once the transaction is saved — see [Accrual Postings](/accounting/accrual-postings). |
+
+The constants for transaction types live on `SavingsAccountTransactionType` and are saved as the `transaction_type_enum` column; the values are `DEPOSIT(1)`, `WITHDRAWAL(2)`, `INTEREST_POSTING(4)`, `WITHDRAWAL_FEE(5)`, `ANNUAL_FEE(6)`, `WAIVE_CHARGES(7)`, `PAY_CHARGE(8)`, `DIVIDEND_PAYOUT(9)`, `INITIATE_TRANSFER(12)`, `APPROVE_TRANSFER(13)`, `WITHDRAW_TRANSFER(14)`, `REJECT_TRANSFER(15)`, `OVERDRAFT_INTEREST(16)`, `WRITTEN_OFF(17)`, `OVERDRAFT_FEE(18)`, `HOLD_AMOUNT(20)`, `RELEASE_AMOUNT(21)`, `ACCRUAL(22)`. The accrual code is what the [Savings Accrual](/savings/savings-accrual) job writes.
+
+## Search and advanced query
+
+`GET search` accepts a `TransactionSearchRequest` (typed values, status, date range, payment type) and returns a Spring `Page<SavingsAccountTransactionData>` ordered by the `sortOrder` query parameter. `POST query` accepts an `AdvancedQueryRequest` (the same JSONata-style filter language used elsewhere in Fineract) and routes through `SavingsAccountTransactionSearchService.queryTransactions(savingsId, request, pageable)`.
+
+Both backends share a single read query so the columns returned match the `SavingsAccountTransactionData` projection used by `retrieveOne`.
+
+## Reading a single transaction
+
+`GET {transactionId}` is the simplest endpoint:
+
+```java
+public String retrieveOne(@PathParam("savingsId") final Long savingsId,
+        @PathParam("transactionId") final Long transactionId,
+        @Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(SAVINGS_ACCOUNT_RESOURCE_NAME);
+    SavingsAccountTransactionData transactionData =
+            savingsAccountReadPlatformService.retrieveSavingsTransaction(
+                    savingsId, transactionId, DepositAccountType.SAVINGS_DEPOSIT);
+    ApiRequestJsonSerializationSettings settings =
+            apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, transactionData,
+            SavingsApiSetConstants.SAVINGS_TRANSACTION_RESPONSE_DATA_PARAMETERS);
+}
+```
+
+The `DepositAccountType.SAVINGS_DEPOSIT` discriminator is passed because the same read service powers the FD and RD transaction resources, which call the method with `FIXED_DEPOSIT` or `RECURRING_DEPOSIT` instead.
+
+The response shape is `SavingsAccountTransactionData`, the same DTO used by the search and advanced-query endpoints, so any consumer that paginates transactions can reuse the same Jackson model for the single-row retrieval.
+
+## The `template` endpoint
+
+`GET template?savingsId=…` returns the empty transaction shape clients use to populate the deposit / withdrawal form:
+
+```java
+SavingsAccountTransactionData savingsAccount =
+        savingsAccountReadPlatformService.retrieveDepositTransactionTemplate(
+                savingsId, DepositAccountType.SAVINGS_DEPOSIT);
+Collection<PaymentTypeData> paymentTypeOptions =
+        paymentTypeReadPlatformService.retrieveAllPaymentTypes();
+savingsAccount = SavingsAccountTransactionData.templateOnTop(savingsAccount, paymentTypeOptions);
+```
+
+`templateOnTop` is a static factory that copies the parent envelope (savings id, account number, currency) and bolts on the payment-type options. The endpoint intentionally does *not* call any write service.
+
+## Search and advanced-query backends
+
+The advanced-query endpoint accepts a JSONata-style request:
+
+```java
+@POST
+@Path("query")
+public String advancedQuery(@PathParam("savingsId") final Long savingsId,
+        AdvancedQueryRequest request, @Context final UriInfo uriInfo) {
+    ...
+    Page<JsonObject> page = transactionsSearchService.queryAdvanced(savingsId, request);
+    ...
+}
+```
+
+The `Page` returned is `org.springframework.data.domain.Page`, which is why this resource imports the Spring page rather than the Fineract one. Pagination metadata (`number`, `size`, `totalElements`) is therefore serialised in the Spring convention for these two endpoints only.
+
+The `search` endpoint binds query parameters into a `TransactionSearchRequest`:
+
+| Query parameter | Field |
+|---|---|
+| `fromSubmittedDate` / `toSubmittedDate` | submitted-on range. |
+| `fromAmount` / `toAmount` | transaction amount range. |
+| `types` | comma-separated `SavingsAccountTransactionType` ids. |
+| `credit` | filter to credit-side transactions. |
+| `debit` | filter to debit-side transactions. |
+| `excludeReversed` | exclude transactions where `is_reversed = 1`. |
+
+Both backends share the same SQL row mapper as `retrieveOne`, so the response columns are identical.
+
+## Maker / checker
+
+When the tenant has maker / checker turned on for a permission (e.g. `WITHDRAWAL_SAVINGSACCOUNT`), `PortfolioCommandSourceWritePlatformServiceImpl.logCommandSource` returns a `CommandProcessingResult` with `resourceId` set but the `isMakerChecker` flag true and no actual mutation performed. A second user then approves the staged `m_portfolio_command_source` row via the `/v1/makercheckers/{id}?command=approve` endpoint, at which point `processAndLogCommandService.executeCommand` is invoked again with `isApprovedByChecker = true`.
+
+The transactions resource itself contains no code path for the checker step — that runs entirely inside the command-source module — but the endpoints behave exactly the same way both pre- and post-approval.
+
+## Adjust / undo / reverse semantics
+
+The three transaction-id endpoints differ in how the savings ledger is rewritten:
+
+| Command | Effect on the original transaction | Effect on the account | Compensating transaction written |
+|---|---|---|---|
+| `undo` | marked `is_reversed = 1`, `manuallyAdjustedOrReversed`. | running balance recomputed back to the previous state. | none — the row stays, just flagged. |
+| `reverse` | marked `is_reversed = 1`. | running balance recomputed. | none — the row stays. |
+| `modify` | marked `is_reversed = 1`. | running balance recomputed. | a new transaction is created with the adjusted amount and a back-link via `originalTxnId`. |
+| `releaseAmount` | reduces the active on-hold amount. | `account.totalOnHold` is decremented. | a `RELEASE_AMOUNT` (`21`) transaction is created. |
+
+For `undo` and `reverse` the write service additionally recomputes every downstream `INTEREST_POSTING` transaction whose `transactionDate >= reversedTxnDate` to keep the balance arithmetic consistent. That recomputation reuses the same code path as the [Interest Posting Job](/savings/interest-posting-job).
+
+## Hold and release flow
+
+`POST` (no transaction id) with `command=holdAmount` and the matching `POST {transactionId}?command=releaseAmount` are the only endpoints whose write-service method does *not* take `JsonCommand`-only arguments. The hold flow is:
+
+1. The body is parsed into a `JsonCommand` containing `amount`, `transactionDate`, `reasonForBlock`, optional `lien` flag.
+2. `holdAmount` is bound to `entity = "SAVINGSACCOUNT"`, `action = "HOLDAMOUNT"`. The handler is `HoldAmountFromSavingsAccountCommandHandler`.
+3. The write service inserts a `SavingsAccountTransaction` of type `HOLD_AMOUNT` (`20`) *and* a `DepositAccountOnHoldTransaction` row.
+4. `m_savings_account.totalOnHold` is incremented; the running balance is unchanged because hold transactions do not move money — they just earmark it.
+
+Release reverses (2)–(4) and writes a `RELEASE_AMOUNT` (`21`) transaction with `originalTxnId` pointing at the hold transaction.
+
+See [Deposit Account On Hold Funds](/savings/deposit-account-on-hold-funds) for the lien semantics on top.
+
+## Force withdrawal
+
+`command=force-withdrawal` bypasses the normal balance and lock-in validation that `command=withdrawal` runs. It is intended for operations such as government-mandated debits and is gated by a separate permission `FORCEWITHDRAWAL_SAVINGSACCOUNT`. The wrapper:
+
+```java
+public CommandWrapperBuilder savingsAccountForceWithdrawal(final Long accountId) {
+    this.actionName = "FORCEWITHDRAWAL";
+    this.entityName = "SAVINGSACCOUNT";
+    this.savingsId  = accountId;
+    this.entityId   = null;
+    this.href       = "/savingsaccounts/" + accountId + "/transactions";
+    return this;
+}
+```
+
+The handler resolves to `ForceWithdrawSavingsAccountCommandHandler` which calls `SavingsAccountWritePlatformService.withdraw(savingsId, command, false /* applyWithdrawalFee */, false /* runEnforceMinimumBalance */, true /* forced */)`. The savings ledger is mutated identically to a normal withdrawal — just with the validators turned off.
+
+## Related pages
+
+- [Savings Account Transactions (public API contract)](/api/savings-account-transactions)
+- [Savings Accounts API (subsystem)](/savings/savings-accounts-api)
+- [Savings Product API (subsystem)](/savings/savings-product-api)
+- [Savings Transactions (domain)](/savings/savings-transactions)
+- [Savings Write Service](/savings/savings-write-service)
+- [Savings Overview](/savings/overview)
+- [Interest Posting Job](/savings/interest-posting-job)
+- [Savings Accrual](/savings/savings-accrual)
+- [Job Names Enumeration](/jobs/job-names-enumeration)
+- [Accrual Postings](/accounting/accrual-postings)

@@ -1,0 +1,224 @@
+---
+title: "REST Conventions, Command Query, and Envelopes"
+sidebarTitle: "Conventions"
+description: "HTTP methods, the command= query parameter pattern, the CommandProcessingResult envelope, pagination, date locale rules, and standard error JSON used by Fineract."
+---
+
+Fineract's REST surface is largely **command-oriented** rather than RESTful in the strict CRUD sense. This page documents the cross-cutting conventions that every [`*ApiResource`](/api/overview) follows: HTTP method choice, the `?command=...` query parameter that overloads POST, the `CommandProcessingResult` write envelope, list pagination, date formatting, and standard error JSON.
+
+## HTTP method conventions
+
+| Method | Used for | Body | Idempotent? |
+| --- | --- | --- | --- |
+| `GET` | Reads (single, list, template) | none | yes |
+| `POST` (no `command=`) | Create a new resource | JSON | no |
+| `POST` (with `?command=X`) | State transition on an existing resource | JSON | depends on `X` |
+| `PUT` | Full or partial update of a resource | JSON | mostly |
+| `DELETE` | Hard delete (pending entities) or soft close | none | yes |
+
+Concrete examples:
+
+- `POST /v1/clients` — create a client.
+- `POST /v1/clients/{id}?command=activate` — transition the client to active.
+- `POST /v1/clients/{id}?command=close` — close the client.
+- `POST /v1/loans/{id}?command=approve` — approve a loan application.
+- `PUT /v1/clients/{id}` — patch the client's basic fields.
+- `DELETE /v1/clients/{id}` — delete a *pending* client (cannot delete once active).
+
+## The `command=` query parameter
+
+Most "verbs" on an existing aggregate are dispatched off a single `POST /resource/{id}` endpoint, switched on `?command=...`. The resource method extracts `commandParam` and builds a different `CommandWrapper` per value.
+
+Excerpt from [`ClientsApiResource`](/api/clients) (`fineract-provider/src/main/java/org/apache/fineract/portfolio/client/api/ClientsApiResource.java`):
+
+```java
+@POST
+@Path("{clientId}")
+public String activate(@PathParam("clientId") final Long clientId,
+        @QueryParam("command") final String commandParam,
+        final String apiRequestBodyAsJson) {
+
+    final CommandWrapperBuilder builder =
+        new CommandWrapperBuilder().withJson(apiRequestBodyAsJson);
+    CommandWrapper commandRequest = null;
+    if (is(commandParam, "activate")) {
+        commandRequest = builder.activateClient(clientId).build();
+    } else if (is(commandParam, "close")) {
+        commandRequest = builder.closeClient(clientId).build();
+    } else if (is(commandParam, "reject")) {
+        commandRequest = builder.rejectClient(clientId).build();
+    } else if (is(commandParam, "withdraw")) {
+        commandRequest = builder.withdrawClient(clientId).build();
+    }
+    // ... more commands ...
+    final CommandProcessingResult result =
+        commandsSourceWritePlatformService.logCommandSource(commandRequest);
+    return toApiJsonSerializer.serialize(result);
+}
+```
+
+If `commandParam` does not match any known value, the resource throws `UnrecognizedQueryParamException` and the HTTP response is 400.
+
+### Common command values
+
+These appear repeatedly. The exact set per aggregate is documented on each ApiResource page.
+
+| Command | Where | Effect |
+| --- | --- | --- |
+| `activate` | clients, groups, centers, loans, savings | move from pending → active |
+| `close` | clients, groups, loans, savings | terminate the aggregate |
+| `reject` | clients, loans | reject a pending application |
+| `withdraw` | clients, loans | withdraw a pending application |
+| `reactivate` | clients | reopen after close |
+| `undoReject` / `undoWithdraw` | clients, loans | revert a rejection/withdrawal |
+| `assignStaff` / `unassignStaff` | clients, groups | (un)bind a loan officer |
+| `proposeTransfer`, `acceptTransfer`, `withdrawTransfer`, `rejectTransfer`, `proposeAndAcceptTransfer` | clients | inter-office transfer state machine |
+| `updateSavingsAccount` | clients | change default savings account |
+| `generateCollectionSheet` | groups, centers | produce a collection sheet snapshot |
+
+## Response envelope: `CommandProcessingResult`
+
+Every write endpoint returns the same shape, regardless of which aggregate was touched. The class lives at `fineract-core/src/main/java/org/apache/fineract/infrastructure/core/data/CommandProcessingResult.java`.
+
+```json
+{
+  "officeId": 1,
+  "groupId": null,
+  "clientId": 42,
+  "loanId": null,
+  "savingsId": null,
+  "resourceId": 42,
+  "subResourceId": null,
+  "resourceIdentifier": "42",
+  "transactionId": null,
+  "changes": {
+    "firstname": "Jane",
+    "lastname": "Doe"
+  },
+  "commandId": 1719876543210,
+  "rollbackTransaction": false
+}
+```
+
+Key fields:
+
+- **`resourceId`** — the primary id of the affected aggregate (always present on success).
+- **`subResourceId`** — id of a child entity, e.g. a newly created charge or identifier.
+- **`resourceIdentifier`** — string form (used when the natural identifier is not a Long).
+- **`changes`** — map of `{field: newValue}` describing exactly what the command mutated. Empty `{}` if nothing changed; missing entirely if the call is a creation.
+- **`commandId`** — id assigned by the `m_portfolio_command_source` audit row. Use this to look up the command in [Command Source](/command/command-source).
+- **`<aggregate>Id`** fields (`clientId`, `loanId`, `groupId`, `officeId`, `savingsId`) — populated when the command is scoped to that entity.
+
+Read endpoints do **not** wrap responses in `CommandProcessingResult` — they return the raw DTO JSON.
+
+## Pagination
+
+Lists that support paging accept these query parameters:
+
+| Param | Type | Default |
+| --- | --- | --- |
+| `offset` | int | 0 |
+| `limit` | int | 200 (capped per resource; see `SearchParameters`) |
+| `orderBy` | string | resource-specific |
+| `sortOrder` | string | `ASC` or `DESC` |
+
+The response is a `Page<DTO>` of the form:
+
+```json
+{
+  "totalFilteredRecords": 1234,
+  "pageItems": [ { "id": 1, "...": "..." }, { "id": 2, "...": "..." } ]
+}
+```
+
+`totalFilteredRecords` is the count after filters but before paging (so paging UIs can show "page 3 of N"). v2 endpoints use Spring Data's `Page<T>` envelope instead (with `content`, `totalElements`, `totalPages`, `number`, `size`).
+
+## Dates: `locale` and `dateFormat`
+
+Every endpoint that **accepts** a date in the body or query requires two companion fields:
+
+- `locale` — IETF locale tag, e.g. `en` or `en_GB`. Controls number/date parsing.
+- `dateFormat` — Java `SimpleDateFormat` pattern, e.g. `dd MMMM yyyy` or `yyyy-MM-dd`.
+
+Example body for `POST /v1/clients`:
+
+```json
+{
+  "officeId": 1,
+  "firstname": "Jane",
+  "lastname": "Doe",
+  "active": true,
+  "activationDate": "04 March 2024",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+If `locale` is missing the request fails with `400` and a `validation.msg.validation.errors.exist` error. Responses always emit ISO-8601 dates regardless of input format — the input format is only consumed by `DateUtils.parseLocalDate`.
+
+## Error JSON
+
+Validation errors land in this shape:
+
+```json
+{
+  "developerMessage": "The request was invalid. This typically will happen due to validation errors which are provided.",
+  "httpStatusCode": "400",
+  "defaultUserMessage": "Validation errors exist.",
+  "userMessageGlobalisationCode": "validation.msg.validation.errors.exist",
+  "errors": [
+    {
+      "developerMessage": "The parameter `firstname` is mandatory.",
+      "defaultUserMessage": "The parameter `firstname` is mandatory.",
+      "userMessageGlobalisationCode": "validation.msg.client.firstname.cannot.be.blank",
+      "parameterName": "firstname"
+    }
+  ]
+}
+```
+
+Permission errors return `403`:
+
+```json
+{
+  "developerMessage": "The user does not have enough permissions to access this resource.",
+  "httpStatusCode": "403",
+  "defaultUserMessage": "User has no permission to read clients.",
+  "userMessageGlobalisationCode": "error.msg.no.permission",
+  "errors": []
+}
+```
+
+Not-found returns `404`:
+
+```json
+{
+  "developerMessage": "The requested resource is not available.",
+  "httpStatusCode": "404",
+  "defaultUserMessage": "Client with identifier 999 does not exist",
+  "userMessageGlobalisationCode": "error.msg.client.id.invalid",
+  "errors": [ { "parameterName": "id", "value": "999" } ]
+}
+```
+
+Optimistic-lock / data-integrity failures return `403` with code `error.msg.platform.data.integrity.issue`.
+
+## Common query parameters across resources
+
+| Param | Effect |
+| --- | --- |
+| `fields=a,b,c` | Project the response to only the listed fields. Implemented by `ApiParameterHelper.extractFieldsParameter`. |
+| `template=true` | Bundle dropdown options inline (countries, types, codes). |
+| `pretty=true` | Pretty-print the JSON. |
+| `tenantIdentifier=<id>` | Equivalent to the `Fineract-Platform-TenantId` header — used by report URLs. |
+
+## Idempotency
+
+`POST` and `PUT` accept an optional `Idempotency-Key` header. If present, replaying the same request returns the cached `CommandProcessingResult` from the first call. See [Command](/command/idempotency) for the storage model.
+
+## Cross-references
+
+- [Authentication endpoints](/api/authentication-endpoints) — basic auth, OAuth2, 2FA.
+- [Tenant header](/api/tenant-header) — required on every call.
+- [Jersey paths](/api/jersey-paths) — how `@Path` is discovered.
+- [Command pipeline](/command/synchronous-command-processing) — what `commandsSourceWritePlatformService.logCommandSource` does after a write endpoint hands it the wrapper.

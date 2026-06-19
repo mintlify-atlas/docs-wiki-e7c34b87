@@ -1,0 +1,271 @@
+---
+title: "POST_INTEREST_FOR_SAVINGS Batch Job — Apache Fineract"
+sidebarTitle: "Interest Posting Job"
+description: "Internal reference for the Apache Fineract POST_INTEREST_FOR_SAVINGS Spring Batch job: tasklet, thread pool, queue and JPA writes."
+---
+
+Apache Fineract posts savings interest with a dedicated Spring Batch job, `POST_INTEREST_FOR_SAVINGS`, which sweeps every active savings account, computes interest for the closed posting periods, and writes one `INTEREST_POSTING` transaction per period. The job is the production code path behind the daily `0 0 0 1/1 * ? *` schedule listed in [Job Names Enumeration](/jobs/job-names-enumeration) and is parallelised across a configurable thread pool with batched JDBC writes.
+
+## Source
+
+```
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/jobs/postinterestforsavings/
+├── PostInterestForSavingConfig.java
+└── PostInterestForSavingTasklet.java
+```
+
+The interest-poster delegate that actually does the math lives in:
+
+```
+fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsSchedularInterestPoster.java
+fineract-savings/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsSchedularInterestPosterTask.java
+```
+
+## JobName
+
+The enum entry is in `fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`:
+
+```java
+POST_INTEREST_FOR_SAVINGS("Post Interest For Savings"),
+```
+
+The display name `"Post Interest For Savings"` is what appears in `m_job` and what the scheduler UI shows.
+
+## Configuration class
+
+`PostInterestForSavingConfig` is a `@Configuration` that exposes the step and the job:
+
+```java
+@Bean
+protected Step postInterestForSavingStep(PostInterestForSavingTasklet postInterestForSavingTasklet) {
+    return new StepBuilder(JobName.POST_INTEREST_FOR_SAVINGS.name(), jobRepository)
+            .tasklet(postInterestForSavingTasklet, transactionManager).build();
+}
+
+@Bean
+public Job postInterestForSavingJob(PostInterestForSavingTasklet postInterestForSavingTasklet) {
+    return new JobBuilder(JobName.POST_INTEREST_FOR_SAVINGS.name(), jobRepository)
+            .start(postInterestForSavingStep(postInterestForSavingTasklet))
+            .incrementer(new RunIdIncrementer())
+            .build();
+}
+```
+
+Both the step name and the job name resolve to `POST_INTEREST_FOR_SAVINGS` (the enum constant name), which is the key the Fineract scheduler uses when it looks up Spring Batch jobs.
+
+The collaborators wired by `@Autowired` into the config are:
+
+| Field | Used for |
+|---|---|
+| `JobRepository` | Spring Batch metadata persistence. |
+| `PlatformTransactionManager` | Surrounds the tasklet (the inner posting uses its own `@Transactional` boundary). |
+| `SavingsAccountReadPlatformService` | `retrieveAllSavingsDataForInterestPosting(...)` — the page reader. |
+| `ConfigurationDomainService` | `retrievePivotDateConfig()` for backdated-transaction support. |
+| `SavingsSchedularInterestPosterTask` | The `Callable<Void>` posted to the thread pool per batch. |
+| `SavingsAccountWritePlatformService` | The interest write happens via this service inside the inner Callable. |
+| `SavingsAccountRepositoryWrapper` | JPA repository used by the writer. |
+| `SavingsAccountAssembler` | Builds the in-memory `SavingsAccount` aggregate. |
+| `JdbcTemplate` | Used by the poster for the post-pass batch JDBC update of journal entries. |
+| `TransactionTemplate` | Allows the inner Callable to open its own transaction. |
+
+## Tasklet step
+
+`PostInterestForSavingTasklet` is the single step of the job:
+
+```java
+@RequiredArgsConstructor
+@Slf4j
+@Component
+public class PostInterestForSavingTasklet implements Tasklet {
+
+    private static final int QUEUE_SIZE = 1;
+
+    private final SavingsAccountReadPlatformService savingAccountReadPlatformService;
+    private final ConfigurationDomainService configurationDomainService;
+    private final ApplicationContext applicationContext;
+    @Qualifier(TaskExecutorConstant.CONFIGURABLE_TASK_EXECUTOR_BEAN_NAME)
+    private final ThreadPoolTaskExecutor taskExecutor;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception { ... }
+}
+```
+
+The two job parameters it reads are pulled by Fineract's scheduler from `m_job` and per-run overrides:
+
+| Parameter | Meaning |
+|---|---|
+| `thread-pool-size` | Core / max pool size for `ThreadPoolTaskExecutor`. |
+| `batch-size` | Accounts per inner Callable; `pageSize = batchSize * threadPoolSize`. |
+
+Step-level flow (mirrors `execute`):
+
+| Step | Action |
+|---|---|
+| 1 | Read `thread-pool-size`, `batch-size`; size the executor; read `pivotDate` flag (`backdatedTxnsAllowedTill`). |
+| 2 | Load the first page with `retrieveAllSavingsDataForInterestPosting(backdatedTxnsAllowedTill, pageSize, ACTIVE.getValue(), 0L)`. |
+| 3 | Wrap the page as `Collections.synchronizedList` and push into a single-slot queue. |
+| 4 | Loop while the queue is non-empty: dequeue a page, set `maxSavingsIdInList` to the last id, call `postInterest(...)`. |
+| 5 | Inside `postInterest`: split the page across `threadPoolSize` Callable workers, plus one prefetch Callable that keeps the queue topped up. |
+| 6 | Each worker grabs a fresh `SavingsSchedularInterestPosterTask` from the Spring context, sets its sub-list, backdated flag and `FineractContext`, then `taskExecutor.submit(...)`. |
+| 7 | `checkCompletion` waits for every `Future<Void>` to complete and logs any aborted threads. |
+| 8 | Return `RepeatStatus.FINISHED`. |
+
+The id-boundary safety check after slicing the list keeps "all rows for the same savings id" inside the same worker:
+
+```java
+while (toIndex < size && savingsAccounts.get(toIndex - 1).getId().equals(savingsAccounts.get(toIndex).getId())) {
+    toIndex++;
+}
+```
+
+This matters because `retrieveAllSavingsDataForInterestPosting` returns one row per savings transaction, not per account; splitting the boundary mid-account would double-post.
+
+## What `SavingsSchedularInterestPoster.postInterest` does
+
+The Callable (`SavingsSchedularInterestPosterTask.call`) defers to `SavingsSchedularInterestPoster` (in `fineract-savings`). The relevant excerpt:
+
+```java
+@Transactional(isolation = Isolation.READ_UNCOMMITTED, rollbackFor = Exception.class)
+public void postInterest() throws JobExecutionException {
+    if (!savingAccounts.isEmpty()) {
+        List<Throwable> errors = new ArrayList<>();
+        LocalDate yesterday = DateUtils.getBusinessLocalDate().minusDays(1);
+        for (SavingsAccountData savingsAccountData : savingAccounts) {
+            try {
+                if (isInterestAlreadyPostedForPeriod(savingsAccountData, yesterday)) {
+                    continue;
+                }
+                SavingsAccountData ret = savingsAccountWritePlatformService.postInterest(
+                        savingsAccountData, false, null, backdatedTxnsAllowedTill);
+                savingsAccountDataList.add(ret);
+            } catch (Exception e) { errors.add(e); }
+        }
+        if (errors.isEmpty()) { batchUpdate(savingsAccountDataList); }
+        if (!errors.isEmpty()) { throw new JobExecutionException(errors); }
+    }
+}
+```
+
+`savingsAccountWritePlatformService.postInterest(savingsAccountData, postInterestAsOn=false, transactionDate=null, backdatedTxnsAllowedTill)` is the in-memory variant that computes the interest, builds the `SavingsAccountTransaction` objects, and updates running balances *without* hitting the DB per account. The accumulated `savingsAccountDataList` is then flushed in two batched JDBC passes:
+
+1. `batchUpdate` — inserts the `m_savings_account_transaction` rows and updates `m_savings_account.last_interest_posted_till` / running balance.
+2. `batchUpdateJournalEntries` — inserts `acc_gl_journal_entry` rows for the savings control and interest-on-savings GL accounts, using the savings transaction id prefixed with `"S"` as the `transaction_identifier`. See [Accrual Postings](/accounting/accrual-postings) for how the accounting side categorises these journal entries.
+
+## JPA linkage
+
+| Table | JPA entity | Job activity |
+|---|---|---|
+| `m_savings_account` | `SavingsAccount` | running balance, `lastInterestPostedTill`, `interestPostedTillDate`. |
+| `m_savings_account_transaction` | `SavingsAccountTransaction` | one `INTEREST_POSTING` (type `4`) per posted period. |
+| `m_savings_account_charge` | `SavingsAccountCharge` | unchanged — annual fees run from a different job. |
+| `acc_gl_journal_entry` | `JournalEntry` | inserted by `batchUpdateJournalEntries`. |
+| `m_savings_product` | `SavingsProduct` | read-only — supplies `nominalAnnualInterestRate`, compounding & posting period types, days-in-year. |
+
+The reader on the page-fetch side is `SavingsAccountReadPlatformServiceImpl.retrieveAllSavingsDataForInterestPosting`, documented in [Savings Read Service](/savings/savings-read-service).
+
+## How the job is launched
+
+The job is registered with the Fineract scheduler via the standard machinery described in [Job Names Enumeration](/jobs/job-names-enumeration). The seeded row in `m_job` carries:
+
+- `job_name = "Post Interest For Savings"`
+- `cron_expression = "0 0 0 1/1 * ? *"` (every day at 00:00:00, server timezone)
+- `is_active`, `currently_running`, `task_priority`, `thread_pool_size`, `batch_size` configurable through `PUT /jobs/{jobId}`.
+
+It is also exposed as an [inline job](/jobs/inline-job-api) and can be invoked synchronously via `POST /jobs/{jobId}?command=executeJob` for ad-hoc reposting.
+
+## Failure semantics
+
+The tasklet catches `InterruptedException` and `ExecutionException` from `Future.get()` and logs them but does *not* fail the step — that lets a few bad accounts not kill the rest of the run. The inner `postInterest` collects per-account errors into a list and only raises `JobExecutionException` when at least one error occurred *and* the batch update has not been run; the all-or-nothing behaviour of `batchUpdate` then keeps the DB consistent.
+
+When the job aborts mid-run, `m_job_run_history` records the failure and the next scheduler tick re-evaluates the cron.
+
+## Skip logic
+
+`SavingsSchedularInterestPoster.isInterestAlreadyPostedForPeriod` short-circuits accounts whose latest `INTEREST_POSTING` covers up to "yesterday" (the business date minus one day):
+
+```java
+LocalDate yesterday = DateUtils.getBusinessLocalDate().minusDays(1);
+if (isInterestAlreadyPostedForPeriod(savingsAccountData, yesterday)) {
+    log.debug("Interest already posted for savings account {} up to date {}, skipping",
+            savingsAccountData.getId(),
+            savingsAccountData.getSummary().getInterestPostedTillDate());
+    continue;
+}
+```
+
+This makes the job idempotent: re-running it on the same business date is safe, and a stuck job picked back up from `INCREASE_BUSINESS_DATE_BY_1_DAY` will not double-post. The check looks at `SavingsAccountSummaryData.interestPostedTillDate`, which is loaded by the read service.
+
+## Backdated transactions
+
+The job honours the global pivot date configuration via `ConfigurationDomainService.retrievePivotDateConfig()`. When `backdatedTxnsAllowedTill` is true:
+
+- The interest engine includes any transaction whose `transactionDate >= pivotDate` even if the transaction was *submitted* after the posting cut-off.
+- The posting still writes the `INTEREST_POSTING` transaction on the period-end date, not on today.
+
+When false, the engine assumes a strict "no late transactions" model and ignores anything submitted after the posting boundary. The flag is read once per page and threaded into each Callable.
+
+## Batch JDBC update
+
+`SavingsSchedularInterestPoster.batchUpdate` is the final per-page step. It uses `JdbcTemplate.batchUpdate(...)` with two prepared statements:
+
+| Statement | Purpose |
+|---|---|
+| INSERT into `m_savings_account_transaction` | one row per new `INTEREST_POSTING` transaction. |
+| UPDATE `m_savings_account` | `last_interest_posted_till`, `interest_posted_till_date`, running balance and on-hold totals. |
+
+`batchUpdateJournalEntries` then issues a third batch INSERT into `acc_gl_journal_entry`, with the transaction identifier formed as `"S" + savingsAccountTransactionId.toString()`. The constant `SAVINGS_TRANSACTION_IDENTIFIER = "S"` is what the savings accounting processor uses elsewhere too — see [Accrual Postings](/accounting/accrual-postings) for the loan-side analogue (`"L"`).
+
+## Why the `ApplicationContext` lookup
+
+The tasklet obtains a fresh `SavingsSchedularInterestPosterTask` per worker:
+
+```java
+SavingsSchedularInterestPosterTask savingsSchedularInterestPosterTask =
+        applicationContext.getBean(SavingsSchedularInterestPosterTask.class);
+savingsSchedularInterestPosterTask.setSavingAccounts(subList);
+savingsSchedularInterestPosterTask.setBackdatedTxnsAllowedTill(backdatedTxnsAllowedTill);
+savingsSchedularInterestPosterTask.setContext(ThreadLocalContextUtil.getContext());
+```
+
+The bean is declared with prototype scope (otherwise the `setSavingAccounts` call would clobber state across threads). Each task carries its own `FineractContext` snapshot so the worker thread sees the same authenticated user, tenant, business date and locale as the orchestrating tasklet.
+
+`ThreadLocalContextUtil.init(context)` is called inside the worker's `try` block and `ThreadLocalContextUtil.reset()` in the `finally`, mirroring the pattern in every other parallel batch job (see [Job Registry and Stuck Jobs](/jobs/job-registry-and-stuck-jobs)).
+
+## Comparison with on-demand interest posting
+
+The same write-service method ultimately runs whether the trigger is the batch job or the `POST /v1/savingsaccounts/{accountId}?command=postInterest` REST call, but the wrappers differ:
+
+| Trigger | Method | Concurrency | Skip logic | Builds journal entries |
+|---|---|---|---|---|
+| REST `postInterest` | `SavingsAccountWritePlatformService.postInterest(savingsId, postInterestOnDate, isInterestTransfer)` | single account, single transaction. | none — the user explicitly asked. | yes, via `SavingsAccountDomainService.postJournalEntries`. |
+| REST `postInterestAsOn` (transactions) | same write-service method with `transactionDate` set. | single account. | none. | yes. |
+| Batch `POST_INTEREST_FOR_SAVINGS` | `SavingsAccountWritePlatformService.postInterest(savingsAccountData, postInterestAsOn, transactionDate, backdatedTxnsAllowedTill)` | paginated, multi-threaded, batched. | `isInterestAlreadyPostedForPeriod` check. | yes, but via the batched `batchUpdateJournalEntries` JDBC path. |
+
+Both call into the same `PostingPeriod` engine, so the resulting transaction amounts are deterministic for the same set of inputs.
+
+## Configuration touchpoints
+
+| Source | Setting | Used as |
+|---|---|---|
+| `c_configuration` | `is-interest-posting-current-period` | toggles `isSavingsInterestPostingAtCurrentPeriodEnd`. |
+| `c_configuration` | `is-pivot-date-allowed` | toggles `backdatedTxnsAllowedTill`. |
+| `c_configuration` | `financial-year-beginning-month` | aligns posting periods to the fiscal year. |
+| `m_job` | `thread_pool_size` | feeds the tasklet's `thread-pool-size` job parameter. |
+| `m_job` | `batch_size` | feeds the tasklet's `batch-size` job parameter. |
+| `m_job` | `cron_expression` | scheduler cron. |
+
+All of `c_configuration` is fetched through `ConfigurationDomainService`, which caches values within the `FineractContext` of the running transaction.
+
+## Related pages
+
+- [Savings Accounts API (subsystem)](/savings/savings-accounts-api)
+- [Savings Transactions API (subsystem)](/savings/savings-transactions-api)
+- [Savings Product API (subsystem)](/savings/savings-product-api)
+- [Savings Accrual](/savings/savings-accrual)
+- [Savings Read Service](/savings/savings-read-service)
+- [Savings Write Service](/savings/savings-write-service)
+- [Savings Overview](/savings/overview)
+- [Job Names Enumeration](/jobs/job-names-enumeration)
+- [Accrual Postings](/accounting/accrual-postings)
+- [Savings Account Transactions (public API)](/api/savings-account-transactions)

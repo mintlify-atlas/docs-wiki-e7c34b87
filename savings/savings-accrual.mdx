@@ -1,0 +1,298 @@
+---
+title: "Savings Accrual Batch Job — Apache Fineract Internals"
+sidebarTitle: "Savings Accrual"
+description: "Internal reference for ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS: tasklet, SavingsAccrualWritePlatformService, accrual transactions, JPA writes."
+---
+
+Apache Fineract books savings-side interest accruals through a dedicated Spring Batch job that walks every accrual-enabled savings product, recomputes the interest that has accrued up to the business date, and writes an `ACCRUAL` transaction (savings transaction type `22`) for any closed posting period that does not already have one. The job is the savings counterpart of the loan periodic accrual job documented in [Accrual Postings](/accounting/accrual-postings).
+
+## Source
+
+```
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/jobs/addaccrualtransactionforsavings/
+├── AddAccrualTransactionForSavingsConfig.java
+└── AddAccrualTransactionForSavingsTasklet.java
+```
+
+The actual accrual computation lives in:
+
+```
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsAccrualWritePlatformService.java
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/service/SavingsAccrualWritePlatformServiceImpl.java
+```
+
+## JobName
+
+The enum entry is in `fineract-core/src/main/java/org/apache/fineract/infrastructure/jobs/service/JobName.java`:
+
+```java
+ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS(
+        "Add Accrual Transactions For Savings"),
+```
+
+That long constant — usually shortened in conversation to `ADD_ACCRUAL_TRANSACTIONS_FOR_SAVINGS` — is the canonical key for the job in `m_job`. The display name in the scheduler UI is `"Add Accrual Transactions For Savings"`.
+
+## Configuration class
+
+`AddAccrualTransactionForSavingsConfig` is a `@Configuration` exposing the step, the job and the tasklet bean:
+
+```java
+@Bean
+protected Step addAccrualTransactionForSavingsStep() {
+    return new StepBuilder(
+            JobName.ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS.name(),
+            jobRepository)
+        .tasklet(addAccrualTransactionForSavingsTasklet(), transactionManager).build();
+}
+
+@Bean
+public Job addAccrualTransactionForSavingsJob() {
+    return new JobBuilder(
+            JobName.ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS.name(),
+            jobRepository)
+        .start(addAccrualTransactionForSavingsStep())
+        .incrementer(new RunIdIncrementer()).build();
+}
+
+@Bean
+public AddAccrualTransactionForSavingsTasklet addAccrualTransactionForSavingsTasklet() {
+    return new AddAccrualTransactionForSavingsTasklet(savingsAccrualWritePlatformService);
+}
+```
+
+The only collaborator wired in is `SavingsAccrualWritePlatformService` — there is no thread pool here. Unlike the [interest posting job](/savings/interest-posting-job), the accrual job is single-threaded and relies on the write service to batch its updates.
+
+## Tasklet step
+
+`AddAccrualTransactionForSavingsTasklet` is tiny:
+
+```java
+@RequiredArgsConstructor
+public class AddAccrualTransactionForSavingsTasklet implements Tasklet {
+
+    private final SavingsAccrualWritePlatformService savingsAccrualWritePlatformService;
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        try {
+            addPeriodicAccruals(DateUtils.getBusinessLocalDate());
+        } catch (MultiException e) {
+            throw new JobExecutionException(e);
+        }
+        return RepeatStatus.FINISHED;
+    }
+
+    private void addPeriodicAccruals(final LocalDate tilldate) throws MultiException {
+        savingsAccrualWritePlatformService.addAccrualEntries(tilldate);
+    }
+}
+```
+
+Step-level flow:
+
+| Step | Action |
+|---|---|
+| 1 | Read `DateUtils.getBusinessLocalDate()` — the Fineract business date set by the [COB pipeline](/cob/overview) or by `INCREASE_BUSINESS_DATE_BY_1_DAY`. |
+| 2 | Delegate to `SavingsAccrualWritePlatformService.addAccrualEntries(tillDate)`. |
+| 3 | Wrap any `MultiException` as `JobExecutionException` so the scheduler records the failure. |
+| 4 | Return `RepeatStatus.FINISHED`. |
+
+## What `addAccrualEntries` does
+
+`SavingsAccrualWritePlatformServiceImpl.addAccrualEntries` is annotated `@Transactional` and runs the following loop:
+
+```java
+final List<SavingsAccrualData> savingsAccrualData =
+        savingsAccountReadPlatformService.retrievePeriodicAccrualData(tillDate, null);
+final Integer financialYearBeginningMonth =
+        configurationDomainService.retrieveFinancialYearBeginningMonth();
+final boolean isSavingsInterestPostingAtCurrentPeriodEnd =
+        configurationDomainService.isSavingsInterestPostingAtCurrentPeriodEnd();
+final MathContext mc = MoneyHelper.getMathContext();
+
+for (SavingsAccrualData savingsAccrual : savingsAccrualData) {
+    if (savingsAccrual.getDepositType().isSavingsDeposit() && savingsAccrual.getIsAllowOverdraft()
+            && !savingsAccrual.getIsTypeInterestReceivable()) {
+        continue;
+    }
+    SavingsAccount savingsAccount = savingsAccountAssembler.assembleFrom(savingsAccrual.getId(), false);
+    LocalDate fromDate = savingsAccrual.getAccruedTill();
+    if (fromDate == null) {
+        fromDate = savingsAccount.getActivationDate();
+    }
+    addAccrualTransactions(savingsAccount, fromDate, tillDate, financialYearBeginningMonth,
+            isSavingsInterestPostingAtCurrentPeriodEnd, mc, null);
+}
+```
+
+Errors are collected into a list and re-thrown as `JobExecutionException` once the loop finishes, so a single misbehaving account does not stop the rest.
+
+### Inside `addAccrualTransactions`
+
+For each account:
+
+| Step | Action |
+|---|---|
+| 1 | Snapshot existing transaction ids via `findExistingTransactionIds` / `findExistingReversedTransactionIds`. |
+| 2 | Read posting / compounding / days-in-year / calculation enums from the `SavingsAccount`. |
+| 3 | Call `SavingsHelper.determineInterestPostingPeriods(fromDate, tillDate, postingPeriodType, financialYearBeginningMonth, postedAsOnTransactionDates)` to slice the interval into `LocalDateInterval` posting periods. |
+| 4 | For each interval not in the future, build a `PostingPeriod` with `PostingPeriod.createFrom(...)` and call `calculateInterest(...)`. |
+| 5 | If the account already has an accrual transaction whose `transactionDate` equals the period end *and* it is not reversed, skip. Otherwise build an `ACCRUAL` transaction via `SavingsAccountTransaction.accrual(savingsAccount, office, endDate, interestEarnedAbs, false, refNo)`, set its running balance and overdraft amount, and `savingsAccount.addTransaction(...)`. |
+| 6 | Update `savingsAccount.setAccruedTillDate(accruedTillDate)`, `saveAndFlush`. |
+| 7 | Call `savingsAccountDomainService.postJournalEntries(savingsAccount, existingTransactionIds, existingReversedTransactionIds, false)` to drive the savings accounting processor and emit the GL entries. |
+
+The condition that decides whether to create a transaction is:
+
+```java
+if (!accrualTransactionDates.contains(period.getPeriodInterval().endDate())
+        || (!matchingAccrualReverseDates.isEmpty()
+            && matchingAccrualDates.size() == matchingAccrualReverseDates.size())) { ... }
+```
+
+The second branch lets a fully-reversed accrual be re-posted on a later run, which is the recovery story for a wrong-date business-date rewind.
+
+## JPA linkage
+
+| Table | JPA entity | Job activity |
+|---|---|---|
+| `m_savings_account` | `SavingsAccount` | `accruedTillDate` is updated; `addTransaction` keeps the in-memory collection consistent before `saveAndFlush`. |
+| `m_savings_account_transaction` | `SavingsAccountTransaction` | one `ACCRUAL` (`transaction_type_enum = 22`) per period. |
+| `acc_gl_journal_entry` | `JournalEntry` | created by the savings accrual accounting processor — debit `Interest Receivable`, credit `Income From Interest`. |
+| `m_savings_product` | `SavingsProduct` | read-only; supplies interest rules and the accrual GL mappings (`incomeFromInterestId`, `interestReceivableAccountId`). |
+
+The read query that lists candidate accounts is:
+
+```
+SavingsAccountReadPlatformServiceImpl.retrievePeriodicAccrualData(tillDate, savingsId)
+```
+
+returning `SavingsAccrualData(id, accountNo, accruedTill, depositType, isAllowOverdraft, isTypeInterestReceivable, …)`. See [Savings Read Service](/savings/savings-read-service) for the row mapper.
+
+## Eligibility
+
+A savings account is included in `retrievePeriodicAccrualData` only when its product has accounting rule `ACCRUAL_PERIODIC` (`3`). The tasklet skips overdraft-enabled savings accounts whose accrual data lacks the `isTypeInterestReceivable` flag, because for those accounts overdraft interest is booked as receivable on the loan side instead.
+
+The companion configuration flag `isSavingsInterestPostingAtCurrentPeriodEnd` (from `c_configuration`) decides whether the *current* in-progress posting period is included in the slice list. When false, the job only writes accrual transactions for *closed* periods.
+
+## How the job is launched
+
+Like every other Fineract batch job, `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS` is seeded into `m_job` by a database changeset and registered with the Fineract scheduler. It is *not* part of the daily defaults in earlier seeds — it is added by the accrual-savings changeset — so installations upgraded from older versions may need to enable it manually. The job supports:
+
+- the standard cron schedule (`PUT /jobs/{jobId}` with a `cron_expression` body),
+- ad-hoc launch via `POST /jobs/{jobId}?command=executeJob`,
+- inline launch through the [Inline Job API](/jobs/inline-job-api) for COB-style runs.
+
+When called from COB it runs *after* the savings business steps so that any deposits or withdrawals booked earlier in the day are included in the accrued balance.
+
+## Failure semantics
+
+The tasklet propagates a `MultiException` as `JobExecutionException`. Inside `addAccrualEntries` each account is wrapped in its own `try / catch`, so one bad account does not skip the rest, but the run is still marked failed once any errors are collected. Because each account's accrual is committed inside `saveAndFlush` (the outer transaction commits at the end of the loop), partial progress is preserved on failure — the next run picks up from `accruedTillDate`.
+
+## Difference from the interest-posting job
+
+| Aspect | `POST_INTEREST_FOR_SAVINGS` | `ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_…` |
+|---|---|---|
+| Transaction type written | `INTEREST_POSTING` (`4`) | `ACCRUAL` (`22`) |
+| Parallelism | Configurable thread pool; queue-based prefetch. | Single-threaded loop. |
+| Accounting rule | Works for `CASH_BASED` and `ACCRUAL_PERIODIC` savings products. | Only `ACCRUAL_PERIODIC` products. |
+| Updates `lastInterestPostedTill`? | Yes. | No — updates `accruedTillDate` instead. |
+| Journal entries booked | Savings control vs. Interest On Savings. | Interest Receivable vs. Income From Interest. |
+| Cron default | Daily 00:00. | Daily, after `INCREASE_BUSINESS_DATE_BY_1_DAY`. |
+
+Both jobs ultimately route through `SavingsAccountDomainService.postJournalEntries`, which invokes the savings accounting processor described in [Accrual Postings](/accounting/accrual-postings).
+
+## Posting periods
+
+The accrual job uses the *same* posting-period helper as the interest-posting job:
+
+```java
+final List<LocalDateInterval> postingPeriodIntervals =
+        savingsHelper.determineInterestPostingPeriods(
+                fromDate, tillDate, postingPeriodType,
+                financialYearBeginningMonth, postedAsOnTransactionDates);
+```
+
+`SavingsHelper.determineInterestPostingPeriods` walks from `fromDate` to `tillDate` using the product's `interestPostingPeriodType` (monthly, quarterly, bi-annual, annual), aligned on `financialYearBeginningMonth`. The returned `LocalDateInterval` list is what each `PostingPeriod` is built over.
+
+`PostingPeriod.createFrom(...)` then runs the interest formula with:
+
+| Parameter | Source |
+|---|---|
+| `periodInterval` | from `postingPeriodIntervals`. |
+| `periodStartingBalance` | the previous period's `closingBalance()`. |
+| `savingsAccountTransactionDetailsForPostingPeriodList` | from `SavingsAccount.toSavingsAccountTransactionDetailsForPostingPeriodList()`. |
+| `currency`, `compoundingPeriodType`, `interestCalculationType`, `interestRateAsFraction`, `daysInYear` | from the savings account / product. |
+| `tillDate` | the tasklet's `DateUtils.getBusinessLocalDate()`. |
+| `interestPostTransactionIds` | `savingsHelper.fetchPostInterestTransactionIds(savingsAccount.getId())`. |
+| `isInterestTransfer` | `false`. |
+| `minBalanceForInterestCalculation` | from the product. |
+| `isSavingsInterestPostingAtCurrentPeriodEnd` | from `c_configuration`. |
+| `isUserPosting` | true when the period end matches a user-driven `postedAsOn` transaction. |
+
+The overdraft rate is set in a second step:
+
+```java
+postingPeriod.setOverdraftInterestRateAsFraction(
+        savingsAccount.getNominalAnnualInterestRateOverdraft()
+                      .divide(BigDecimal.valueOf(100), mc));
+```
+
+## Building the accrual transaction
+
+The factory used is `SavingsAccountTransaction.accrual(...)`:
+
+```java
+SavingsAccountTransaction savingsAccountTransaction = SavingsAccountTransaction.accrual(
+        savingsAccount, savingsAccount.office(),
+        period.getPeriodInterval().endDate(),
+        period.getInterestEarned().abs(),
+        false, refNo);
+savingsAccountTransaction.setRunningBalance(period.getClosingBalance());
+savingsAccountTransaction.setOverdraftAmount(period.getInterestEarned());
+if (!MathUtil.isZero(savingsAccountTransaction.getAmount())) {
+    savingsAccount.addTransaction(savingsAccountTransaction);
+}
+```
+
+Zero-amount accruals are deliberately skipped to keep `m_savings_account_transaction` clean.
+
+The accrual transaction is type `ACCRUAL` (`22`) with `is_manual_transaction = 0`, no `payment_detail_id`, `running_balance` populated and `overdraft_amount` set so the savings accounting processor can split the journal entry across regular and overdraft GL accounts.
+
+## Journal-entry hand-off
+
+After `saveAndFlush`, the impl calls:
+
+```java
+savingsAccountDomainService.postJournalEntries(
+        savingsAccount, existingTransactionIds, existingReversedTransactionIds, false);
+```
+
+`SavingsAccountDomainService.postJournalEntries` is the cross-module hand-off into the accounting subsystem. It computes the *difference* between current and snapshot transaction ids and forwards the new accrual transactions to the savings accounting processor (`AccrualBasedAccountingProcessorForSavings`), which in turn writes the `acc_gl_journal_entry` rows. Read [Accrual Postings](/accounting/accrual-postings) for the GL mapping rules.
+
+The fourth argument (`isAccountTransfer`) is hard-coded to `false` for the accrual job because periodic accruals are never the result of a transfer.
+
+## Running locally
+
+For development the job can be invoked with:
+
+- `POST /v1/jobs/{jobId}?command=executeJob` — the standard ad-hoc launch. The scheduler reads the job by name from `m_job` and runs the Spring Batch `Job` bean defined in `AddAccrualTransactionForSavingsConfig`.
+- `POST /v1/inlinejobs` with body `{ "jobName": "ADD_PERIODIC_ACCRUAL_ENTRIES_FOR_SAVINGS_WITH_INCOME_POSTED_AS_TRANSACTIONS" }` — synchronous variant via the [Inline Job API](/jobs/inline-job-api).
+
+Both routes ultimately resolve to the same `Job` bean. The synchronous form is helpful in integration tests because it blocks until the tasklet returns.
+
+## Test surface
+
+The reference unit tests live under `fineract-provider/src/test/java/org/apache/fineract/portfolio/savings/jobs/` (per module convention) and the integration tests under `integration-tests`. The integration suite seeds a savings product with `accountingRule = 3`, opens an account, posts a few deposits, advances the business date, and asserts that `addAccrualEntries` produces the expected `ACCRUAL` transactions and journal entries. Adding new accrual logic should grow both layers.
+
+## Related pages
+
+- [Interest Posting Job](/savings/interest-posting-job)
+- [Savings Accounts API (subsystem)](/savings/savings-accounts-api)
+- [Savings Transactions API (subsystem)](/savings/savings-transactions-api)
+- [Savings Product API (subsystem)](/savings/savings-product-api)
+- [Savings Read Service](/savings/savings-read-service)
+- [Savings Write Service](/savings/savings-write-service)
+- [Savings Overview](/savings/overview)
+- [Job Names Enumeration](/jobs/job-names-enumeration)
+- [Accrual Postings](/accounting/accrual-postings)
+- [Savings Account Transactions (public API)](/api/savings-account-transactions)

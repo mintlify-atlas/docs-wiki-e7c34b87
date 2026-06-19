@@ -1,0 +1,124 @@
+---
+title: "Batch API — Apache Fineract Multi-Request Pipelining & Dependencies"
+sidebarTitle: "Batch API"
+description: "Reference for the Apache Fineract /v1/batches endpoint that bundles many HTTP operations — with dependencies — into a single round trip."
+---
+
+The Batch API lets a single HTTP request carry an array of *logical* HTTP operations and have Apache Fineract execute them in order — optionally inside one database transaction, optionally with each request referencing data produced by a previous one via JSON Path. It is how Mifos clients build complex client/loan/saving onboarding flows in one call without paying the latency of N round trips.
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.batch.api.BatchApiResource` |
+| File | `fineract-core/src/main/java/org/apache/fineract/batch/api/BatchApiResource.java` |
+| JAX-RS `@Path` | `/v1/batches` |
+| Swagger tag | `Batch API` |
+| Service | `BatchApiService` |
+| Request DTO | `BatchRequest` |
+| Response DTO | `BatchResponse` |
+| Instance-mode guard | `FineractProperties.getMode().isReadOnlyMode()` ↔ `InvalidInstanceTypeMethodException` |
+
+## Endpoints
+
+| Method | Path | Description | Command / handler | Permission |
+| --- | --- | --- | --- | --- |
+| `POST` | `/v1/batches` | Execute a list of `BatchRequest`s. Without `?enclosingTransaction=true` each request commits independently; with it, the whole batch runs inside one transaction that rolls back on the first failure. | `BatchApiService.handleBatchRequestsWith[Without]EnclosingTransaction(list, uriInfo)` | Authenticated; individual requests then check their own permissions |
+
+The resource is intentionally thin — most of the routing/JsonPath logic lives in `BatchApiService` and the underlying `CommandStrategy` implementations.
+
+## Request shape
+
+Each entry in the payload is a `BatchRequest`:
+
+| Field | Notes |
+| --- | --- |
+| `requestId` | Numeric id chosen by the client (used for `reference`). |
+| `method` | `GET` / `POST` / `PUT` / `DELETE`. |
+| `relativeUrl` | URL *after* `/api/v1/` — for example `clients`, `loans/$.loanId/charges`. |
+| `headers` | Optional list of `{name,value}`. |
+| `body` | Optional JSON-encoded string (for `POST`/`PUT`). |
+| `reference` | Optional `requestId` of a parent request — the engine substitutes `$.path` tokens against the parent's response body. |
+
+JSON Path placeholders look like `$.clientId`, `$.loanId`, `$[0].id`. They are resolved depth-first using the parent's response, so deeply nested references (1 → 2 → 6) work as documented in the swagger tag.
+
+## Example: enrol a client then disburse a loan
+
+```bash
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example.org/fineract-provider/api/v1/batches?enclosingTransaction=true' \
+  -d '[
+        {
+          "requestId": 1,
+          "relativeUrl": "clients",
+          "method": "POST",
+          "headers": [{"name":"Content-Type","value":"application/json"}],
+          "body": "{\"officeId\":1,\"firstname\":\"Bob\",\"lastname\":\"Smith\",\"active\":true,\"activationDate\":\"15 April 2024\",\"dateFormat\":\"dd MMMM yyyy\",\"locale\":\"en\"}"
+        },
+        {
+          "requestId": 2,
+          "reference": 1,
+          "relativeUrl": "loans",
+          "method": "POST",
+          "headers": [{"name":"Content-Type","value":"application/json"}],
+          "body": "{\"clientId\":\"$.clientId\",\"productId\":1,\"principal\":1000,\"loanTermFrequency\":12,\"loanTermFrequencyType\":2,\"numberOfRepayments\":12,\"repaymentEvery\":1,\"repaymentFrequencyType\":2,\"amortizationType\":1,\"interestType\":0,\"interestCalculationPeriodType\":1,\"transactionProcessingStrategyCode\":\"mifos-standard-strategy\",\"expectedDisbursementDate\":\"15 April 2024\",\"submittedOnDate\":\"15 April 2024\",\"dateFormat\":\"dd MMMM yyyy\",\"locale\":\"en\",\"interestRatePerPeriod\":12}"
+        }
+      ]'
+```
+
+The response is one `BatchResponse` per request, in the same order:
+
+```json
+[
+  { "requestId": 1, "statusCode": 200, "body": "{\"clientId\":204,\"resourceId\":204}" },
+  { "requestId": 2, "statusCode": 200, "body": "{\"loanId\":113,\"resourceId\":113,\"clientId\":204}" }
+]
+```
+
+## Enclosing transaction
+
+Setting `enclosingTransaction=true` causes the service to call `handleBatchRequestsWithEnclosingTransaction`. The contract:
+
+- All requests run inside one Spring-managed transaction.
+- The first request whose handler throws an exception triggers a rollback.
+- The HTTP response is a single `BatchResponse` (status `400`) carrying the failure body — *no* downstream requests are reported.
+
+Without the flag the service calls `handleBatchRequestsWithoutEnclosingTransaction`, each request commits or rolls back individually, and the response is one `BatchResponse` per request.
+
+## Instance-mode guard
+
+Before dispatching, the resource walks the request list and asserts read-only compatibility:
+
+```java
+if (fineractProperties.getMode().isReadOnlyMode()) {
+    final Optional<BatchRequest> nonGetRequest = requestList.stream()
+            .filter(batchRequest -> !HttpMethod.GET.equals(batchRequest.getMethod())).findFirst();
+    if (nonGetRequest.isPresent()) {
+        throw new InvalidInstanceTypeMethodException(nonGetRequest.get().getMethod());
+    }
+}
+```
+
+That means a read-only Fineract pod can only handle GET-only batches; the first non-GET method raises `InvalidInstanceTypeMethodException`, which the global exception mapper renders as `405 Method Not Allowed`. See [Instance Mode](/api/instance-mode).
+
+## Permissions
+
+The outer call only requires the user to be authenticated (`context.authenticatedUser()`). Each individual `BatchRequest` is dispatched through the same Jersey infrastructure that handles direct REST calls, so it goes through the same permission checks as if it had been posted on its own — `READ_*`, `CREATE_*`, `UPDATE_*`, etc. Maker-checker also applies per request.
+
+## Failure semantics
+
+| Mode | Behaviour on failure |
+| --- | --- |
+| `enclosingTransaction=false` | The failed request's `BatchResponse` carries a non-2xx status; other requests still execute and are reported in their own `BatchResponse`. |
+| `enclosingTransaction=true` | The whole transaction rolls back. Only one `BatchResponse` is returned — the one describing the first failure (with status `400`). |
+
+When the batch contains dependent requests, a failure in the parent always propagates to its children: the JsonPath substitution can't resolve and the child fails with a substitution error.
+
+## Related resources
+
+- [Instance Mode](/api/instance-mode) — explains the read-only / batch-manager guards.
+- [Audits](/api/audits) and [Maker Checkers](/api/maker-checkers) — each non-GET request inside the batch still appears as its own command-source row.
+- [Authentication](/api/authentication) / [User Details](/api/user-details) — the credentials that authorise every nested request.
+- [Clients](/api/clients), [Loans](/api/loans), [Savings Accounts](/api/savings-accounts) — the most common batch payload targets.

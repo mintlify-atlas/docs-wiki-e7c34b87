@@ -1,0 +1,177 @@
+---
+title: "Jersey JAX-RS Path Discovery and Resource Registration"
+sidebarTitle: "Jersey Paths"
+description: "How JerseyConfig discovers @Path-annotated Spring beans, handles v1/v2 path conflicts, and exposes the runtime resource map for tooling like Swagger."
+---
+
+Fineract's REST surface is implemented in JAX-RS (Jersey 3) on top of Spring Boot. There is no central routing table — instead, every endpoint is a Spring bean annotated with `@Path`, picked up at boot by `JerseyConfig`. This page documents the discovery mechanism, what `@ApplicationPath` does, the v1/v2 path layout, conflict rules, and how Swagger / OpenAPI consume the same set of beans.
+
+## The application config
+
+**Source:** `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/jersey/JerseyConfig.java`
+
+```java
+@Configuration(proxyBeanMethods = false)
+@ApplicationPath("/api")
+public class JerseyConfig extends ResourceConfig {
+
+    JerseyConfig() {
+        register(org.glassfish.jersey.media.multipart.MultiPartFeature.class);
+        register(new AbstractBinder() {
+            @Override
+            protected void configure() {
+                bind(PageableParamProvider.class)
+                    .to(ValueParamProvider.class)
+                    .in(Singleton.class);
+            }
+        });
+        register(org.glassfish.jersey.server.validation.ValidationFeature.class);
+        property(ServerProperties.WADL_FEATURE_DISABLE, true);
+    }
+
+    @Autowired
+    ApplicationContext appCtx;
+
+    @PostConstruct
+    public void setup() {
+        appCtx.getBeansWithAnnotation(Path.class).values().forEach(this::register);
+        appCtx.getBeansWithAnnotation(Provider.class).values().forEach(this::register);
+    }
+}
+```
+
+Three things happen here:
+
+1. **`@ApplicationPath("/api")`** mounts every Jersey endpoint under `/fineract-provider/api/...`. That is why every `@Path` in the codebase starts with `/v1/...` or `/v2/...` — the `/api` prefix is added by Jersey.
+2. The constructor registers core features: multipart for file uploads (CSV imports, document uploads), a `PageableParamProvider` that converts query parameters into Spring Data `Pageable` objects for v2 endpoints, and bean validation.
+3. The `@PostConstruct` `setup()` method scans the Spring `ApplicationContext` for every bean annotated with `jakarta.ws.rs.Path` (resources) or `jakarta.ws.rs.ext.Provider` (exception mappers, message-body readers/writers, filters) and registers them with Jersey.
+
+## How a resource is discovered
+
+```mermaid
+flowchart LR
+    A[Spring boot startup] --> B[Component scan picks up @Component on every *ApiResource]
+    B --> C[Beans are created]
+    C --> D[JerseyConfig.@PostConstruct runs]
+    D --> E[appCtx.getBeansWithAnnotation Path .values]
+    E --> F[For each bean: ResourceConfig.register obj]
+    F --> G[Jersey indexes the @Path methods]
+    G --> H[Servlet container serves requests]
+```
+
+Implications:
+
+- A resource class **must** be a Spring bean (`@Component`, `@RestController`, or any stereotype). A bare `@Path` class without a stereotype is invisible.
+- A resource registered manually with `register(SomeApiResource.class)` would be instantiated by Jersey (not Spring) and lose dependency injection. Always rely on the auto-registration.
+- Adding a new endpoint is just: write a class, annotate with `@Component` + `@Path("/v1/foo")`, add `@GET`/`@POST` methods, restart. No registry update needed.
+
+## The `/v1` vs `/v2` split
+
+There is no Jersey-level prefix for versioning. Each resource hard-codes its version into its own `@Path`:
+
+```java
+@Path("/v1/clients")        public class ClientsApiResource { ... }
+@Path("/v1/groups")         public class GroupsApiResource { ... }
+@Path("/v1/offices")        public class OfficesApiResource { ... }
+@Path("/v1/taxes/component") public class TaxComponentApiResource { ... }
+
+@Path("/v2/clients")        public class ClientSearchV2ApiResource { ... }
+```
+
+This means:
+
+- A v1 endpoint and a v2 endpoint can coexist for the same logical resource — they are completely independent classes.
+- There is no automatic deprecation routing — calling `/v2/clients/123` does **not** fall back to `/v1/clients/123`.
+- The version is purely a naming convention. Jersey does not parse it.
+
+## Path conflict resolution
+
+Jersey matches paths using JAX-RS rules. Two methods can share the same `@Path` template provided the HTTP method or media type differs. Conflicts surface at startup as `ModelValidationException` and abort the boot.
+
+Common patterns you will see in Fineract:
+
+| Pattern | Example | Notes |
+| --- | --- | --- |
+| Same path, different HTTP method | `GET /v1/clients/{id}` + `PUT /v1/clients/{id}` + `DELETE /v1/clients/{id}` + `POST /v1/clients/{id}?command=...` | All four live on the same class |
+| Same path, different `@Consumes` | `POST /v1/staff/uploadtemplate` accepts `multipart/form-data` distinct from the JSON `POST /v1/staff` | OK |
+| Templated vs literal | `GET /v1/clients/template` vs `GET /v1/clients/{clientId}` | Literal `template` wins because JAX-RS prefers exact matches over `@PathParam`s |
+| Templated `{clientId}` vs `/external-id/{externalId}` | `GET /v1/clients/{clientId}` vs `GET /v1/clients/external-id/{externalId}` | OK — distinct first segment after `/clients/` |
+
+Pitfall: defining `@Path("template")` **after** `@Path("{clientId}")` on the same class is still fine, but defining two methods with `@Path("{x}")` and `@Path("{y}")` on the same HTTP verb is not — JAX-RS sees them as identical templates.
+
+## File upload endpoints
+
+The `MultiPartFeature` registered in the constructor enables `multipart/form-data` parameters on routes like:
+
+```java
+@POST
+@Path("uploadtemplate")
+@Consumes(MediaType.MULTIPART_FORM_DATA)
+public String postClientTemplate(
+        @FormDataParam("file") final InputStream uploadedInputStream,
+        @FormDataParam("file") final FormDataContentDisposition fileDetail,
+        @FormDataParam("locale") final String locale,
+        @FormDataParam("dateFormat") final String dateFormat) { ... }
+```
+
+These appear on `ClientsApiResource`, `GroupsApiResource`, `CentersApiResource`, `OfficesApiResource`, `StaffApiResource`, and various others — see the [Bulk import](/core/bulkimport) section.
+
+## Pageable query parameter binding
+
+The constructor registers `PageableParamProvider` so v2 endpoints can declare `org.springframework.data.domain.Pageable` directly:
+
+```java
+@POST
+@Path("search")
+public Page<ClientSearchData> searchByText(PagedRequest<ClientTextSearch> request) {
+    return delegate.searchByText(request);
+}
+```
+
+Without that binder, Jersey would not know how to populate `Pageable` (which is not a JAX-RS type) from the query string.
+
+## WADL disabled
+
+`property(ServerProperties.WADL_FEATURE_DISABLE, true)` turns off Jersey's WADL generator. The reasons:
+
+- WADL is largely obsolete.
+- WADL endpoints (`/application.wadl`) leak information to unauthenticated callers.
+- Fineract publishes its API via Swagger/OpenAPI instead — see below.
+
+## Swagger / OpenAPI generation
+
+Fineract uses `springdoc-openapi` to emit an OpenAPI 3 document by scanning the same `@Path` beans. The Swagger UI is reachable at:
+
+```
+GET /fineract-provider/swagger-ui/index.html
+GET /fineract-provider/v3/api-docs
+```
+
+Every endpoint in this section has `@Operation`, `@RequestBody`, `@ApiResponse` annotations consumed by springdoc to produce schema entries. The generated OpenAPI is what feeds the [`fineract-client`](/clients/fineract-client) SDK generator (via openapi-generator-maven-plugin in `fineract-client/build.gradle`).
+
+## Provider beans
+
+The `setup()` also picks up every `@Provider`-annotated Spring bean. These include:
+
+- **Exception mappers** — `PlatformApiDataValidationExceptionMapper`, `UnAuthenticatedUserExceptionMapper`, `AbstractIdempotentCommandExceptionMapper`, etc. — convert thrown exceptions into the [standard error envelope](/api/conventions#error-json).
+- **Filters** — `CommandSourceFilter`, `IdempotentCommandFilter` — wrap write requests.
+- **Message body writers** — for custom serialisation (e.g. CSV downloads).
+
+A new exception mapper is registered automatically as long as you annotate it with `@Component` + `@Provider`.
+
+## Discovery surface — how big is it?
+
+At time of writing the codebase ships roughly **150 `*ApiResource` classes** across all modules (`fineract-provider`, `fineract-loan`, `fineract-savings`, `fineract-accounting`, `fineract-tax`, `fineract-core`, …). They are scattered under `src/main/java/.../api/` in their respective subsystems. To enumerate them locally:
+
+```bash
+find fineract-* -name "*ApiResource.java" -path "*/api/*" | wc -l
+```
+
+The API pages in this section document the **portfolio/clients**, **portfolio/group**, **organisation/***, and **tax** resources. Loan, savings, accounting, infrastructure, and so on have their own sections.
+
+## Related pages
+
+- [Overview](/api/overview) — surface map and request flow.
+- [Conventions](/api/conventions) — request/response envelopes consumed by these endpoints.
+- [Tenant header](/api/tenant-header) — runs before Jersey in the security chain.
+- [Clients → fineract-client](/clients/fineract-client) — SDK generated from the Swagger output of these `@Path` beans.

@@ -1,0 +1,115 @@
+---
+title: "Internal Loan Account Lock API — Apache Fineract Test-only Lock Placement"
+sidebarTitle: "Internal Loan Lock"
+description: "Reference for the Apache Fineract /v1/internal/loans/{loanId}/place-lock/{lockOwner} TEST-profile endpoint used to inject COB locks from tests."
+---
+
+The Internal Loan Account Lock API is a **test-only** companion to the production [Loan Account Lock](/api/loan-account-lock) endpoint. It lets integration tests synthesise a `LoanAccountLock` row directly — choosing the loan id, the `LockOwner` value, and optionally an error message — without having to drive the close-of-business pipeline. Apache Fineract uses it inside the COB integration suite to exercise the "locked loan" branches of LOAN_COB without actually running the job.
+
+<Warning>
+This resource is guarded by `@Profile(FineractProfiles.TEST)`. It is **only** registered with Spring when the `test` profile is active, and its `afterPropertiesSet` callback logs a loud `DO NOT USE THIS IN PRODUCTION!` banner on startup. Production Fineract deployments must run without `test` in `SPRING_PROFILES_ACTIVE` so that the bean — and therefore the JAX-RS path — does not exist.
+</Warning>
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.cob.api.InternalLoanAccountLockApiResource` |
+| File | `fineract-provider/src/main/java/org/apache/fineract/cob/api/InternalLoanAccountLockApiResource.java` |
+| JAX-RS `@Path` | `/v1/internal/loans` |
+| Spring profile guard | `@Profile(FineractProfiles.TEST)` |
+| Repository | `LoanAccountLockRepository` |
+| Domain object | `LoanAccountLock` |
+| Lock owner enum | `LockOwner` |
+| Business-date source | `ThreadLocalContextUtil.getBusinessDateByType(COB_DATE)` |
+
+The class also implements `InitializingBean` purely so it can emit the warning banner from `afterPropertiesSet()`:
+
+```
+DO NOT USE THIS IN PRODUCTION!
+Internal client services mode is enabled
+DO NOT USE THIS IN PRODUCTION!
+```
+
+## Endpoints
+
+| Method | Path | Description | Command / handler | Permission |
+| --- | --- | --- | --- | --- |
+| `POST` | `/v1/internal/loans/{loanId}/place-lock/{lockOwner}` | Persist a `LoanAccountLock` for the loan with the chosen owner and the current COB business date. Body may include an `error` to mark the lock as a failure. | `LoanAccountLockRepository.save(new LoanAccountLock(...))` | None — relies on the `test` profile guard |
+
+The handler verbatim:
+
+```java
+@POST
+@Path("{loanId}/place-lock/{lockOwner}")
+public Response placeLockOnLoanAccount(@Context final UriInfo uriInfo, @PathParam("loanId") Long loanId,
+        @PathParam("lockOwner") String lockOwner, @RequestBody(required = false) LockRequest request) {
+
+    LoanAccountLock loanAccountLock = new LoanAccountLock(loanId, LockOwner.valueOf(lockOwner),
+            ThreadLocalContextUtil.getBusinessDateByType(BusinessDateType.COB_DATE));
+
+    if (StringUtils.isNotBlank(request.getError())) {
+        loanAccountLock.setError(request.getError(), request.getError());
+    }
+    loanAccountLockRepository.save(loanAccountLock);
+    return Response.status(Response.Status.ACCEPTED).build();
+}
+```
+
+## Path parameters
+
+| Parameter | Type | Notes |
+| --- | --- | --- |
+| `loanId` | `Long` | Must point to an existing `m_loan` row. No referential check is performed up-front; the foreign-key constraint surfaces at flush time. |
+| `lockOwner` | `String` | Must be one of the `LockOwner` enum constants (e.g. `LOAN_COB_PARTITIONING`, `LOAN_COB_CHUNK_PROCESSING`, `LOAN_INLINE_COB_PROCESSING`). Invalid values raise `IllegalArgumentException` from `LockOwner.valueOf(...)` and surface as a 500. |
+
+## Request body
+
+`LockRequest` is a small DTO (defined alongside the resource) with a single optional `error` field. Both arguments to `setError(message, stackTrace)` receive the same string, so the resulting row has identical content in `error_message` and `stack_trace`.
+
+```json
+{
+  "error": "java.lang.IllegalStateException: synthetic test failure"
+}
+```
+
+Send an empty body or omit the `error` field to create a clean lock — the same as a successful in-flight COB partition would.
+
+## Response
+
+The endpoint always returns `202 Accepted` with no body, mirroring how the real COB pipeline acknowledges a lock placement. To inspect the resulting row, call [`GET /v1/loans/locked`](/api/loan-account-lock).
+
+## Example
+
+```bash
+# Place a partitioning-stage lock on loan 1042 with no error
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example.org/fineract-provider/api/v1/internal/loans/1042/place-lock/LOAN_COB_PARTITIONING' \
+  -d '{}'
+
+# Place a parked / failed lock with a synthetic error
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example.org/fineract-provider/api/v1/internal/loans/1042/place-lock/LOAN_COB_CHUNK_PROCESSING' \
+  -d '{"error":"java.lang.IllegalStateException: simulated failure"}'
+```
+
+## Use in the COB test suite
+
+The lock placed by this endpoint feeds two integration scenarios:
+
+1. **Catch-up retry path** — call `place-lock/LOAN_COB_CHUNK_PROCESSING` with an `error`, then invoke [COB Catch-Up](/api/cob-catchup) and assert that the loan is reprocessed without manual intervention.
+2. **Concurrent inline run** — call `place-lock/LOAN_INLINE_COB_PROCESSING`, then try the [Inline Job](/api/inline-jobs) `LOAN_COB` and verify that the inline path skips loans already owned by another worker.
+
+When debugging in a local TEST instance, the `BUSINESS_DATE` and `COB_DATE` values used by the lock come from the request thread's `ThreadLocalContextUtil`; set them via the [Business Date](/api/business-date) endpoints before placing the lock.
+
+## Related resources
+
+- [Loan Account Lock](/api/loan-account-lock) — production read endpoint for the same table.
+- [COB Catch-Up](/api/cob-catchup) and [Working Capital COB Catch-Up](/api/working-capital-cob-catchup) — drive the LOAN_COB job that consumes these locks.
+- [Internal COB](/api/internal-cob) — TEST-only partition/fast-forward helpers in the same subsystem.
+- [Inline Jobs](/api/inline-jobs) — fire `LOAN_COB` against a curated loan list while these locks are in place.
+- [Business Date](/api/business-date) — set `COB_DATE` before placing the lock so that the row records a meaningful business date.

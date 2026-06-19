@@ -1,0 +1,100 @@
+---
+title: "Scheduler API — Apache Fineract Job Scheduler Status Controls"
+sidebarTitle: "Scheduler"
+description: "Reference for the Apache Fineract /v1/scheduler endpoints used to inspect and toggle the Quartz-backed job scheduler at runtime."
+---
+
+The Scheduler API is the runtime control plane for Apache Fineract's Quartz-backed `JobRegisterService`. It reports whether the in-process scheduler thread is currently running and lets operators flip it between the `Active` and `Standby` states without restarting the JVM. Together with the [Scheduler Jobs](/api/scheduler-jobs) and [Inline Jobs](/api/inline-jobs) APIs, it forms the lifecycle surface for every background batch job that Fineract registers (loan COB, posting interest, accruals, external event publishing, etc.).
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.infrastructure.jobs.api.SchedulerApiResource` |
+| File | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/api/SchedulerApiResource.java` |
+| JAX-RS `@Path` | `/v1/scheduler` |
+| Swagger tag | `Scheduler` |
+| Underlying service | `JobRegisterService` (Quartz wrapper) |
+| Permission constants | `SchedulerJobApiConstants` |
+
+## Endpoints
+
+| Method | Path | Description | Command / handler | Permission |
+| --- | --- | --- | --- | --- |
+| `GET` | `/v1/scheduler` | Return whether the scheduler thread is `Active` (running) or `Standby` (paused). | `JobRegisterService.isSchedulerRunning()` → `SchedulerDetailData` | `READ_SCHEDULER` (via `validateHasReadPermission(SCHEDULER_RESOURCE_NAME)`) |
+| `POST` | `/v1/scheduler?command=start` | Activate the scheduler so registered jobs fire on their cron expressions. Responds `202 Accepted`. | `JobRegisterService.startScheduler()` | `ALL_FUNCTIONS` or `UPDATE_SCHEDULER` |
+| `POST` | `/v1/scheduler?command=stop` | Pause the scheduler — already-running jobs finish, but no new triggers fire. Responds `202 Accepted`. | `JobRegisterService.pauseScheduler()` | `ALL_FUNCTIONS` or `UPDATE_SCHEDULER` |
+
+Any other value of `command` raises `UnrecognizedQueryParamException` and the resource returns `400 Bad Request`. A caller missing both `ALL_FUNCTIONS` and `UPDATE_SCHEDULER` triggers a `NoAuthorizationException` (HTTP `403`).
+
+## Status retrieval
+
+`retrieveStatus(UriInfo)` calls `PlatformSecurityContext.authenticatedUser().validateHasReadPermission(...)` first, then asks `JobRegisterService` whether the scheduler is running. The boolean is wrapped in a `SchedulerDetailData` and serialised via `ToApiJsonSerializer<SchedulerDetailData>`, honouring the `fields=` query parameter through `ApiRequestParameterHelper`.
+
+```bash
+curl -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  https://fineract.example.org/fineract-provider/api/v1/scheduler
+```
+
+```json
+{
+  "active": true
+}
+```
+
+When the scheduler is paused (for example, during a controlled COB catch-up window), the same call returns `"active": false`. Use `fields=active` to keep the payload small when polling.
+
+## Toggling scheduler state
+
+`changeSchedulerStatus(commandParam)` is the only write endpoint. The handler:
+
+1. Reads the authenticated user via `PlatformSecurityContext`.
+2. Calls `hasNotPermissionForAnyOf("ALL_FUNCTIONS", "UPDATE_SCHEDULER")` — if both are missing it throws `NoAuthorizationException` with the message `"User has no authority to update scheduler status"`.
+3. Compares `commandParam` to `SchedulerJobApiConstants.COMMAND_START_SCHEDULER` and `COMMAND_STOP_SCHEDULER` using a case-insensitive `equalsIgnoreCase`.
+4. Calls `jobRegisterService.startScheduler()` or `jobRegisterService.pauseScheduler()` accordingly.
+
+There is no request body — the verb is encoded entirely in the `command` query parameter, matching the convention used by [Maker Checkers](/api/maker-checkers) and the [Scheduler Jobs](/api/scheduler-jobs) execute endpoints.
+
+```bash
+# Pause all scheduled batch jobs
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  'https://fineract.example.org/fineract-provider/api/v1/scheduler?command=stop'
+# HTTP/1.1 202 Accepted
+
+# Resume scheduling
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  'https://fineract.example.org/fineract-provider/api/v1/scheduler?command=start'
+# HTTP/1.1 202 Accepted
+```
+
+The 202 response is intentional — the actual Quartz scheduler transition can be asynchronous in clustered deployments where `JobRegisterService` propagates the change through the shared Quartz tables.
+
+## Operational notes
+
+- **Cluster behaviour.** In a multi-node Fineract deployment using the clustered Quartz scheduler, calling `stop` on one node pauses the shared scheduler for all nodes. Status reads, however, reflect the local `JobRegisterService` only.
+- **COB interaction.** Pausing the scheduler is the standard way to freeze the COB pipeline before invoking the [Loan COB Catch-Up](/api/cob-catchup) or [Working Capital COB Catch-Up](/api/working-capital-cob-catchup) endpoints, so that the catch-up has exclusive control of business-date advancement.
+- **Read-only mode.** When `fineract.mode.read-only-mode=true`, the write endpoint is still wired into Jersey but the global instance-mode filter rejects the POST before it reaches the handler — see [Instance Mode](/api/instance-mode).
+- **Inline alternative.** Even with the scheduler paused, operators can trigger an immediate run of a specific job through [Inline Jobs](/api/inline-jobs) (`POST /v1/jobs/{jobName}/inline`). That bypasses Quartz entirely and runs synchronously in the request thread.
+
+## Permission model
+
+The two permissions referenced by this resource are seeded through Fineract's permission catalogue (see [Permissions](/api/permissions)):
+
+| Permission code | Purpose |
+| --- | --- |
+| `READ_SCHEDULER` | Required for `GET /v1/scheduler` (plus reads from `/v1/jobs`). |
+| `UPDATE_SCHEDULER` | Required for `POST /v1/scheduler?command=start|stop`. |
+| `ALL_FUNCTIONS` | Wildcard that satisfies any of the above. |
+
+Granting `UPDATE_SCHEDULER` without `ALL_FUNCTIONS` is the typical least-privilege configuration for an operations role that needs to manage the scheduler but should not be able to execute arbitrary commands. See [Roles](/api/roles) for the wiring.
+
+## Related resources
+
+- [Scheduler Jobs](/api/scheduler-jobs) — list, inspect, update, and execute individual jobs registered with the scheduler.
+- [Inline Jobs](/api/inline-jobs) — run a named job synchronously, outside the Quartz schedule.
+- [Configure Business Step](/api/configure-business-step) — order the COB business steps that the loan COB job runs.
+- [Loan COB Catch-Up](/api/cob-catchup) — drive the loan COB job forward when it has fallen behind the business date.
+- [Permissions](/api/permissions) and [Roles](/api/roles) — manage the `READ_SCHEDULER`/`UPDATE_SCHEDULER` permission grants.

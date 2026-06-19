@@ -1,0 +1,275 @@
+---
+title: "Savings Product API Subsystem — Apache Fineract Wiki"
+sidebarTitle: "Product API"
+description: "Internal view of SavingsProductsApiResource: path constants, read service, command builder factories and JPA linkage to m_savings_product."
+---
+
+This page is the subsystem-internal companion to the public [Savings Products](/api/savings-products) reference. Apache Fineract exposes savings product CRUD through a single Jersey resource, and every write hops onto the `CommandWrapperBuilder` → `SynchronousCommandProcessingService` → `SavingsProductWritePlatformService` chain. Engineers extending the product model should read this page along with the [Savings Account Domain](/savings/savings-account-domain) and [Savings Write Service](/savings/savings-write-service).
+
+## Source
+
+```
+fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/api/SavingsProductsApiResource.java
+```
+
+Declaration (line 82):
+
+```java
+@Path("/v1/savingsproducts")
+@Component
+@Tag(name = "Savings Product", description = "An MFIs savings product offerings are modeled using this API.")
+@RequiredArgsConstructor
+public class SavingsProductsApiResource {
+```
+
+The Swagger DTOs live in `SavingsProductsApiResourceSwagger.java` in the same package.
+
+## Collaborators
+
+| Field | Role |
+|---|---|
+| `SavingsProductReadPlatformService` | JDBC reads — `retrieveAll`, `retrieveOne`, dropdowns. |
+| `SavingsDropdownReadPlatformService` | Interest-compounding, calculation, posting, days-in-year option lists. |
+| `CurrencyReadPlatformService` | Allowed currencies. |
+| `AccountingDropdownReadPlatformService` | GL account option lists for the template. |
+| `ProductToGLAccountMappingReadPlatformService` | Fetches the GL account mappings on `retrieveOne` when accounting is enabled. |
+| `ChargeReadPlatformService.retrieveSavingsProductCharges(productId)` | Joins charge rows on `retrieveOne`. |
+| `PaymentTypeReadService` | Payment-type dropdown for the template. |
+| `TaxReadPlatformService` | Tax-group dropdown for the template. |
+| `ConfigurationDomainService` | Reads global configuration flags shown on the template. |
+| `PortfolioCommandSourceWritePlatformService` | Single entry into the command bus. |
+| `DefaultToApiJsonSerializer<SavingsProductData>` | Uses `SAVINGS_PRODUCT_RESPONSE_DATA_PARAMETERS` from `SavingsApiSetConstants`. |
+| `PlatformSecurityContext` | `validateHasReadPermission("savingsproduct")` on GETs. |
+
+## Path and permission constants
+
+From `fineract-core/src/main/java/org/apache/fineract/portfolio/savings/SavingsApiConstants.java`:
+
+| Constant | Value |
+|---|---|
+| `SAVINGS_PRODUCT_RESOURCE_NAME` | `"savingsproduct"` |
+
+GETs check `validateHasReadPermission(SAVINGS_PRODUCT_RESOURCE_NAME)` directly. Writes derive their permission code from the command — `CREATE_SAVINGSPRODUCT`, `UPDATE_SAVINGSPRODUCT`, `DELETE_SAVINGSPRODUCT` — which is seeded into `m_permission`.
+
+## Endpoint table
+
+`@Path` is relative to `/v1/savingsproducts`.
+
+| Method | Sub-path | Builder factory | Read delegate |
+|---|---|---|---|
+| `POST` | `` | `createSavingProduct()` | — |
+| `PUT` | `{productId}` | `updateSavingProduct(productId)` | — |
+| `GET` | `` | — | `SavingsProductReadPlatformService.retrieveAll` |
+| `GET` | `{productId}` | — | `retrieveOne(productId)` + charges + GL mappings |
+| `GET` | `template` | — | dropdown services + currency, tax-group, payment-type, accounting options |
+| `DELETE` | `{productId}` | `deleteSavingProduct(productId)` | — |
+
+## `CommandWrapperBuilder` factories
+
+The builder methods used here live in `fineract-core/src/main/java/org/apache/fineract/commands/service/CommandWrapperBuilder.java`:
+
+```java
+public CommandWrapperBuilder createSavingProduct() {
+    this.actionName = "CREATE";
+    this.entityName = "SAVINGSPRODUCT";
+    this.entityId = null;
+    this.href = "/savingsproducts/template";
+    return this;
+}
+
+public CommandWrapperBuilder updateSavingProduct(final Long productId) {
+    this.actionName = "UPDATE";
+    this.entityName = "SAVINGSPRODUCT";
+    this.entityId = productId;
+    this.href = "/savingsproducts/" + productId;
+    return this;
+}
+
+public CommandWrapperBuilder deleteSavingProduct(final Long productId) {
+    this.actionName = "DELETE";
+    this.entityName = "SAVINGSPRODUCT";
+    this.entityId = productId;
+    this.href = "/savingsproducts/" + productId;
+    return this;
+}
+```
+
+So every write produces a `CommandWrapper` keyed by `entity = "SAVINGSPRODUCT"` and action `CREATE`, `UPDATE` or `DELETE`. The matching handlers in `fineract-provider/src/main/java/org/apache/fineract/portfolio/savings/handler/` are:
+
+| Action | Handler | Write-service method |
+|---|---|---|
+| `CREATE` | `CreateSavingsProductCommandHandler` | `SavingsProductWritePlatformService.create(command)` |
+| `UPDATE` | `UpdateSavingsProductCommandHandler` | `update(productId, command)` |
+| `DELETE` | `DeleteSavingsProductCommandHandler` | `delete(productId)` |
+
+Each handler is annotated `@CommandType(entity = "SAVINGSPRODUCT", action = "...")` and the `CommandHandlerProvider` uses that annotation to register them with `SynchronousCommandProcessingService`.
+
+## Request lifecycle into the command pipeline
+
+For the POST:
+
+1. The resource builds a `CommandWrapper`:
+   ```java
+   final CommandWrapper commandRequest = new CommandWrapperBuilder()
+           .createSavingProduct()
+           .withJson(apiRequestBodyAsJson)
+           .build();
+   ```
+2. It calls `commandsSourceWritePlatformService.logCommandSource(commandRequest)`.
+3. `PortfolioCommandSourceWritePlatformServiceImpl` rehydrates the body as a `JsonCommand`, resolves the maker-checker decision, and forwards to `SynchronousCommandProcessingService.executeCommand`.
+4. `SynchronousCommandProcessingService` looks up `CreateSavingsProductCommandHandler`, runs it in a transaction, persists a `CommandSource` row, publishes a `SavingsProductCreateBusinessEvent`, and returns the `CommandProcessingResult`.
+5. The resource serialises the result through `DefaultToApiJsonSerializer<SavingsProductData>`.
+
+PUT and DELETE follow the same flow with `updateSavingProduct(productId)` / `deleteSavingProduct(productId)`.
+
+## What `GET {productId}` does internally
+
+`retrieveOne` is the most complex GET in the resource because it joins charges, accounting mappings and optional template data:
+
+```java
+SavingsProductData savingProductData = savingProductReadPlatformService.retrieveOne(productId);
+Collection<ChargeData> charges = chargeReadPlatformService.retrieveSavingsProductCharges(productId);
+savingProductData = SavingsProductData.withCharges(savingProductData, charges);
+
+if (savingProductData.hasAccountingEnabled()) {
+    Map<String, Object> accountingMappings =
+        accountMappingReadPlatformService.fetchAccountMappingDetailsForSavingsProduct(
+                productId, savingProductData.accountingRuleTypeId());
+    Collection<PaymentTypeToGLAccountMapper> paymentChannelToFundSourceMappings =
+        accountMappingReadPlatformService.fetchPaymentTypeToFundSourceMappingsForSavingsProduct(productId);
+    Collection<ChargeToGLAccountMapper> feeToGLAccountMappings =
+        accountMappingReadPlatformService.fetchFeeToIncomeAccountMappingsForSavingsProduct(productId);
+    Collection<ChargeToGLAccountMapper> penaltyToGLAccountMappings =
+        accountMappingReadPlatformService.fetchPenaltyToIncomeAccountMappingsForSavingsProduct(productId);
+    savingProductData = SavingsProductData.withAccountingDetails(savingProductData,
+            accountingMappings, paymentChannelToFundSourceMappings,
+            feeToGLAccountMappings, penaltyToGLAccountMappings);
+}
+
+if (settings.isTemplate()) {
+    savingProductData = handleTemplateRelatedData(savingProductData);
+}
+```
+
+The `handleTemplateRelatedData` helper bolts the dropdown values onto the response so a UI maintenance screen can render straight from the same payload.
+
+## JPA linkage
+
+| Table | JPA entity | When |
+|---|---|---|
+| `m_savings_product` | `SavingsProduct` (`fineract-savings/.../portfolio/savings/domain/SavingsProduct.java`) | every CRUD endpoint. |
+| `m_savings_product_charge` (join) | `SavingsProductCharge` | charges array on create / update / read. |
+| `m_product_mapping` | `ProductToGLAccountMapping` | accounting rule and GL mappings on create / update / read. |
+| `m_payment_type` (join) | — | payment-channel-to-fund-source mappings. |
+| `m_tax_group` | `TaxGroup` | optional `taxGroupId` on product. |
+| `m_currency` | `MonetaryCurrency` | currency code, decimals, multiples. |
+
+Discriminator column `deposit_type_enum` separates passbook savings (`100`) from FD product (`200`) and RD product (`300`). This resource handles only the `100` discriminator — see `FixedDepositProductsApiResource` and `RecurringDepositProductsApiResource` for the other two.
+
+## Validation
+
+`SavingsProductDataValidator` (called from inside `SavingsProductWritePlatformService.create / update`) enforces:
+
+- mandatory: `name`, `shortName`, `description`, `currencyCode`, `digitsAfterDecimal`, `inMultiplesOf`, `nominalAnnualInterestRate`, `interestCompoundingPeriodType`, `interestCalculationType`, `interestCalculationDaysInYearType`, `accountingRule`.
+- cash accounting (`accountingRule = 2`): `savingsReferenceAccountId`, `savingsControlAccountId`, `interestOnSavingsAccountId`, `incomeFromFeeAccountId`, `transfersInSuspenseAccountId`, `incomeFromPenaltyAccountId`.
+- accrual accounting (`accountingRule = 3`): additionally `incomeFromInterestId`, plus the receivable accounts wired by [Accrual Postings](/accounting/accrual-postings) and the [Savings Accrual](/savings/savings-accrual) job.
+
+If the body is malformed the validator collects `ApiParameterError` rows and `SynchronousCommandProcessingService` throws `PlatformApiDataValidationException` before any DB write happens.
+
+## Cascading effects
+
+A product `UPDATE` may rewrite accounting mappings used by every child `SavingsAccount`. The write service deletes / re-creates rows in `m_product_mapping`, then publishes a `SavingsProductUpdateBusinessEvent`. Charges added to the product are *not* retro-applied to existing accounts — only newly opened accounts inherit them via `SavingsAccountAssembler.assembleFrom`.
+
+A `DELETE` fails with a `PlatformDataIntegrityException` if any `SavingsAccount` still references the product, because the FK on `m_savings_account.product_id` is enforced.
+
+## Template endpoint internals
+
+`GET template` is the most expensive read endpoint because it joins every dropdown a savings-product maintenance UI needs:
+
+```java
+public String retrieveTemplate(@Context final UriInfo uriInfo) {
+    context.authenticatedUser().validateHasReadPermission(SAVINGS_PRODUCT_RESOURCE_NAME);
+    SavingsProductData savingsProduct = savingProductReadPlatformService.retrieveNew();
+    savingsProduct = handleTemplateRelatedData(savingsProduct);
+    final ApiRequestJsonSerializationSettings settings =
+            apiRequestParameterHelper.process(uriInfo.getQueryParameters());
+    return toApiJsonSerializer.serialize(settings, savingsProduct,
+            SavingsApiSetConstants.SAVINGS_PRODUCT_RESPONSE_DATA_PARAMETERS);
+}
+```
+
+`handleTemplateRelatedData` populates the following collections on `SavingsProductData`:
+
+| Field | Source |
+|---|---|
+| `currencyOptions` | `currencyReadPlatformService.retrieveAllowedCurrencies()`. |
+| `interestCompoundingPeriodTypeOptions` | `dropdownReadPlatformService.retrieveCompoundingInterestPeriodTypeOptions()`. |
+| `interestPostingPeriodTypeOptions` | `dropdownReadPlatformService.retrieveInterestPostingPeriodTypeOptions()`. |
+| `interestCalculationTypeOptions` | `dropdownReadPlatformService.retrieveInterestCalculationTypeOptions()`. |
+| `interestCalculationDaysInYearTypeOptions` | `dropdownReadPlatformService.retrieveInterestCalculationDaysInYearTypeOptions()`. |
+| `lockinPeriodFrequencyTypeOptions` | `dropdownReadPlatformService.retrieveLockinPeriodFrequencyTypeOptions()`. |
+| `withdrawalFeeTypeOptions` | `dropdownReadPlatformService.retrievewithdrawalFeeTypeOptions()`. |
+| `paymentTypeOptions` | `paymentTypeReadPlatformService.retrieveAllPaymentTypes()`. |
+| `accountingRuleOptions` | `accountingDropdownReadPlatformService.retrieveAccountingRuleTypeOptions()`. |
+| `accountingMappingOptions` | `accountingDropdownReadPlatformService.retrieveAccountMappingOptionsForSavingsProducts()`. |
+| `chargeOptions` | `chargeReadPlatformService.retrieveSavingsProductApplicableCharges(false)`. |
+| `penaltyOptions` | `chargeReadPlatformService.retrieveSavingsProductApplicableCharges(true)`. |
+| `taxGroupOptions` | `taxReadPlatformService.retrieveTaxGroupsForLookUp()`. |
+
+The single `?template=true` query parameter on `retrieveOne` runs the same helper so a maintenance form can be hydrated with both the persisted product and the lookups in one round-trip.
+
+## Body shape on create
+
+The Swagger schema `SavingsProductsApiResourceSwagger.PostSavingsProductsRequest` is the canonical shape, but here are the fields the validator reads from `JsonCommand`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | unique on `m_savings_product`. |
+| `shortName` | string | unique, max 4 chars. |
+| `description` | string | free text. |
+| `currencyCode` | string | ISO 4217. |
+| `digitsAfterDecimal` | integer | currency precision override. |
+| `inMultiplesOf` | integer | rounding multiplier. |
+| `nominalAnnualInterestRate` | decimal | percentage. |
+| `interestCompoundingPeriodType` | integer | enum from `SavingsCompoundingInterestPeriodType`. |
+| `interestPostingPeriodType` | integer | enum from `SavingsPostingInterestPeriodType`. |
+| `interestCalculationType` | integer | enum from `SavingsInterestCalculationType`. |
+| `interestCalculationDaysInYearType` | integer | enum from `SavingsInterestCalculationDaysInYearType`. |
+| `lockinPeriodFrequency` / `lockinPeriodFrequencyType` | integer | lock-in window. |
+| `minRequiredOpeningBalance` | decimal | optional opening minimum. |
+| `withdrawalFeeForTransfers` | boolean | when true the withdrawal fee applies to transfers too. |
+| `allowOverdraft` | boolean | enables overdraft semantics. |
+| `overdraftLimit` | decimal | matched by `nominalAnnualInterestRateOverdraft`. |
+| `minBalanceForInterestCalculation` | decimal | floor used by the interest poster. |
+| `withHoldTax` | boolean | gates `taxGroupId` requirement. |
+| `taxGroupId` | long | FK to `m_tax_group`. |
+| `accountingRule` | integer | `1`=none, `2`=cash, `3`=accrual. |
+| `charges` | array | list of charge ids. |
+| `paymentChannelToFundSourceMappings` | array | per-payment-type GL override. |
+| `feeToIncomeAccountMappings` / `penaltyToIncomeAccountMappings` | array | per-charge GL override. |
+| `lienAllowed` | boolean | enables on-hold lien transactions. |
+| `maxAllowedLienLimit` | decimal | absolute lien cap. |
+
+## Cross-module fan-out
+
+A savings product is referenced by:
+
+- `m_savings_account.product_id` → every passbook savings account.
+- `m_charge.savings_product_id` (join via `m_savings_product_charge`).
+- `m_loan_product` indirectly when a loan uses a savings account as a fund source (via `m_savings_product_id` on standing instructions).
+- `m_share_product` is *not* related — share products live in `fineract-investor` and use a separate resource.
+
+This is why product modifications publish a `SavingsProductCreateBusinessEvent` / `SavingsProductUpdateBusinessEvent` — downstream consumers (notifications, audit logs, integrations) usually want to react to the rule change without re-reading every account.
+
+## Related pages
+
+- [Savings Products (public API contract)](/api/savings-products)
+- [Savings Accounts API (subsystem)](/savings/savings-accounts-api)
+- [Savings Transactions API (subsystem)](/savings/savings-transactions-api)
+- [Savings Account Domain](/savings/savings-account-domain)
+- [Savings Write Service](/savings/savings-write-service)
+- [Savings Overview](/savings/overview)
+- [Interest Posting Job](/savings/interest-posting-job)
+- [Savings Accrual](/savings/savings-accrual)
+- [Job Names Enumeration](/jobs/job-names-enumeration)
+- [Accrual Postings](/accounting/accrual-postings)

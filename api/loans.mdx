@@ -1,0 +1,186 @@
+---
+title: "Loans API — Apache Fineract /v1/loans Application And State Machine"
+sidebarTitle: "Loans"
+description: "Reference for the Apache Fineract LoansApiResource: list, retrieve, submit, modify, approve, disburse, reject, withdraw, delete loan applications, plus GLIM, delinquency action, and approved-amount endpoints."
+---
+
+The Loans API is the master entry point Apache Fineract clients call to manage the loan application lifecycle — from `Submitted and pending approval` through approval, disbursal, repayment and closure — including state transitions, delinquency actions, GLIM (Group Loan Individual Monitoring) flows, and Excel-based bulk import.
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.portfolio.loanaccount.api.LoansApiResource` |
+| File | `fineract-provider/src/main/java/org/apache/fineract/portfolio/loanaccount/api/LoansApiResource.java` |
+| JAX-RS `@Path` | `/v1/loans` |
+| Swagger tag | `Loans` |
+| Permission resource | `LOAN` (read/write) and `DELINQUENCY_TAGS`, `DELINQUENCY_ACTION` (delinquency endpoints) |
+| Primary read service | `LoanReadPlatformService` |
+| Command source | `PortfolioCommandSourceWritePlatformService` |
+
+The resource is constructed via Lombok `@RequiredArgsConstructor` and wires more than thirty collaborators including `LoanReadPlatformService`, `LoanProductReadPlatformService`, `LoanScheduleCalculationPlatformService`, `GuarantorReadPlatformService`, `DelinquencyReadPlatformService`, `LoanSummaryProviderDelegate`, `LoanCapitalizedIncomeBalanceRepository`, `LoanApprovedAmountHistoryRepository`, `GLIMAccountInfoReadPlatformService`, `BulkImportWorkbookService` and `BulkImportWorkbookPopulatorService`.
+
+## Endpoint matrix
+
+### Application CRUD by internal id
+
+| Method | Path | Description | Command handler | Permission |
+| --- | --- | --- | --- | --- |
+| `GET` | `/v1/loans/template` | Template for new loan applications (`templateType=individual`/`group`/`jlg`, `clientId`, `groupId`, `productId`, `staffInSelectedOfficeOnly`, `activeOnly`). | `LoanReadPlatformService.retrieveTemplateWithClientAndProductDetails(...)` | `READ_LOAN` |
+| `GET` | `/v1/loans/{loanId}/template` | Loan approval / state transition template (`templateType=approval` etc). | `LoanReadPlatformService.retrieveLoanForApproval(loanId)` | `READ_LOAN` |
+| `GET` | `/v1/loans/{loanId}` | Retrieve a loan. Supports `?associations=all`, `?exclude=`, `?fields=`. | `LoanReadPlatformService.retrieveOne(loanId)` (+ assoc loaders) | `READ_LOAN` |
+| `GET` | `/v1/loans` | List loans with pagination (`offset`, `limit`, `sortOrder`, `orderBy`, `accountNo`, `externalId`, `status`, `sqlSearch`). | `LoanReadPlatformService.retrieveAll(searchParameters)` | `READ_LOAN` |
+| `POST` | `/v1/loans` | Calculate a repayment schedule (`?command=calculateLoanSchedule`) or submit a new loan application. | `CommandWrapperBuilder.createLoanApplication()` → `CREATE_LOAN` | `CREATE_LOAN` |
+| `PUT` | `/v1/loans/{loanId}` | Modify a pending loan application (only when status is `Submitted and pending approval`). With `?command=markAsFraud` flips fraud flag. | `updateLoanApplication(loanId)` or `markAsFraud(loanId)` | `UPDATE_LOAN` |
+| `DELETE` | `/v1/loans/{loanId}` | Delete a loan in `Submitted and awaiting approval`. | `deleteLoanApplication(loanId)` | `DELETE_LOAN` |
+| `POST` | `/v1/loans/{loanId}` | State transitions — see [State commands](#state-transition-commands) below. | varies by `?command=` | per-command |
+
+### External-id variants
+
+The resource exposes a symmetric set of endpoints under `/v1/loans/external-id/{loanExternalId}` for clients that prefer the loan's `externalId` over the numeric primary key. Each variant resolves the external id through `LoanReadPlatformService.getResolvedLoanId(externalId)` and reuses the same delegate methods:
+
+| Method | Path | Mirror of |
+| --- | --- | --- |
+| `GET` | `/v1/loans/external-id/{loanExternalId}` | `GET /v1/loans/{loanId}` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/template` | `GET /v1/loans/{loanId}/template` |
+| `PUT` | `/v1/loans/external-id/{loanExternalId}` | `PUT /v1/loans/{loanId}` |
+| `DELETE` | `/v1/loans/external-id/{loanExternalId}` | `DELETE /v1/loans/{loanId}` |
+| `POST` | `/v1/loans/external-id/{loanExternalId}` | `POST /v1/loans/{loanId}` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/delinquencytags` | `GET /v1/loans/{loanId}/delinquencytags` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/delinquency-actions` | `GET /v1/loans/{loanId}/delinquency-actions` |
+| `POST` | `/v1/loans/external-id/{loanExternalId}/delinquency-actions` | `POST /v1/loans/{loanId}/delinquency-actions` |
+| `PUT` | `/v1/loans/external-id/{loanExternalId}/approved-amount` | `PUT /v1/loans/{loanId}/approved-amount` |
+| `GET` | `/v1/loans/external-id/{loanExternalId}/approved-amount` | `GET /v1/loans/{loanId}/approved-amount` |
+| `PUT` | `/v1/loans/external-id/{loanExternalId}/available-disbursement-amount` | `PUT /v1/loans/{loanId}/available-disbursement-amount` |
+
+### GLIM (group-loan-individual-monitoring) flows
+
+| Method | Path | Description | Command handler |
+| --- | --- | --- | --- |
+| `GET` | `/v1/loans/glimAccount/{glimId}` | Retrieve a GLIM repayment template (parent + children). | `GLIMAccountInfoReadPlatformService.findGlimAccount(glimId)` |
+| `POST` | `/v1/loans/glimAccount/{glimId}` | GLIM state transitions — see [GLIM commands](#glim-commands) below. | varies by `?command=` |
+
+### Delinquency endpoints
+
+| Method | Path | Description | Command / read | Permission |
+| --- | --- | --- | --- | --- |
+| `GET` | `/v1/loans/{loanId}/delinquencytags` | Retrieve the loan delinquency tag history. | `DelinquencyReadPlatformService.retrieveDelinquencyRangeHistory(loanId)` | `READ_DELINQUENCY_TAGS` |
+| `GET` | `/v1/loans/{loanId}/delinquency-actions` | Retrieve `pause` / `resume` delinquency actions on the loan. | `DelinquencyReadPlatformService.retrieveLoanDelinquencyActions(loanId)` | `READ_LOAN` |
+| `POST` | `/v1/loans/{loanId}/delinquency-actions` | Add a new delinquency action (`pause` or `resume`). | `CommandWrapperBuilder.createDelinquencyAction(loanId)` | `CREATE_DELINQUENCY_ACTION` |
+
+### Approved / available disbursement amount
+
+| Method | Path | Description | Command handler |
+| --- | --- | --- | --- |
+| `PUT` | `/v1/loans/{loanId}/approved-amount` | Modify the approved loan amount (creates a `LoanApprovedAmountHistory` entry). | `CommandWrapperBuilder.updateLoanApprovedAmount(loanId)` |
+| `GET` | `/v1/loans/{loanId}/approved-amount` | Retrieve approved-amount modification history. | `LoanApprovedAmountHistoryRepository.findAll(loanId)` |
+| `PUT` | `/v1/loans/{loanId}/available-disbursement-amount` | Modify the available-for-disbursement amount (indirectly adjusts approved amount). | `CommandWrapperBuilder.updateLoanAvailableDisbursementAmount(loanId)` |
+
+### Excel bulk import / download templates
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/v1/loans/downloadtemplate` | Download the loan-import Excel workbook (`officeId`, `staffId`, `dateFormat`). |
+| `POST` | `/v1/loans/uploadtemplate` | Upload a completed loan-import workbook (`multipart/form-data`). |
+| `GET` | `/v1/loans/repayments/downloadtemplate` | Download the repayment-import workbook. |
+| `POST` | `/v1/loans/repayments/uploadtemplate` | Upload a completed repayment-import workbook. |
+
+## State transition commands
+
+`POST /v1/loans/{loanId}?command={cmd}` dispatches through `CommandParameterUtil.is(commandParam, ...)` in `stateTransitions(...)`. Recognised values:
+
+| `command` | Command handler | Outcome |
+| --- | --- | --- |
+| `reject` | `rejectLoanApplication(loanId)` | Reject pending application. |
+| `withdrawnByApplicant` | `withdrawLoanApplication(loanId)` | Applicant withdraws. |
+| `approve` | `approveLoanApplication(loanId)` | Approve a pending application. |
+| `disburse` | `disburseLoanApplication(loanId)` | Disburse approved loan. |
+| `disburseToSavings` | `disburseLoanToSavingsApplication(loanId)` | Disburse principal into a linked savings account. |
+| `disburseWithoutAutoDownPayment` | `disburseWithoutAutoDownPayment(loanId)` | Disburse without auto-creating a down-payment transaction. |
+| `undoapproval` | `undoLoanApplicationApproval(loanId)` | Reverse approval. |
+| `undodisbursal` | `undoLoanApplicationDisbursal(loanId)` | Reverse the full disbursal. |
+| `undolastdisbursal` | `undoLastDisbursalLoanApplication(loanId)` | Reverse only the last tranche (multi-disburse). |
+| `assignloanofficer` | `assignLoanOfficer(loanId)` | Assign a staff member as loan officer. |
+| `unassignloanofficer` | `unassignLoanOfficer(loanId)` | Remove the loan-officer assignment. |
+| `recoverGuarantees` | `recoverFromGuarantor(loanId)` | Trigger guarantee recovery from posted guarantors. |
+| `assigndelinquency` | `assignDelinquency(loanId)` | Manually assign a delinquency range. |
+| `contractTermination` | `applyContractTermination(loanId)` | Terminate the contract (progressive loans). |
+| `undoContractTermination` | `undoContractTermination(loanId)` | Reverse a contract termination. |
+
+Unknown `command` values raise `UnrecognizedQueryParamException("command", commandParam)`.
+
+## GLIM commands
+
+`POST /v1/loans/glimAccount/{glimId}?command={cmd}` dispatches:
+
+| `command` | Command handler |
+| --- | --- |
+| `reject` | `rejectGLIMApplication(glimId)` |
+| `approve` | `approveGLIMLoanApplication(glimId)` |
+| `disburse` | `disburseGlimLoanApplication(glimId)` |
+| `glimrepayment` | `repaymentGlimLoanApplication(glimId)` |
+| `undodisbursal` | `undoGLIMLoanDisbursal(glimId)` |
+| `undoapproval` | `undoGLIMLoanApproval(glimId)` |
+
+## Request / response shapes
+
+Swagger types live in `LoansApiResourceSwagger`. The most-used schemas:
+
+- `PostLoansRequest` — used by `POST /v1/loans`. Mandatory: `clientId`/`groupId`, `productId`, `principal`, `loanTermFrequency`, `loanTermFrequencyType`, `numberOfRepayments`, `repaymentEvery`, `repaymentFrequencyType`, `interestRatePerPeriod`, `interestRateFrequencyType`, `amortizationType`, `interestType`, `interestCalculationPeriodType`, `transactionProcessingStrategyCode`, `expectedDisbursementDate`, `submittedOnDate`, `loanType`.
+- `PutLoansLoanIdRequest` — used by `PUT /v1/loans/{loanId}` modifies the same envelope but is rejected unless the loan is still `Submitted and pending approval`.
+- `PostLoansLoanIdRequest` — used by approve/reject/disburse/withdraw state transitions. Typical fields: `approvedOnDate`, `expectedDisbursementDate`, `approvedLoanAmount`, `transactionAmount`, `actualDisbursementDate`, `note`, `locale`, `dateFormat`.
+- `PutLoansApprovedAmountRequest` — used by `PUT /v1/loans/{loanId}/approved-amount`. Fields: `approvedLoanAmount`, `note`.
+- `PostLoansDelinquencyActionRequest` — `{ action, startDate, endDate, locale, dateFormat }`.
+
+Example state-transition request (`POST /v1/loans/123?command=approve`):
+
+```json
+{
+  "approvedOnDate": "20 September 2025",
+  "approvedLoanAmount": 5000.00,
+  "expectedDisbursementDate": "01 October 2025",
+  "note": "Approved by branch manager",
+  "locale": "en",
+  "dateFormat": "dd MMMM yyyy"
+}
+```
+
+Response (all command-driven write endpoints):
+
+```json
+{
+  "officeId": 1,
+  "clientId": 42,
+  "loanId": 123,
+  "resourceId": 123,
+  "changes": { "status": { "id": 200, "code": "loanStatusType.approved" } }
+}
+```
+
+## Field reference
+
+The class-level `@Tag` Javadoc enumerates the meaning of every input parameter. Selected highlights:
+
+- `accountNo` — auto-generated if omitted at create time.
+- `externalId` — caller-provided unique reference.
+- `principal` — disbursement amount.
+- `loanTermFrequency` × `loanTermFrequencyType` (0=Days, 1=Weeks, 2=Months, 3=Years).
+- `numberOfRepayments` × `repaymentEvery` × `repaymentFrequencyType` (0=Days, 1=Weeks, 2=Months).
+- `interestRatePerPeriod` × `interestRateFrequencyType` (2=Per month, 3=Per year).
+- `amortizationType` (0=Equal principal payments, 1=Equal installments).
+- `interestType` (0=Declining balance, 1=Flat).
+- `interestCalculationPeriodType` (0=Daily, 1=Same as repayment period) and `allowPartialPeriodInterestCalculation`.
+- `transactionProcessingStrategyCode` — payment-application strategy code (`mifos-standard-strategy`, `principal-interest-penalties-fees-order-strategy`, `interest-principal-penalties-fees-order-strategy`, `early-repayment-strategy`, `rbi-india-strategy`, `progressive-loan-strategy`, …).
+- `loanType` — one of `individual`, `group`, `jlg`.
+
+## Permissions
+
+Endpoint authorisation is enforced via `PlatformSecurityContext.authenticatedUser().validateHasReadPermission(...)` / `validateHasCreatePermission(...)` and through the `CommandWrapperBuilder` action code that is mapped to a permission inside `commandsource`. For most endpoints the resource code is `LOAN`; delinquency tag history uses `DELINQUENCY_TAGS`; delinquency-action writes use `DELINQUENCY_ACTION`.
+
+## Related pages
+
+- [/loan/loans-api](/loan/loans-api) — subsystem walk-through of the same handler chain.
+- [/loan/loan-application-write-service](/loan/loan-application-write-service) — service-tier implementation of the create/modify/state transition commands.
+- [/loan/loan-read-service](/loan/loan-read-service) — read-side `LoanReadPlatformService` queries used by every GET endpoint.
+- [/api/loan-transactions](/api/loan-transactions) and [/api/loan-charges](/api/loan-charges) — sibling sub-resources.
+- [/loan/glim-group-loans](/loan/glim-group-loans) — GLIM domain documentation.

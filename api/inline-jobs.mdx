@@ -1,0 +1,106 @@
+---
+title: "Inline Jobs API — Apache Fineract Synchronous Job Execution"
+sidebarTitle: "Inline Jobs"
+description: "Reference for the Apache Fineract /v1/jobs/{jobName}/inline endpoint that runs a named batch job synchronously inside the request thread."
+---
+
+The Inline Jobs API runs an Apache Fineract batch job *synchronously* — bypassing Quartz, ignoring the scheduler's `Active`/`Standby` state, and returning only when the job has finished. It is the standard mechanism behind the COB catch-up flow and an operations tool for forcing a job to run against a specific input set (typically a list of loan IDs) without waiting for the next scheduled trigger. The companion async pathway is `POST /v1/jobs/{jobId}?command=executeJob` documented under [Scheduler Jobs](/api/scheduler-jobs).
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.infrastructure.jobs.api.InlineJobApiResource` |
+| File | `fineract-provider/src/main/java/org/apache/fineract/infrastructure/jobs/api/InlineJobApiResource.java` |
+| JAX-RS `@Path` | `/v1/jobs` |
+| Swagger tag | `Inline Job` |
+| Command pipeline | `PortfolioCommandSourceWritePlatformService` via `CommandWrapperBuilder.executeInlineJob(jobName)` |
+| Request schema | `InlineJobResourceSwagger.InlineJobRequest` |
+| Response schema | `InlineJobResourceSwagger.InlineJobResponse` (`LoanIdsResponseDTO`) |
+
+The resource is a Spring `@Component` wired with `@RequiredArgsConstructor` (constructor injection of `PortfolioCommandSourceWritePlatformService` and `DefaultToApiJsonSerializer<LoanIdsResponseDTO>`).
+
+## Endpoints
+
+| Method | Path | Description | Command / handler | Permission |
+| --- | --- | --- | --- | --- |
+| `POST` | `/v1/jobs/{jobName}/inline` | Execute the named job inline (synchronously). Body carries job parameters such as `loanIds`. | `CommandWrapperBuilder.executeInlineJob(jobName)` → `commandWritePlatformService.logCommandSource(...)` | Driven by the job's own permission; reused under maker-checker if enabled |
+
+The handler implementation is minimal — it builds a `CommandWrapper`, logs it through the standard command pipeline, and serialises the result:
+
+```java
+final CommandWrapper commandRequest = new CommandWrapperBuilder()
+        .executeInlineJob(jobName)
+        .withJson(jsonRequestBody)
+        .build();
+CommandProcessingResult result = commandWritePlatformService.logCommandSource(commandRequest);
+return serializer.serialize(result);
+```
+
+## Request
+
+The path parameter `{jobName}` is the *short name* (Java enum value) of the job, e.g. `LOAN_COB`, `WORKING_CAPITAL_LOAN_COB`, `INCREASE_BUSINESS_DATE_BY_1_DAY`, `EXTERNAL_EVENT_PUBLISHING`. Anything outside `JobName` triggers a validation error.
+
+The body is a JSON object whose shape depends on the target job. For COB-style jobs it carries a list of loan identifiers; the swagger model exposes a single `loanIds` array:
+
+```bash
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example.org/fineract-provider/api/v1/jobs/LOAN_COB/inline' \
+  -d '{
+        "loanIds": [101, 102, 103]
+      }'
+```
+
+The `400 Bad Request` documented by the resource's `@ApiResponse(responseCode = "400")` annotation is emitted when the `loanIds` list violates its size validation, or when `jobName` does not resolve to a known `JobName`.
+
+## Response
+
+Successful execution returns the standard `CommandProcessingResult` serialised as JSON. Many inline jobs also embed a `LoanIdsResponseDTO` so the caller can see which loans were processed:
+
+```json
+{
+  "resourceId": null,
+  "changes": {
+    "loanIds": [101, 102, 103]
+  }
+}
+```
+
+For jobs that do not consume loan ids — `INCREASE_BUSINESS_DATE_BY_1_DAY`, for instance — the body may be empty (`{}`) and the response is simply the command-processing result.
+
+## Synchronous semantics
+
+Because the request thread blocks until the job returns, **the connection must stay open for the full job duration**. For long-running COB sweeps this can be several minutes; configure the reverse proxy (NGINX, ALB, …) and the HTTP client timeout accordingly. The inline path is most useful when:
+
+- Driving the COB catch-up loop from [Loan COB Catch-Up](/api/cob-catchup) — that resource issues `POST /v1/jobs/LOAN_COB/inline` once per day-boundary advance.
+- Re-running a failed COB partition against a curated set of loan IDs returned by [Internal COB](/api/internal-cob)'s `/v1/internal/cob/partitions/{partitionSize}`.
+- Forcing `EXTERNAL_EVENT_PUBLISHING` to drain the outbox in a tightly-controlled order (often paired with [External Event Configuration](/api/external-event-configuration)).
+
+If you need fire-and-forget execution that returns 202 immediately, use the Quartz-backed `POST /v1/jobs/{jobId}?command=executeJob` from [Scheduler Jobs](/api/scheduler-jobs) instead.
+
+## Differences from Quartz execution
+
+| Property | Inline (`/v1/jobs/{jobName}/inline`) | Quartz (`/v1/jobs/{jobId}?command=executeJob`) |
+| --- | --- | --- |
+| Threading | Runs on the HTTP request thread. | Runs on a Quartz worker thread. |
+| Response | Returns after the job completes. | Returns `202 Accepted` immediately. |
+| Scheduler state | Independent of `Active`/`Standby`. | Requires `Active` to actually fire. |
+| Instance mode | Always allowed (no `isBatchManagerEnabled` guard). | Requires batch-manager mode (`405` otherwise). |
+| Job identifier | Job *name* (enum constant). | Numeric `jobId` or `shortName`. |
+| Maker-checker | Goes through `logCommandSource`, so participates if enabled. | Same. |
+
+## Permissions
+
+Inline execution is gated by the job's own permission. The `CommandWrapper` produced by `executeInlineJob(jobName)` carries the job name, which is mapped to the corresponding permission code by the command handler registry. Granting `ALL_FUNCTIONS` is the easiest blanket option for operators; for fine-grained control, give a role only the permissions of the jobs they are allowed to fire (see [Permissions](/api/permissions) and [Roles](/api/roles)).
+
+## Related resources
+
+- [Scheduler](/api/scheduler) — flip the Quartz scheduler on/off (inline jobs ignore this).
+- [Scheduler Jobs](/api/scheduler-jobs) — async execution via `command=executeJob` and job configuration.
+- [Loan COB Catch-Up](/api/cob-catchup) — primary consumer of the inline `LOAN_COB` invocation.
+- [Working Capital COB Catch-Up](/api/working-capital-cob-catchup) — drives the inline `WORKING_CAPITAL_LOAN_COB` job.
+- [Configure Business Step](/api/configure-business-step) — order the steps inside COB jobs.
+- [Internal COB](/api/internal-cob) — partitioning helpers that pair with inline COB runs (TEST profile only).
+- [Audits](/api/audits) — find the command rows produced by inline executions.

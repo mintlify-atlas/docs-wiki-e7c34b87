@@ -1,0 +1,230 @@
+---
+title: "Authentication Endpoints, Basic Auth, OAuth2 User Details"
+sidebarTitle: "Auth Endpoints"
+description: "Fineract authentication surface: /v1/authentication for Basic Auth verification, /v1/userdetails for OAuth2 token introspection, two-factor flow, and SDK usage."
+---
+
+Apache Fineract supports two authentication modes — HTTP Basic and OAuth2 / JWT — selected at boot via Spring profiles. Each mode exposes a single REST endpoint that the UI uses to verify credentials and prefetch the authenticated user's roles and permissions. This page documents both endpoints from source, the two-factor add-on, and how SDKs call them.
+
+## At a glance
+
+| Endpoint | Mode | Source | Returns |
+| --- | --- | --- | --- |
+| `POST /v1/authentication` | Basic Auth | `AuthenticationApiResource` | `AuthenticatedUserData` (username, roles, permissions, base64Encoded credentials) |
+| `GET /v1/userdetails` | OAuth2 / JWT | `UserDetailsApiResource` | `AuthenticatedOauthUserData` (same shape, no base64 credentials) |
+
+Both classes are `@ConditionalOnProperty` — only the one matching your `fineract.security.*.enabled` flag is registered with Jersey at startup.
+
+## POST /v1/authentication
+
+**Source:** `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/api/AuthenticationApiResource.java`
+
+```java
+@Component
+@ConditionalOnProperty("fineract.security.basicauth.enabled")
+@Path("/v1/authentication")
+@Tag(name = "Authentication HTTP Basic")
+public class AuthenticationApiResource {
+
+    @POST
+    @Consumes({ MediaType.APPLICATION_JSON })
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String authenticate(final String apiRequestBodyAsJson) { ... }
+}
+```
+
+### Endpoint summary
+
+| HTTP | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/v1/authentication` | `{ "username": "...", "password": "..." }` | `AuthenticatedUserData` JSON |
+
+### Behaviour
+
+1. Parses the body as `AuthenticateRequest { username, password }` via Gson.
+2. Builds a `UsernamePasswordAuthenticationToken` and runs it through the qualifier-named `customAuthenticationProvider` (a `DaoAuthenticationProvider`).
+3. On success collects roles + permissions from the resolved `AppUser`.
+4. Returns `base64EncodedAuthenticationKey` = `Base64(username:password)` — this is the value the UI must send in `Authorization: Basic ...` on subsequent calls.
+
+### Sample request
+
+```bash
+curl -k -X POST https://localhost:8443/fineract-provider/api/v1/authentication \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"mifos","password":"password"}'
+```
+
+### Sample response
+
+```json
+{
+  "username": "mifos",
+  "userId": 1,
+  "base64EncodedAuthenticationKey": "bWlmb3M6cGFzc3dvcmQ=",
+  "authenticated": true,
+  "officeId": 1,
+  "officeName": "Head Office",
+  "staffId": null,
+  "staffDisplayName": null,
+  "organisationalRole": null,
+  "roles": [ { "id": 1, "name": "Super user", "description": "..." } ],
+  "permissions": [ "ALL_FUNCTIONS", "READ_CLIENT", "CREATE_CLIENT", "..." ],
+  "shouldRenewPassword": false,
+  "isTwoFactorAuthenticationRequired": false
+}
+```
+
+### Two-factor add-on
+
+When `fineract.security.2fa.enabled=true` **and** the user lacks the `BYPASS_TWO_FACTOR_PERMISSION`, the response includes:
+
+```json
+{
+  "isTwoFactorAuthenticationRequired": true,
+  "...": "..."
+}
+```
+
+The UI must then call the [Two-Factor Auth](/security/two-factor-auth) endpoints (`POST /v1/twofactor` to request a token, `POST /v1/twofactor/validate` to validate). Until validated the user can only access endpoints that have the `BYPASS_TWO_FACTOR_PERMISSION` allowance.
+
+### Failure modes
+
+| Cause | HTTP | Body |
+| --- | --- | --- |
+| Bad credentials | 401 | `{ "errorCode": "error.msg.user.invalid.credentials", "..." }` |
+| Locked or disabled user | 401 | `error.msg.user.account.locked` |
+| Password expired (force reset) | 403 | `error.msg.password.reset.required` |
+| Body missing `username` / `password` | 400 | `IllegalArgumentException` from the resource |
+
+## GET /v1/userdetails
+
+**Source:** `fineract-security/src/main/java/org/apache/fineract/infrastructure/security/api/UserDetailsApiResource.java`
+
+```java
+@Path("/v1/userdetails")
+@Component
+@ConditionalOnProperty("fineract.security.oauth2.enabled")
+@Tag(name = "Fetch authenticated user details")
+public class UserDetailsApiResource {
+
+    @GET
+    @Produces({ MediaType.APPLICATION_JSON })
+    public String fetchAuthenticatedUserData() { ... }
+}
+```
+
+### Endpoint summary
+
+| HTTP | Path | Body | Returns |
+| --- | --- | --- | --- |
+| GET | `/v1/userdetails` | none | `AuthenticatedOauthUserData` JSON |
+
+### Behaviour
+
+1. Reads the `FineractJwtAuthenticationToken` from the Spring Security context — there is no body, the auth comes from the `Authorization: Bearer <jwt>` header.
+2. Extracts the `AppUser` principal and serialises roles + permissions + office + staff details.
+3. Reports `isTwoFactorAuthenticationRequired` the same way Basic-Auth does.
+
+### Sample request
+
+```bash
+curl -k -X GET https://localhost:8443/fineract-provider/api/v1/userdetails \
+  -H "Fineract-Platform-TenantId: default" \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIs..."
+```
+
+### Sample response
+
+```json
+{
+  "username": "mifos",
+  "userId": 1,
+  "accessToken": "eyJhbGciOiJSUzI1NiIs...",
+  "authenticated": true,
+  "officeId": 1,
+  "officeName": "Head Office",
+  "roles": [ { "id": 1, "name": "Super user" } ],
+  "permissions": [ "ALL_FUNCTIONS" ],
+  "shouldRenewPassword": false,
+  "isTwoFactorAuthenticationRequired": false
+}
+```
+
+Note: `accessToken` echoes the JWT supplied in the header so the UI does not need to track it separately.
+
+## Mode selection at boot
+
+`AuthenticationApiResource` is gated by `@ConditionalOnProperty("fineract.security.basicauth.enabled")`. `UserDetailsApiResource` is gated by `@ConditionalOnProperty("fineract.security.oauth2.enabled")`. Exactly one of these should be true in your `application.properties`:
+
+```properties
+# Basic Auth mode (default)
+fineract.security.basicauth.enabled=true
+fineract.security.oauth2.enabled=false
+
+# OAuth2 / JWT mode (Keycloak, Auth0, etc.)
+fineract.security.basicauth.enabled=false
+fineract.security.oauth2.enabled=true
+
+# Optional 2FA on top of either mode
+fineract.security.2fa.enabled=true
+```
+
+## OAuth2 token endpoint
+
+Fineract does **not** issue JWTs itself in OAuth2 mode — it expects to validate JWTs minted by an external provider (Keycloak by default, configured via `spring.security.oauth2.resourceserver.jwt.issuer-uri`). Token exchange endpoints (`/oauth/token`, `/auth/realms/.../protocol/openid-connect/token`) live on the IdP, not on Fineract.
+
+The token must contain:
+
+- `preferred_username` — matches `m_appuser.username` in the tenant DB.
+- Any custom claim used by `FineractJwtAuthenticationConverter` to map roles.
+
+## SDK usage
+
+### Java (OkHttp `fineract-client`)
+
+```java
+ApiClient client = new ApiClient();
+client.setBasePath("https://localhost:8443/fineract-provider/api/v1");
+client.setFineractPlatformTenantId("default");
+// Basic Auth helper
+client.setUsername("mifos");
+client.setPassword("password");
+
+PostAuthenticationResponse resp =
+    new AuthenticationHttpBasicApi(client)
+        .authenticate(new PostAuthenticationRequest()
+            .username("mifos").password("password"),
+            /* returnClientList */ true);
+```
+
+### Feign (`fineract-client-feign`)
+
+```java
+FineractClient fc = FineractClient.builder()
+    .baseURL("https://localhost:8443/fineract-provider/api/v1/")
+    .tenant("default")
+    .basicAuth("mifos", "password")
+    .build();
+
+PostAuthenticationResponse resp = fc.authenticationHttpBasic
+    .authenticate(new PostAuthenticationRequest()
+        .username("mifos").password("password"), true);
+```
+
+## Token vs Basic Auth tradeoffs
+
+| | Basic Auth | OAuth2 / JWT |
+| --- | --- | --- |
+| Header | `Authorization: Basic <base64(user:pass)>` | `Authorization: Bearer <jwt>` |
+| Verification call | `POST /v1/authentication` | `GET /v1/userdetails` |
+| Credential rotation | requires UI re-login | handled by IdP refresh token |
+| Per-request cost | DB lookup + bcrypt every call | JWT signature verify (no DB hit if cached) |
+| Suitable for | demos, internal back-office | production, SSO scenarios |
+
+## Related pages
+
+- [Security → Spring Security setup](/security/security-config) — filter chain and providers.
+- [Security → Two-factor auth](/security/two-factor-auth) — `/v1/twofactor` endpoints.
+- [Tenant header](/api/tenant-header) — required *before* auth.
+- [API conventions](/api/conventions) — error envelope used on auth failure.

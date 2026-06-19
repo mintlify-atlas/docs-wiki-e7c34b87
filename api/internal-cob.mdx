@@ -1,0 +1,123 @@
+---
+title: "Internal COB API — Apache Fineract Test-only COB Partition Helpers"
+sidebarTitle: "Internal COB"
+description: "Reference for the Apache Fineract /v1/internal/cob TEST-profile endpoints that expose COB partitioning and per-loan business-date shortcuts."
+---
+
+The Internal COB API is a **test-only** sidecar used by Apache Fineract's COB integration suite to peek inside the partitioner, fast-forward a single loan past pending business dates, and re-run reprocessing in isolation. It exists so tests can drive corner cases of `LOAN_COB` (uneven partitioning, mid-pipeline failures, mid-day reprocess) without spinning up the full Quartz pipeline.
+
+<Warning>
+This resource is guarded by `@Profile(FineractProfiles.TEST)`. The class is only registered when the `test` Spring profile is active, and its `afterPropertiesSet` callback prints a `DO NOT USE THIS IN PRODUCTION!` banner. Production Fineract deployments must omit `test` from `SPRING_PROFILES_ACTIVE`.
+</Warning>
+
+## Source
+
+| Aspect | Value |
+| --- | --- |
+| Resource class | `org.apache.fineract.cob.api.InternalCOBApiResource` |
+| File | `fineract-provider/src/main/java/org/apache/fineract/cob/api/InternalCOBApiResource.java` |
+| JAX-RS `@Path` | `/v1/internal/cob` |
+| Swagger tag | `Internal COB` |
+| Spring profile guard | `@Profile(FineractProfiles.TEST)` |
+| Loan ID source | `RetrieveLoanIdService` |
+| Loan repository | `LoanRepositoryWrapper` |
+| Schedule service | `LoanScheduleService` |
+| Date format | `"dd MMMM yyyy"` (`DATETIME_PATTERN`) |
+
+The class implements `InitializingBean` purely to surface the banner warning on application startup.
+
+## Endpoints
+
+| Method | Path | Description | Command / handler | Permission |
+| --- | --- | --- | --- | --- |
+| `GET` | `/v1/internal/cob/partitions/{partitionSize}` | Show how `LOAN_COB` would slice its work into chunks of `partitionSize`. | `RetrieveLoanIdService.retrieveLoanCOBPartitions(NUMBER_OF_DAYS_BEHIND, BUSINESS_DATE, false, partitionSize)` | None (relies on `test` profile guard) |
+| `POST` | `/v1/internal/cob/fast-forward-cob-date-of-loan/{loanId}` | Move a single loan's `lastClosedBusinessDate` forward to the date supplied in the request body. | `LoanRepositoryWrapper.save(loan.setLastClosedBusinessDate(...))` | None (test guard) |
+| `POST` | `/v1/internal/cob/loan-reprocess/{loanId}` | Regenerate the schedule and reprocess all transactions for the loan under a single transaction. | `LoanScheduleService.regenerateScheduleWithReprocessingTransactions(loan)` | None (test guard) |
+
+## Partition inspector
+
+```bash
+curl -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  'https://fineract.example.org/fineract-provider/api/v1/internal/cob/partitions/100'
+```
+
+The handler:
+
+```java
+LocalDate businessDate = ThreadLocalContextUtil.getBusinessDateByType(BusinessDateType.BUSINESS_DATE);
+List<COBPartition> loanCOBPartitions = retrieveIdService.retrieveLoanCOBPartitions(
+        LoanCOBConstant.NUMBER_OF_DAYS_BEHIND, businessDate, false, partitionSize);
+```
+
+The response is a JSON array of `COBPartition` records — each carries the inclusive loan-id range and the count of loans it owns:
+
+```json
+[
+  { "pageNo": 0, "businessDate": "2024-04-15", "minLoanId": 1, "maxLoanId": 100, "count": 100 },
+  { "pageNo": 1, "businessDate": "2024-04-15", "minLoanId": 101, "maxLoanId": 200, "count": 100 }
+]
+```
+
+Use `fields=` (handled by `ApiRequestParameterHelper`) to project a subset of those columns in test assertions.
+
+## Fast-forwarding a single loan
+
+```bash
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  -H 'Content-Type: application/json' \
+  'https://fineract.example.org/fineract-provider/api/v1/internal/cob/fast-forward-cob-date-of-loan/1042' \
+  -d '{"lastClosedBusinessDate":"10 April 2024"}'
+```
+
+Notes:
+
+- The date string must match `dd MMMM yyyy` — for example `10 April 2024`. The handler parses it with `LocalDate.parse(lastClosedBusinessDate, dateTimeFormatter)`.
+- The loan is loaded with `findOneWithNotFoundDetection(loanId)`, so an unknown id yields the standard `404`.
+- No event is fired and no command-source row is created; this is a raw entity update for test setup only.
+
+This is the fastest way to set up a test where a specific loan should be considered "already processed up to date X" without running COB.
+
+## Forcing a reprocess
+
+```bash
+curl -X POST -u mifos:password \
+  -H 'fineract-platform-tenantid: default' \
+  'https://fineract.example.org/fineract-provider/api/v1/internal/cob/loan-reprocess/1042'
+```
+
+The handler is `@Transactional`:
+
+```java
+@POST
+@Path("loan-reprocess/{loanId}")
+@Transactional
+public void loanReprocess(@Context final UriInfo uriInfo, @PathParam("loanId") long loanId) {
+    loanScheduleService.regenerateScheduleWithReprocessingTransactions(
+        loanRepositoryWrapper.findOneWithNotFoundDetection(loanId));
+}
+```
+
+It is the test hook for invoking `LoanScheduleService.regenerateScheduleWithReprocessingTransactions(...)` without going through the normal COB business-step ordering. The response is `204 No Content`.
+
+## Typical test pattern
+
+A representative usage:
+
+1. Seed loans, set `BUSINESS_DATE` via [Business Date](/api/business-date).
+2. `GET /v1/internal/cob/partitions/{n}` to assert the partition shape that `LOAN_COB` will produce.
+3. `POST /v1/internal/cob/fast-forward-cob-date-of-loan/{loanId}` to mark some loans as already processed.
+4. `POST /v1/jobs/LOAN_COB/inline` ([Inline Jobs](/api/inline-jobs)) to run COB on the remaining loans.
+5. `POST /v1/internal/cob/loan-reprocess/{loanId}` to validate the reprocessing logic in isolation.
+
+`Internal COB` thus complements the production [Loan Account Lock](/api/loan-account-lock) and [COB Catch-Up](/api/cob-catchup) endpoints, exposing the inner machinery that those higher-level surfaces orchestrate.
+
+## Related resources
+
+- [COB Catch-Up](/api/cob-catchup) and [Working Capital COB Catch-Up](/api/working-capital-cob-catchup) — production-grade catch-up flows.
+- [Internal Loan Account Lock](/api/internal-loan-account-lock) — TEST-only lock injector in the same subsystem.
+- [Inline Jobs](/api/inline-jobs) — invoke `LOAN_COB` inline against curated loan sets.
+- [Configure Business Step](/api/configure-business-step) — ordering of the COB business steps.
+- [Loans](/api/loans), [Loan Schedule](/api/loan-schedule) and [Loan Transactions](/api/loan-transactions) — the entities reprocessed by these helpers.
+- [Business Date](/api/business-date) — adjust `BUSINESS_DATE` / `COB_DATE` before invoking these endpoints.
